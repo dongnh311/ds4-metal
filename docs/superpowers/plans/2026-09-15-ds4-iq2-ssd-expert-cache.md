@@ -15,6 +15,7 @@
 - **Fast path is sacred (user decision, constraint ⑤):** the RAM-hit path must be the existing Metal qwen4 graph; the pager's only contract is `ensure_expert_resident(layer, expert, ids) -> bool all-hit`. No new copy/abstraction on hits. Verify with `test_qwen4_logit_dump.py`: resident-mode output is byte-identical to pre-port baseline.
 - **Bit-identical gate (GreenBitAI protocol):** for paged mode: (1) logit match vs resident on ≥5 prompts to 160 tokens; (2) layer-wise resident-vs-paged comparison over all 48 layers; (3) MTP on/off checked separately. A paged run that drifts = architecture bug, reject the change.
 - **AGENT.md:** Qwen4 code is `DS4_HAS_QWEN4_METAL`-guarded (Metal-only; CUDA/ROCm builds exclude it — commit `bab2029`). Any edit to shared structs in `ds4_gpu.h` or to DeepSeek/GLM streaming paths → STOP and ask the user (CUDA machine check + distributed test gate).
+- **No new user-facing flags (AGENT.md: "Do not add permanent semantic variants behind flags").** Spec §21's `--expert-cache-size` / `--expert-prefetch-depth` map onto DS4's EXISTING flag family: `--ssd-streaming` enables the pager; `--ssd-streaming-cache-experts <bytes>` is the cache budget, auto-sized by `ds4_ssd_auto_cache_plan` (`ds4_ssd.c:108`) — this IS spec §6's "machine decides residency, not a flag" auto-residency; `--ssd-streaming-preload` covers hot pre-residency. Anything new stays env-only and diagnostic (`DS4_QWEN4_PAGER_STATS`, eviction weights), the same convention as `DS4_QWEN4_NO_FUSE`.
 - **No requant, no kernel rewrites in Phases 1–2.** IQ2_XXS/Q2_K + current kernels only. Kernel work = separate campaign (Plan 2) after miss-rate data exists.
 - **Benchmark protocol (user-specified, fixed):** every staged build reports tok/s, TTFT, expert cache hit %, prefetch hit %, SSD read MB/s, SSD read latency, expert misses/token, stall/token, Metal utilization, RAM, swap. Stage letters A→G below are cumulative and each gets its own CSV row set. "Faster" is accepted only via this table, never by feel.
 - Build machine: M5 Pro 64 GB; paged runs need `qwen38-experts.bin` (~36 GiB IQ2/Q2K payload, smaller than GreenBitAI's 70.31 GiB 4-bit store — a core advantage) on a fast local SSD.
@@ -52,7 +53,7 @@ Staged enablement (each stage is a separate commit + bench row set, so regressio
 
 **Files:** `docs/ORCA_UNCENSORED_DS4_IQ2.md` (append "SSD stage A baseline" section); create `speed-bench/orca-iq2-ssd-baseline.csv`
 
-**Interfaces:** Produces stage-A baseline numbers (tok/s/TTFT at 4K/32K/220K context, RAM, swap) + a `fio`/`iostat` profile of the target SSD (sequential + 4K random read MB/s, IOPS, latency p50/p99) that every later stage compares against. Also records SSD read latency/MBs counters method used in the protocol (e.g., `iostat -d -I -w` sampling script `misc/ssd_watch.sh`, ~40 lines, allowed to live in `misc/` since it's a tool not a feature).
+**Interfaces:** Produces stage-A baseline numbers (tok/s/TTFT at the 5-point sweep 32K/64K/128K/192K/220K, RAM, swap) + a `fio`/`iostat` profile of the target SSD (sequential + 4K random read MB/s, IOPS, latency p50/p99) that every later stage compares against. Each bench point also writes the provenance receipt (spec §3/§20): git commit, model sha256, macOS version, chip, ctx, prompt/gen lengths, temp, mtp on/off, swap peak, and **output_checksum** (sha256 of the generated token-ids at greedy) — the golden-reference token sequence. If 220K or any point beyond is unstable, record the **failure mode** (Metal OOM / swap / stall duration) in the receipt instead of forcing the run. Also records SSD read latency/MBs counters method used in the protocol (e.g., `iostat -d -I -w` sampling script `misc/ssd_watch.sh`, ~40 lines, allowed to live in `misc/` since it's a tool not a feature).
 
 - [ ] **Step 1: Lock the Plan-1 build** — confirm `gguf/Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q2KDownPad768-MTP.gguf` + PLE sidecar exist and Plan 1 Task 5 numbers are on file. If Plan 1 is not done, run it first; this plan depends on its artifact, not on Ivan's.
 - [ ] **Step 2: Stage A bench** — `ds4-bench` at 4K/32K/220K ctx (greedy + MTP on), `vm_stat` peak swap, TTFT. Write CSV rows labeled `stage=A`.
@@ -126,11 +127,11 @@ Key decisions (locked, implement as stated):
 - [ ] **Step 3: gate + bench `stage=D`** (logit diff unchanged; tok/s and predicted-match-rate in CSV).
 - [ ] **Step 4: if predicted match < ~50% on agentic workloads, stop and report** — the next-layer-probability term of stage E only pays off if *some* locality exists; no auto-escalation.
 
-## Task 5: Scored eviction + hot-expert pre-residency (stage E)
+## Task 5: Eviction ladder — LRU first, then scored eviction + hot pre-residency (stage E)
 
-**Files:** `ds4_expert_pager.c` (scorer: `score = w1·freq + w2·recency + w3·next_layer_prob + w4·load_cost`, weights tuned from stage-D stats, kept as 4 named constants), `gguf-tools/` (optional small script to capture router statistics in a dry resident run → `hot_experts.json` pre-residency list).
+**Files:** `ds4_expert_pager.c` (eviction policy: **stage E1 = plain LRU** (spec §10: "initial implementation may use LRU"); **stage E2 = scored** `score = w1·freq + w2·recency + w3·next_layer_prob − w4·bundle_size`, with `w1..w4` exposed as env-overridable constants `DS4_QWEN4_CACHE_W_FREQ/RECY/PRED/COST` — diagnostic experiment knobs per AGENT.md convention, defaults set from stage D stats, not user-tunable flags), `gguf-tools/` (optional small script to capture router statistics in a dry resident run → `hot_experts.json` pre-residency list).
 
-**Interfaces:** Produces `stage=E` rows incl. `expert miss/token` trend vs stage D.
+**Interfaces:** Produces `stage=E1/E2` rows incl. hit/miss/eviction/**re-load rate** counters (spec §10; the pager stats struct in Task 2 already records them — surface all four in the CSV). Never evict bundles in state IN_USE or PREFETCHING (spec §10 hard rule; enforced in the pager state machine from Task 2: COLD → PREFETCHING → READY → IN_USE → EVICTING → COLD).
 
 - [ ] **Step 1: dry-run stats capture** — one resident run over a representative workload records per-(layer, expert) selection counts; pack into `hot_experts.json` (tool, Python, ~80 lines, output data is per-workload and NOT committed to the model artifact).
 - [ ] **Step 2: scored eviction** in pager cache; pre-residency fills the byte budget (from `--ssd-streaming-cache-experts` auto-budget, existing `ds4_ssd_auto_cache_plan`) with hot experts first.
@@ -153,7 +154,7 @@ Key decisions (locked, implement as stated):
 **Interfaces:** Consumes stages A–F. MTP here is *measured on top of* the paged build, not tuned (MTP tuning itself remains Plan 2's Task 4; re-sequenced to G per user decision "MTP phải để sau").
 
 - [ ] **Step 1: bench `stage=G`** = best paged stage (E or F) × {MTP off, MTP on, `DS4_QWEN4_MTP_DEPTH` 2/3}, all protocol metrics.
-- [ ] **Step 2: write the campaign table** (A→G × {tok/s, TTFT, hit%, SSD MB/s, RAM, swap} at 32K/220K/256K/300K context) into the doc; state explicitly which context frontiers paged ≥ resident (the "long-context wins" claim only counts if it's in this table).
+- [ ] **Step 2: write the campaign table** (A→G × {tok/s, TTFT, hit%, SSD MB/s, RAM, swap} at 32K/64K/128K/192K/220K, with 256K/320K/512K probed and failure modes recorded) into the doc; state explicitly which context frontiers paged ≥ resident (the "long-context wins" claim only counts if it's in this table). **Success thresholds (spec §18):** paged ≥ resident tok/s within 5% at every frontier where resident does not swap; first target ≥40 tok/s @220K; 256K+ practical with **zero OS swap** — a paged run whose only win is "runs but swaps" is recorded as a failure mode, not success.
 - [ ] **Step 3: user decision gate:** keep paged mode, and whether any stage's change set needs the CUDA/distributed regression check per AGENT.md (pager is qwen4-Metal-only; if no shared struct moved, report "CUDA unaffected by construction" with the `grep -c` evidence; if it did move, ASK).
 - [ ] **Step 4: commit docs + CSV; branch review (superpowers:finishing-a-development-branch) before any PR.**
 

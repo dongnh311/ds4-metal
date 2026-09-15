@@ -8,7 +8,9 @@
 
 **Tech Stack:** Objective-C Metal (`ds4_metal.m`, `metal/qwen4.metal`), C graph scheduling (`ds4.c`, `DS4_HAS_QWEN4_METAL`-guarded blocks), Python logit-dump fixtures, `ds4-bench`.
 
-**Spec:** `docs/superpowers/specs/2026-09-15-orca-uncensored-ds4-iq2-design.md` (tok/s lever section) + in-session decision: Phase 1 kernel-only → Phase 2 MTP → Phase 3 PLE/SSD later. Plan 1 (Orca build, `docs/superpowers/plans/2026-09-15-orca-uncensored-ds4-iq2.md`) must be finished first on the M5 Pro; its Task 5 numbers are this campaign's baseline.
+**Spec:** `docs/superpowers/specs/2026-09-15-orca-uncensored-ds4-iq2-design.md` + `DS4-IQ2 Fast+ Final Engineering Specification` (in-session, 2026-09-15). **Global execution order (spec §25):** Plan 1 Orca build → Plan 3 expert cache/prefetch → Plan 4 paged/FP8 KV + memory manager → **this plan (kernel-only + MTP, last among the big three)** → compressed-KV experiment (out of scope). Rationale: paging/KV layers produce the miss/stall/bandwidth data that tells the kernel work *where* to optimize; MTP stays last per spec §13.
+
+**Baseline for this campaign:** the best paged stage's receipt (Plan 3 Task 7) at 220K context, plus Plan 1 Task 5 numbers. Plan 1 must be finished first on the M5 Pro.
 
 ## Global Constraints
 
@@ -16,7 +18,8 @@
 - **Bit-identical gate:** any kernel rewrite passes `python3 tests/test_qwen4_logit_dump.py` (teacher-forced dump vs baseline) and `make test-qwen4-kernels` before `ds4-bench` is even run. A faster path with unexplained logit drift is REJECTED (AGENT.md: correctness before speed).
 - **No new permanent semantic variants:** diagnostic env knobs are allowed only when they validate the one release path (precedent: `DS4_QWEN4_NO_FUSE`, `DS4_QWEN4_SPEC_FORCE_ACCEPT`).
 - **Keep code small/sharp** — prefer modifying the existing fused kernel family over adding parallel variants; do not add C++.
-- Benchmark protocol is fixed (Task 0): same prompt, 4K and 32K frontiers, 128-token greedy, `--mtp` on/off, 3 runs each, recorded in `speed-bench/`. No other numbers count.
+- Benchmark protocol is fixed (Task 0): 5-point sweep (32/64/128/192/220K), 1K-prompt + 128-token greedy, MTP on/off, provenance receipt per point, 3 runs each, recorded in `speed-bench/` (CSV + JSON receipts). No other numbers count. **Success threshold (spec §18):** decode ≥40 tok/s @220K without quality regression; stretch 45–50+. Kernel-stage gate stays bit-identical; MTP-stage gate is token-sequence stability at depth-2 default.
+- **No new user-facing flags** (spec §21's `--expert-*`/`--kv-*` flags are out of scope for this plan — that is Plan 3/4 territory; here, per AGENT.md "no permanent semantic variants behind flags", tuning happens in-code from measured data; diagnostic env knobs only).
 
 ## Hook Table (verified against `halfbeak` HEAD, 2026-09-15)
 
@@ -46,7 +49,18 @@ Guard split (for the CUDA-safety check): all Qwen4 graph code in `ds4.c` sits un
 
 **Files:** `speed-bench/` (CSV append), `docs/ORCA_UNCENSORED_DS4_IQ2.md`
 
-**Interfaces:** Produces `speed-bench/orca-iq2-baseline.csv` (columns: ctx, mode=plain|mtp|forced-accept, prefill_tps, decode_tps, mtp_accept1, mtp_accept2, run) used by every later task's before/after comparison.
+**Interfaces:** Produces `speed-bench/orca-iq2-baseline.csv` (columns: ctx, mode=plain|mtp|forced-accept, prefill_tps, decode_tps, ttft_s, mtp_accept1, mtp_accept2, run) used by every later task's before/after comparison.
+
+**Baseline protocol (spec §3, fixed):** five context points — 32K, 64K, 128K, 192K, 220K — at prompt 1K + 128 generated tokens, greedy, MTP on/off. At each point also record the provenance receipt (spec §3/§20):
+
+```json
+{"git_commit": "<head sha>", "model_sha256": "<main gguf>", "macos": "26.x",
+ "chip": "M5 Pro 64GB", "ctx": 32768, "prompt_tokens": 1024, "gen_tokens": 128,
+ "temp": 0, "mtp": "on|off", "swap_bytes_peak": 0,
+ "output_checksum": "<sha256 of generated token-ids sequence>"}
+```
+
+The `output_checksum` (token sequence, not text) is the golden reference: any later campaign task whose token sequence differs at the same greedy settings is a regression, full stop. If a context point (e.g. 256K when probed) is currently unstable, record the **failure mode** (Metal OOM / swap / stall time) in the receipt instead of forcing the run (spec §3).
 
 - [ ] **Step 1: Build + smoke**
 
@@ -129,7 +143,7 @@ Append CSV row (`task=H1`). Commit kernel + CSV: `git commit -m "Optimize Qwen4 
 
 **Interfaces:** Consumes `DS4_QWEN4_MTP_STATS` data (Task 0 Step 2) + `DS4_QWEN4_SPEC_FORCE_ACCEPT` upper-bound number. Produces tuned depth policy + CSV rows `task=mtp-*`.
 
-- [ ] **Step 1: Measure the acceptance distribution** with the Task 0 stat knob across 3 workload classes: agentic tool-calling (multi-turn `ds4-agent`), prose continuation, code generation. Per class: accept rate draft-1, draft-2, draft-3, effective tok/s at depth 2 vs 3 vs forced-accept. Record in CSV.
+- [ ] **Step 1: Measure the acceptance distribution** with the Task 0 stat knob across 3 workload classes: agentic tool-calling (multi-turn `ds4-agent`), prose continuation, code generation. Per class and per MTP mode (spec §13): accept rate draft-1/2/3, **accepted tokens per cycle**, **verification cost** (verify-pass time vs plain step, separate timing), **memory cost** (peak RAM delta MTP on/off), effective tok/s at depth 2 vs 3 vs forced-accept. Record in CSV.
 - [ ] **Step 2: Tune the depth policy.** The `qwen4_spec_depth` window logic (`bits >= 8` engage, `bits < 6` disengage, `reject2_streak >= 2` exit — `ds4.c:73589-73620`) is the first tuning target: with measured acceptance data, adjust thresholds if a workload class shows draft-2/3 consistently not paying. Keep the policy in-code (no env knob proliferation) — thresholds are constants chosen from the measured data, commit the data table into the commit message.
 - [ ] **Step 3: Draft-head row selection.** `DS4_QWEN4_MTP_DRAFT_ROWS`/`DRAFT_VOCAB` (`ds4.c:57958-58031`): if forced-accept gap vs opportunistic MTP is large, test whether a wider draft-head row set narrows it (the draft head scores a frequent-token prefix — wider rows = better drafts but more verify work). One configuration change, bench all 3 workload classes, keep only if effective tok/s improves on at least 2 of 3.
 - [ ] **Step 4: Rewind cost check (discussion #5 territory).** With `DS4_QWEN4_STATS`, confirm `qwen4_rewound` count per run: if full-transcript replays appear (log line "PLE sidecar eviction" per 1024 tokens during decode), that is the #5 bug reproducing on our build — do NOT fix it here, record it and hand to the user (runtime change in rewind snapshot logic, needs the same care as the open upstream discussion). Logit-dump gate still applies to any H13 change.
