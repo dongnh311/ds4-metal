@@ -53,17 +53,26 @@ router, Hyper-Connection mixers, indexer, vision tower, n-gram table.
 
 - [x] Task 0: build `gguf-tools/libds4quants.dylib`; download pinned
       imatrix (sha256 verified); confirm template source already on disk.
-- [x] Task 1 (tool): `gguf-tools/orca_diff.py` — selective payload-hash
-      diff, resumable per shard.
-- [ ] Task 1 (data): Orca + Qwen-base checkpoint download (needs the
-      gated-repo approval; card is open, `model.safetensors.index.json`
-      is not) — run `python3 gguf-tools/orca_diff.py download --repo orca`
-      then the `qwen` / `orca` / `diff` stages.
-- [ ] Task 2: quantize 48 Orca down experts (`qwen4_iq2.py quantize
-      --projection down --source gguf/orca-bf16`).
-- [ ] Task 3: `orca_dense_replace.py` — re-encode the 147 in-template
-      changed dense tensors + assemble the final main GGUF from the
-      template.
-- [ ] Task 4: rebuild PLE Q4_1 sidecar from Orca (`qwen4_pack.py`).
+- [x] Task 1: `gguf-tools/orca_diff.py` — selective payload-hash diff,
+      resumable per shard. Base gate/up readers range-hashed from the hub
+      (no base download); Orca checkpoint downloaded selectively (131
+      shards). Diff report `gguf/orca-diff.json`: 7/7 readers identical,
+      149 changed-set payloads recorded as Orca provenance.
+- [x] Task 2: 48 Orca down experts quantized to Q2_K padded 768
+      (`gguf/experts-down-orca/` + `experts.json` manifest).
+- [x] Task 3: `gguf-tools/orca_dense_replace.py` — 149 in-template
+      changed tensors re-encoded (48 Q2_K down from Task 2, 1 MTP MXFP4
+      down, 49 shared-down + 36 GDN out + 13 o_proj + PLE value_proj
+      as Q8_0, embed_tokens BF16 copy) and the final main GGUF assembled
+      from the verified template with read-back verification of every
+      payload: `gguf/Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q2KDownPad768-MTP.gguf`
+      (44.81 GB, 149 replaced).
+- [x] Task 4: embed the original BF16 n-grams into the main GGUF with
+      `gguf-tools/qwen4_native_ngrams.py` (self-contained, matching this
+      branch's "self-contained Qwen BF16 n-gram releases" design — no
+      `--ple` sidecar on this branch). The n-gram table is byte-identical
+      to the base (proven in the Task 1 reader checks), so it is drawn
+      from the pinned Orca n-gram shards; `ple.value_proj` (the one PLE
+      tensor abliterated) was already replaced in Task 3's main GGUF.
 - [ ] Task 5: target validation (`make`, no-swap load @ 8192 ctx,
       `ds4-eval` core, uncensor smoke, `--mtp` tok/s at 4K/32K).

@@ -81,11 +81,15 @@ def read_index(root: Path) -> dict:
     return weight_map
 
 
-def read_safetensors_header(path: Path, wanted: set) -> dict:
+def read_safetensors_header(path: Path, wanted: set) -> tuple[dict, int]:
+    """(selected header, data_offset): the safetensors data_offset is 8 plus
+    the header JSON length, exactly what qwen4_pack's SourceDB records."""
     with path.open("rb") as fp:
-        (length,) = struct.unpack("<Q", fp.read(8))
+        raw_length = fp.read(8)
+        length = struct.unpack("<Q", raw_length)[0]
         header = json.loads(fp.read(length))
-    return {n: header[n] for n in wanted if n in header}
+    data_offset = 8 + length
+    return {n: header[n] for n in wanted if n in header}, data_offset
 
 
 def target_names(weight_map: dict) -> list:
@@ -158,12 +162,13 @@ def orca_stage(root: Path, out: Path) -> None:
         if not needed:
             print(f"[{ordinal}/{len(per_shard)}] {shard}: complete")
             continue
-        header = read_safetensors_header(path, set(needed))
+        header, data_offset = read_safetensors_header(path, set(needed))
         if missing := [n for n in needed if n not in header]:
             fail(f"{shard} is missing tensors {missing[:3]}")
         with path.open("rb") as fp:
             for name in needed:
                 begin, end = header[name]["data_offsets"]
+                begin, end = begin + data_offset, end + data_offset
                 fp.seek(begin)
                 chunk = fp.read(end - begin)
                 if len(chunk) != end - begin:
