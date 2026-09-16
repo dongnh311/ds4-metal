@@ -12,7 +12,8 @@
 
 ## Global Constraints
 
-- **Model artifact:** every run in this plan uses the Plan-1 build `gguf/Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q2KDownPad768-MTP.gguf` (+ its PLE sidecar), not Ivan's upstream GGUF — same reasoning as Plan 3 Task 2 Step 1: lock the artifact first, record its sha256 in Task 0 receipts.
+- **Model artifact:** every run in this plan uses the Plan-1 final build `gguf/Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q2KDownPad768-MTP-NNgram.gguf` (self-contained n-grams, sha head `ed238d8d…` — record the full sha256 in Task 0 receipts), not Ivan's upstream GGUF — same reasoning as Plan 3 Task 2 Step 1: lock the artifact first.
+- **Context ceiling:** native ceiling is 262144 tokens; beyond 256K requires `DS4_QWEN4_YARN_FACTOR` — Task 3's 320K/512K probes must run with it and record the factor used; 256K and below need no YARN.
 - **Strict order (spec §25):** Plan 3 stage G must be done (or at least stages B–E with numbers) before starting here; its memory-pressure receipts are the input to Task 0. Do not start FP8 KV before paged-KV numbers exist (spec §25: "Do not skip directly to DeepSeek-style compressed KV").
 - **Attention semantics are frozen:** paged KV changes *where* K/V bytes live and their *precision path*; it must not change what attention computes. Gate: `test_qwen4_logit_dump.py` bit-identical for BF16 paged vs BF16 resident; FP8 has its own quality gate (Task 5), not the bit-identical one.
 - **DeepSeek compatibility is out (spec §10):** the DS4-Q4/DeepSeek KV layouts, compressor frontiers, DSpark capture paths are different architectures. This plan adds nothing to them; the new modules are qwen4-only. CUDA/ROCm builds exclude qwen4 (`bab2029`) so no shared-kernel regression is possible; any touch to `ds4_gpu.h` shared structs → ASK the user (AGENT.md CUDA/distributed gate).

@@ -41,3 +41,17 @@ chỉ tools Python trong `gguf-tools/` + build GGUF + chạy test.
 Orca 336 + template 44.8 + PLE out 32 + main out 45 ≈ 458 GB peak trước khi
 xóa Orca; yêu cầu ≥ ~470 GB free từ đầu (hoặc chạy task theo thứ tự và xóa
 dần như plan; plan hiện tại giữ Orca đến hết Task 4).
+
+## Status (2026-09-16) — Plan 1 XONG
+- Artifact cuối: `gguf/Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q2KDownPad768-MTP-NNgram.gguf`
+  (sha head `ed238d8d…` — n-grams self-contained, coherent, verified).
+- Fix ssm_out head-block permutation garble: commit `9edb69d`.
+- Benchmark: ds4-eval core 11/12 (INCOMPLETE duy nhất: aime2025-02 — budget
+  3072-token, không phải lỗi); smoke test PASS; MTP prefill/gen ≈ 106/36.6
+  t/s @4K, ≈109/36.5 @32K.
+- Max-context no-swap: resident 41.72 GiB; KV 12.50 GiB @384K → 55.83 GiB
+  (còn ~8 GiB headroom trên 64 GB). Trần native 262144 token; vượt trần cần
+  `DS4_QWEN4_YARN_FACTOR`.
+- ⚠️ Edge-case: 1 biến thể harmful probe phát "I cannot provide instructions…"
+  rồi chuyển sang viết an toàn — uncensor không tuyệt đối; báo tác giả
+  OrcaRouter card nếu quan trọng.

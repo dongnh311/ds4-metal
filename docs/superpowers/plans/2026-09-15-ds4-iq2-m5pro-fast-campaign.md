@@ -66,7 +66,7 @@ The `output_checksum` (token sequence, not text) is the golden reference: any la
 
 ```bash
 make
-./ds4 -m gguf/Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q2KDownPad768-MTP.gguf --ctx 8192 --prefill-chunk 1024 -p "OK"
+./ds4 -m gguf/Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q2KDownPad768-MTP-NNgram.gguf --ctx 8192 --prefill-chunk 1024 -p "OK"
 ```
 Expected: single-line OK, no Metal OOM. If Plan 1's Orca GGUF isn't ready, use Ivan's template GGUF — but note which in the CSV.
 
