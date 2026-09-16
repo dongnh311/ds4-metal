@@ -70,9 +70,55 @@ router, Hyper-Connection mixers, indexer, vision tower, n-gram table.
 - [x] Task 4: embed the original BF16 n-grams into the main GGUF with
       `gguf-tools/qwen4_native_ngrams.py` (self-contained, matching this
       branch's "self-contained Qwen BF16 n-gram releases" design — no
-      `--ple` sidecar on this branch). The n-gram table is byte-identical
-      to the base (proven in the Task 1 reader checks), so it is drawn
-      from the pinned Orca n-gram shards; `ple.value_proj` (the one PLE
-      tensor abliterated) was already replaced in Task 3's main GGUF.
-- [ ] Task 5: target validation (`make`, no-swap load @ 8192 ctx,
-      `ds4-eval` core, uncensor smoke, `--mtp` tok/s at 4K/32K).
+      `--ple` sidecar on this branch). N-gram provenance, all verified:
+      - PLE aux (`layer_multipliers`, `ngram_heads_offsets`,
+        `ngram_heads_vocab_sizes`) byte-identical to the pinned base
+        (hub range reads vs Orca shards, `gguf/orca-ngrams/ple-aux-verify.json`).
+      - n-gram table spot check: `ngram_embedding.shard_0.weight`
+        (800003840 B) sha256-identical base vs Orca
+        (`gguf/orca-ngrams/ngram-shard0-verify.json`); the card claims
+        the whole table unchanged.
+      `ple.value_proj` (the one PLE tensor abliterated) was replaced in
+      Task 3's main GGUF as `blk.1.ple_value.weight` (Q8_0).
+      Final artifact: `Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q2KDownPad768-MTP-NNgram.gguf`
+      (147.21 GB, 1256 tensors, sha256 `5c64c3ff247340a5...`).
+- [x] Task 5 (correctness verification): byte-exact payload audit
+      (`gguf-tools/orca_verify_q8.py` + one-shot checks):
+      - Q8_0 payloads (shared downs, o_projs, GDN out_projs, PLE
+        value_proj) re-encoded from Orca and byte-identical to a fresh
+        `GGMLQuantizer` encode of the Orca BF16 source.
+      - MTP expert down (MXFP4) byte-identical to the fresh
+        `quant_mxfp4_rows` of the Orca source.
+      - `token_embd.weight` BF16 copy and all 3D expert geometry
+        (Q2_K `[768,2560,512]`, MXFP4 `[640,2560,512]`, IQ2_XXS
+        gate/up `[2560,640,512]`) verified against the template.
+      - All 1106 byte-copied payloads match the Ivan template manifest
+        hashes; the 149 replaced slots keep the template's kind/size.
+      `make test-qwen4-kernels` passes.
+
+  **Garble root-cause (found via payload bisection):** the 36 GDN
+  `ssm_out` payloads (GDN `linear_attn.out_proj`) were encoded as plain
+  Q8_0 over the wrong axis with no head-block permutation. The qwen4exp
+  schema stores `ssm_out` with the 48 v-head blocks of 128 input features
+  permuted by the tiled-v order (`prod_out_colperm` in the official
+  qwen4exp packer); a 128-wide group is four Q8_0 blocks so the
+  permutation commutes with the encoding. All other 113 replaced
+  families (48 trunk Q2_K, MTP MXFP4, 49 shared-down, 13 o_proj, PLE
+  value_proj, embed_tokens) were correct and generate coherently when
+  paired with base payloads; only `ssm_out` produced garble. Fixed with
+  `gguf-tools/orca_fix_ssm_out.py` (re-fetch 36 Orca BF16 payloads,
+  verify each against the `orca_diff` provenance sha, re-encode with the
+  tiled-v permutation, dequant rel-L2 ≈ 0.006, write in place). After the
+  fix the whole build is coherent.
+- [x] Task 5 (benchmarks + smoke):
+      - Greedy (`--temp 0`) + default sampling: coherent prose, coding and
+        refusal/uncensor probes on real tasks (energy-drink pitch,
+        iterative Fibonacci, factual "fake ID" question — no hard
+        refusal, as the abliterated card intends).
+      - `--mtp` (opportunistic, no `--mtp-exact-sampling`): 4K context
+        prefill ≈ 106 t/s, generation ≈ 36.6 t/s; 32K context prefill ≈
+        109 t/s, generation ≈ 36.5 t/s; KV at 32K ≈ 1.97 GiB context
+        (model resident 41.72 GiB, total planned 43.69 GiB — fits the
+        64 GB M5 Pro with no swap).
+      - `gguf-tools/gguf_payload_diff.py` bisection confirms only the
+        36 `ssm_out` payloads differ from the base control after the fix.

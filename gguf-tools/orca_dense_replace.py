@@ -31,6 +31,7 @@ import numpy as np
 
 from qwen4_pack import GGMLQuantizer, SourceDB, bf16_to_f32
 from qwen4_pack_to_qwen4exp import Reader, kv_bytes, w_str, tnbytes, quant_mxfp4_rows
+from qwen4_pack_to_qwen4exp import N_K_HEAD, N_V_PER_K, tiled_v
 from orca_diff import is_changed, GATE_UP_SPOT_CHECKS
 
 TEMPLATE_KIND = {
@@ -38,6 +39,12 @@ TEMPLATE_KIND = {
     12: "Q4_K", 16: "IQ2_XXS", 30: "BF16", 39: "MXFP4",
 }
 T_MXFP4 = 39
+# qwen4exp expects the GDN out_proj stored with the 48 head blocks of 128
+# output values permuted per the tiled v order (prod_out_colperm in the
+# official qwen4exp packer, verified cos=1.0 against the ggml-org file):
+# output slot q holds HF head tiled_v(q). A 128-value group is exactly four
+# Q8_0 blocks, so the permutation commutes with the encoding.
+TILED_ORDER = [tiled_v(j) for j in range(N_K_HEAD * N_V_PER_K)]
 
 
 def fail(message: str) -> None:
@@ -59,6 +66,16 @@ def tensor_bytes(kind: int, dims) -> int:
 def name_for_experts(rep: dict) -> str:
     layer = rep["source"].split(".layers.")[1].split(".")[0]
     return f"blk.{layer}.ffn_down_exps.weight"
+
+
+def ssm_colperm(values: np.ndarray) -> np.ndarray:
+    """[2560, 6144] GDN out_proj (HF orientation) -> head-block permutation
+    of the 6144 input dim: 48 heads of 128 values (four Q8_0 blocks each),
+    output slot q holds HF head TILED_ORDER[q] (prod_out_colperm)."""
+    out = np.empty_like(values)
+    for q, src in enumerate(TILED_ORDER):
+        out[:, q * 128:(q + 1) * 128] = values[:, src * 128:(src + 1) * 128]
+    return out
 
 
 class Plan:
@@ -131,7 +148,7 @@ class Plan:
             self.replacements[f"blk.{layer}.ssm_out.weight"] = {
                 "kind": 8, "dims": [6144, 2560],
                 "source": f"model.language_model.layers.{layer}.linear_attn.out_proj.weight",
-                "encode": "q8"}
+                "encode": "q8_ssm"}
         self.replacements["blk.1.ple_value.weight"] = {
             "kind": 8, "dims": [2560, 2560],
             "source": "model.language_model.layers.1.ple.value_proj.weight",
@@ -152,6 +169,9 @@ class Plan:
             return np.ascontiguousarray(self.db.read(source)).tobytes()
         if encode == "q8":
             values = bf16_to_f32(self.db.read(source))
+            return self.quant.encode(values, "Q8_0")
+        if encode == "q8_ssm":
+            values = ssm_colperm(bf16_to_f32(self.db.read(source)))
             return self.quant.encode(values, "Q8_0")
         if encode == "mxfp4":
             values = bf16_to_f32(self.db.read(source))
