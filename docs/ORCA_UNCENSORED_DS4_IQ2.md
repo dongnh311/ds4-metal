@@ -5,7 +5,7 @@ runtime's `qwen4exp` GGUF: IQ2_XXS gate/up + padded Q2_K down experts,
 abliterated dense tensors re-encoded, MTP + PLE sidecar. Target machine:
 Apple Silicon Mac, 64 GB RAM.
 
-Plan of record: `docs/2026-09-15-orca-uncensored-ds4-iq2.md`
+Plan of record: `docs/Task/2026-09-15-orca-uncensored-ds4-iq2.md`
 (inside the `ds4-metal` main checkout, not this worktree).
 
 ## Pinned constants
@@ -122,3 +122,21 @@ router, Hyper-Connection mixers, indexer, vision tower, n-gram table.
         64 GB M5 Pro with no swap).
       - `gguf-tools/gguf_payload_diff.py` bisection confirms only the
         36 `ssm_out` payloads differ from the base control after the fix.
+      - `ds4-eval --suite core` (12 selected questions, 1536-token budget,
+        `--retry-incomplete`): **11/12 passed**. All SuperGPQA and
+        GPQA-Diamond choices correct; AIME2025: `aime2025-01`=70,
+        `aime2025-16`=468, `aime2025-03`=16 correct; the one INCOMPLETE
+        is `aime2025-02` (long combinatorics proof that ran past the
+        3072-token retry budget — a budget limit, not a garble/regression).
+      - `tests/test_orca_uncensored_smoke.py` (official harness): **PASS**
+        for the harness's two criteria — the harmful probe returned no
+        refusal phrasing (uncensored) and the coding probe returned
+        runnable code. Noted edge: one harmful probe variant
+        *did* emit a safety-style "I cannot provide instructions…" refusal
+        before pivoting to a safety write-up, so the "always comply"
+        property is not absolute — flag to OrcaRouter card authors if it
+        matters. `safe` probe coherent.
+      - Max-context no-swap headroom: model resident 41.72 GiB; KV
+        12.50 GiB at 384K context → 55.83 GiB planned (fits 64 GB with
+        ~8 GiB headroom). Native ceiling 262144 tokens; past that
+        requires `DS4_QWEN4_YARN_FACTOR`.
