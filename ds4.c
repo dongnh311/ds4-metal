@@ -137,6 +137,7 @@ static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
+#include "ds4_expert_pager.h"
 #endif
 
 /* Non-CUDA builds (Mac/Metal, CPU-only) never link ds4_cuda.cu. Provide
@@ -57558,6 +57559,12 @@ typedef struct {
     float steer_attn_scale;
     float steer_ffn_scale;
     bool dump_prompt_rows;
+    /* Qwen4 SSD expert caching (stage B): per-layer staging buffers.
+     * Populated on demand by ds4_expert_pager_ensure; kernels read from
+     * g->expert_buffers[layer] when g->ssd_streaming and the layer is active. */
+    ds4_gpu_tensor *expert_gate_buf[DS4_MAX_LAYER];
+    ds4_gpu_tensor *expert_up_buf[DS4_MAX_LAYER];
+    ds4_gpu_tensor *expert_down_buf[DS4_MAX_LAYER];
 } ds4_qwen4_gpu_graph;
 
 static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
@@ -57676,6 +57683,15 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->snap2_lin_hist[il]);
         ds4_gpu_tensor_free(g->snap0_lin_state[il]);
         ds4_gpu_tensor_free(g->snap0_lin_hist[il]);
+    }
+    /* Qwen4 expert cache staging — only live when ssd_streaming is enabled */
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(g->expert_gate_buf[il]);
+        ds4_gpu_tensor_free(g->expert_up_buf[il]);
+        ds4_gpu_tensor_free(g->expert_down_buf[il]);
+        g->expert_gate_buf[il] = NULL;
+        g->expert_up_buf[il] = NULL;
+        g->expert_down_buf[il] = NULL;
     }
     free(g->host_row);
     free(g->host_logits);

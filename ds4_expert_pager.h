@@ -24,7 +24,7 @@ typedef struct {
     uint32_t bundle_bytes_gate;
     uint32_t bundle_bytes_up;
     uint32_t bundle_bytes_down;
-    uint32_t bundle_count;
+    uint32_t page_size;
     char gguf_sha256[65];
     char sha256[65];
 } ds4_expert_index_header;
@@ -32,6 +32,8 @@ typedef struct {
 typedef struct {
     int bin_fd;
     int index_fd;
+    void *bundle_map;      /* mmap of qwen38-experts.bin */
+    uint64_t bundle_size;
     ds4_expert_index_header header;
     ds4_expert_bundle *bundles;
     uint64_t bundles_capacity;

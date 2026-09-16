@@ -75,10 +75,22 @@ static const char *json_get_string(const char *json, const char *key) {
     return result;
 }
 
-/* Parse numeric field from JSON */
+/* Parse numeric field from JSON — flat key at top level */
 static uint64_t json_get_uint(const char *json, const char *key) {
     char pattern[256];
     snprintf(pattern, sizeof(pattern), "\"%s\": ", key);
+
+    const char *pos = strstr(json, pattern);
+    if (!pos) return 0;
+
+    pos += strlen(pattern);
+    return strtoull(pos, NULL, 10);
+}
+
+/* Parse nested numeric field from JSON — look inside "key": { "subkey": value } */
+static uint64_t json_get_nested_uint(const char *json, const char *parent, const char *child) {
+    char pattern[512];
+    snprintf(pattern, sizeof(pattern), "\"%s\": {\"%s\": ", parent, child);
 
     const char *pos = strstr(json, pattern);
     if (!pos) return 0;
@@ -210,9 +222,11 @@ bool ds4_expert_pager_open(ds4_expert_pager *pager,
     pager->header.version = json_get_uint(json_str, "version");
     pager->header.layer_count = json_get_uint(json_str, "layer_count");
     pager->header.expert_count = json_get_uint(json_str, "expert_count");
-    pager->header.bundle_bytes_gate = json_get_uint(json_str, "gate");
-    pager->header.bundle_bytes_up = json_get_uint(json_str, "up");
-    pager->header.bundle_bytes_down = json_get_uint(json_str, "down");
+    pager->header.page_size = json_get_uint(json_str, "page_size");
+    /* bundle_bytes is nested: "bundle_bytes": {"gate": N, "up": N, "down": N} */
+    pager->header.bundle_bytes_gate = json_get_nested_uint(json_str, "bundle_bytes", "gate");
+    pager->header.bundle_bytes_up = json_get_nested_uint(json_str, "bundle_bytes", "up");
+    pager->header.bundle_bytes_down = json_get_nested_uint(json_str, "bundle_bytes", "down");
 
     const char *sha = json_get_string(json_str, "sha256");
     if (sha) {
