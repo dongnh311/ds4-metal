@@ -1,5 +1,5 @@
 #ifndef DS4_EXPERT_PAGER_H
-#define DS4_BUGLER_H
+#define DS4_EXPERT_PAGER_H
 
 #include <stdbool.h>
 #include <stdint.h>
