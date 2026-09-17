@@ -328,6 +328,39 @@ bool ds4_expert_pager_open(ds4_expert_pager *pager,
     fprintf(stderr, "ds4_expert_pager: opened %llu bundles from %s\n",
             (unsigned long long)pager->bundles_count, index_path);
 
+    /* Direct (layer, expert, tensor) -> bundle index map, so ensure is O(1)
+     * instead of scanning the whole bundle array per expert per token. Built
+     * once here because the index never changes; the residency map that
+     * pager_find_bundle's caller maintains is a separate array. */
+    const uint64_t n_keys = (uint64_t)pager->header.layer_count *
+                            (uint64_t)pager->header.expert_count * 3u;
+    if (n_keys == 0 || n_keys > (uint64_t)1 << 40) {
+        fprintf(stderr, "ds4_expert_pager: index dimensions give %llu bundle keys\n",
+                (unsigned long long)n_keys);
+        free(json_str);
+        close(pager->bin_fd);
+        return false;
+    }
+    pager->key_to_bundle = malloc((size_t)n_keys * sizeof(int32_t));
+    if (!pager->key_to_bundle) {
+        fprintf(stderr, "ds4_expert_pager: failed to allocate bundle lookup\n");
+        free(json_str);
+        close(pager->bin_fd);
+        return false;
+    }
+    for (uint64_t i = 0; i < n_keys; i++) pager->key_to_bundle[i] = -1;
+    pager->key_count = n_keys;
+    for (uint64_t i = 0; i < pager->bundles_count; i++) {
+        const ds4_expert_bundle *b = &pager->bundles[i];
+        if (b->layer >= pager->header.layer_count ||
+            b->expert >= pager->header.expert_count || b->tensor_idx > 2u) {
+            continue;
+        }
+        const uint64_t key = ((uint64_t)b->layer * pager->header.expert_count +
+                              b->expert) * 3u + b->tensor_idx;
+        pager->key_to_bundle[key] = (int32_t)i;
+    }
+
     /*
      * Authoritative sizing line.  Every expert-cache budget, resident-set
      * estimate and prefetch bound downstream must be derived from these
@@ -364,6 +397,200 @@ void ds4_expert_pager_close(ds4_expert_pager *pager) {
         free(pager->bundles);
         pager->bundles = NULL;
     }
+    if (pager->cache_data) {
+        for (uint32_t i = 0; i < pager->cache_capacity; i++) {
+            free(pager->cache_data[i]);
+        }
+        free(pager->cache_data);
+        pager->cache_data = NULL;
+    }
+    free(pager->cache_size);
+    free(pager->cache_last_used);
+    free(pager->cache_access);
+    free(pager->cache_bundle);
+    free(pager->key_to_bundle);
+    free(pager->bundle_lookup);
+    pager->cache_size = NULL;
+    pager->cache_last_used = NULL;
+    pager->cache_access = NULL;
+    pager->cache_bundle = NULL;
+    pager->key_to_bundle = NULL;
+    pager->bundle_lookup = NULL;
+    pager->cache_capacity = 0;
+    pager->cache_resident = 0;
+    pager->cache_used_bytes = 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Resident bundle cache (Stage E)
+ * --------------------------------------------------------------------------- */
+
+/* Index of the bundle for (layer, expert, tensor_idx), or -1.
+ *
+ * A direct map replaces a scan of the whole bundle array: the scan ran once
+ * per expert per token per layer, i.e. three million times for a 2048-token
+ * prefill, to rediscover a constant. */
+static int32_t pager_find_bundle(const ds4_expert_pager *pager,
+                                 uint32_t layer, uint32_t expert,
+                                 uint32_t tensor_idx) {
+    const uint32_t e = pager->header.expert_count;
+    const uint32_t l = pager->header.layer_count;
+    if (e == 0 || l == 0 || layer >= l || expert >= e || tensor_idx > 2u) return -1;
+    const uint64_t key = ((uint64_t)layer * e + expert) * 3u + tensor_idx;
+    if (!pager->key_to_bundle || key >= pager->key_count) return -1;
+    return pager->key_to_bundle[key];
+}
+
+/* Keep score for a resident slot. Higher means keep it.
+ *
+ * Both policies are expressed on the same scale: cache_clock advances once per
+ * hit, so last_used and access count are comparable. E1 keeps the most
+ * recently used; E2 adds lifetime frequency, which is what protects an expert
+ * that recurs on every token from a burst of one-shot experts. E2 is the
+ * default because that is the pattern a re-read-per-token pager produces.
+ *
+ * Note on "hot pre-residency": there is no pre-loading here. Pre-loading needs
+ * a prediction source, and the hotlists in this tree are for other models, so
+ * a Qwen4 hot set would be invented. What the frequency term gives instead is
+ * hot *retention* -- the bundles a run proves it needs survive eviction. */
+static double pager_slot_score(const ds4_expert_pager *pager, uint32_t slot) {
+    const double recency = (double)pager->cache_last_used[slot];
+    if (pager->cache_policy == DS4_EXPERT_EVICT_LRU) return recency;
+    return recency + (double)pager->cache_access[slot];
+}
+
+static int32_t pager_pick_victim(ds4_expert_pager *pager) {
+    int32_t victim = -1;
+    double best_score = 0.0;
+    for (uint32_t i = 0; i < pager->cache_capacity; i++) {
+        if (pager->cache_bundle[i] < 0) continue;
+        const double score = pager_slot_score(pager, i);
+        if (victim < 0 || score < best_score ||
+            (score == best_score &&
+             pager->cache_last_used[i] < pager->cache_last_used[victim])) {
+            victim = (int32_t)i;
+            best_score = score;
+        }
+    }
+    return victim;
+}
+
+static void pager_evict_slot(ds4_expert_pager *pager, uint32_t slot) {
+    if (pager->cache_bundle[slot] >= 0) {
+        pager->bundle_lookup[pager->cache_bundle[slot]] = -1;
+    }
+    pager->cache_used_bytes -= pager->cache_size[slot];
+    pager->cache_bundle[slot] = -1;
+    pager->cache_size[slot] = 0;
+    pager->cache_access[slot] = 0;
+    pager->cache_last_used[slot] = 0;
+    pager->cache_resident--;
+    pager->cache_evictions++;
+}
+
+static int32_t pager_find_free_slot(const ds4_expert_pager *pager) {
+    for (uint32_t i = 0; i < pager->cache_capacity; i++) {
+        if (pager->cache_bundle[i] < 0) return (int32_t)i;
+    }
+    return -1;
+}
+
+/* Reserve a slot for need_bytes, evicting as required.
+ *
+ * Two resources have to be satisfied, and they are not the same one: a slot is
+ * a container sized for the largest bundle, while the budget counts live
+ * bytes. Slots can therefore run out while the budget does not, because gate
+ * and up bundles are smaller than the down bundle the slot count was derived
+ * from. Selecting a victim on either condition, not only on the budget, is
+ * what keeps a run from stalling with free bytes and no free slot. */
+static int32_t pager_reserve_slot(ds4_expert_pager *pager, uint64_t need_bytes) {
+    int32_t slot = pager_find_free_slot(pager);
+    if (slot < 0) {
+        const int32_t victim = pager_pick_victim(pager);
+        if (victim < 0) return -1;   /* nothing resident: impossible unless empty */
+        pager_evict_slot(pager, (uint32_t)victim);
+        slot = victim;
+    }
+    /* The slot is free, so pick_victim cannot return it again. */
+    while (pager->cache_used_bytes + need_bytes > pager->cache_budget_bytes) {
+        const int32_t victim = pager_pick_victim(pager);
+        if (victim < 0) return -1;
+        pager_evict_slot(pager, (uint32_t)victim);
+    }
+    return slot;
+}
+
+bool ds4_expert_pager_enable_cache(ds4_expert_pager *pager, uint64_t bytes) {
+    if (!pager || pager->bundles_count == 0) return false;
+    if (pager->cache_data) return true;
+
+    const char *policy_env = getenv("DS4_QWEN4_EXPERT_EVICT");
+    if (policy_env && policy_env[0]) {
+        pager->cache_policy = (!strcmp(policy_env, "lru") || !strcmp(policy_env, "1"))
+            ? DS4_EXPERT_EVICT_LRU : DS4_EXPERT_EVICT_SCORED;
+    } else {
+        pager->cache_policy = DS4_EXPERT_EVICT_SCORED;
+    }
+
+    /* Largest bundle decides how many slots the budget can ever hold; slots
+     * are containers, not reservations, so the budget is enforced on live
+     * bytes in pager_reserve_slot. */
+    uint64_t max_bundle = 0;
+    for (uint64_t i = 0; i < pager->bundles_count; i++) {
+        if (pager->bundles[i].size > max_bundle) max_bundle = pager->bundles[i].size;
+    }
+    if (max_bundle == 0 || bytes < max_bundle) {
+        fprintf(stderr, "ds4_expert_pager: cache budget %llu B too small for a "
+                "%llu B bundle; running uncached\n",
+                (unsigned long long)bytes, (unsigned long long)max_bundle);
+        return false;
+    }
+
+    uint64_t slots = bytes / max_bundle;
+    if (slots > pager->bundles_count) slots = pager->bundles_count;
+    if (slots > UINT32_MAX) slots = UINT32_MAX;
+
+    pager->cache_data = calloc((size_t)slots, sizeof(void *));
+    pager->cache_size = calloc((size_t)slots, sizeof(uint64_t));
+    pager->cache_last_used = calloc((size_t)slots, sizeof(uint64_t));
+    pager->cache_access = calloc((size_t)slots, sizeof(uint64_t));
+    pager->cache_bundle = malloc((size_t)slots * sizeof(int32_t));
+    pager->bundle_lookup = malloc((size_t)pager->bundles_count * sizeof(int32_t));
+    if (!pager->cache_data || !pager->cache_size || !pager->cache_last_used ||
+        !pager->cache_access || !pager->cache_bundle ||
+        !pager->bundle_lookup) {
+        fprintf(stderr, "ds4_expert_pager: failed to allocate cache metadata\n");
+        free(pager->cache_data); pager->cache_data = NULL;
+        free(pager->cache_size); pager->cache_size = NULL;
+        free(pager->cache_last_used); pager->cache_last_used = NULL;
+        free(pager->cache_access); pager->cache_access = NULL;
+        free(pager->cache_bundle); pager->cache_bundle = NULL;
+        free(pager->bundle_lookup); pager->bundle_lookup = NULL;
+        return false;
+    }
+    for (uint32_t i = 0; i < slots; i++) pager->cache_bundle[i] = -1;
+    for (uint64_t i = 0; i < pager->bundles_count; i++) pager->bundle_lookup[i] = -1;
+
+    pager->cache_capacity = (uint32_t)slots;
+    pager->cache_budget_bytes = bytes;
+    fprintf(stderr,
+            "ds4_expert_pager: resident cache %.2f GiB, %u slots of %llu B max, "
+            "policy=%s\n",
+            (double)bytes / 1073741824.0, pager->cache_capacity,
+            (unsigned long long)max_bundle,
+            pager->cache_policy == DS4_EXPERT_EVICT_LRU ? "E1-lru" : "E2-scored");
+    /* A single MoE step asks for one expert across three tensors, so a cache
+     * below that cannot hold even the step in flight: every access misses and
+     * re-reads, which is the 1247 GiB storm the cache exists to remove. Say so
+     * rather than let a run look cached and behave worse than uncached. */
+    if (pager->cache_capacity < 3u * DS4_EXPERT_PAGER_MIN_SLOTS) {
+        fprintf(stderr,
+                "ds4_expert_pager: WARNING: %u slots cannot hold one step's expert "
+                "set; this run will re-read on every access (read volume grows "
+                "with tokens, not with distinct experts)\n",
+                pager->cache_capacity);
+    }
+    return true;
 }
 
 /* ---------------------------------------------------------------------------
@@ -394,24 +621,61 @@ int ds4_expert_pager_ensure(ds4_expert_pager *pager,
     if (!pager || !expert_ids || n_experts == 0) return -1;
 
     int misses = 0;
-    struct timespec ts0, ts1;
-    clock_gettime(CLOCK_MONOTONIC, &ts0);
+    double latency = 0.0;
 
     for (uint32_t i = 0; i < n_experts; i++) {
-        uint32_t expert = expert_ids[i];
+        const uint32_t expert = expert_ids[i];
+        const int32_t idx = pager_find_bundle(pager, layer, expert, tensor_idx);
 
-        ds4_expert_bundle *bundle = NULL;
-        for (uint64_t j = 0; j < pager->bundles_count; j++) {
-            if (pager->bundles[j].layer == layer &&
-                pager->bundles[j].expert == expert &&
-                pager->bundles[j].tensor_idx == tensor_idx) {
-                bundle = &pager->bundles[j];
-                break;
-            }
+        if (idx < 0) {
+            PAGER_MISS_REPORT("no bundle", layer, expert, tensor_idx, 0);
+            misses++;
+            continue;
         }
 
-        if (!bundle) {
-            PAGER_MISS_REPORT("no bundle", layer, expert, tensor_idx, 0);
+        const ds4_expert_bundle *bundle = &pager->bundles[idx];
+
+        if (!pager->cache_data) {
+            /* Uncached: the pre-Stage-E behaviour, kept so the cached and
+             * uncached arms can be measured against each other. */
+            void *ptr = malloc(bundle->size);
+            if (!ptr) {
+                PAGER_MISS_REPORT("malloc failed", layer, expert, tensor_idx, bundle->size);
+                misses++;
+                continue;
+            }
+            ssize_t nread = pread(pager->bin_fd, ptr, bundle->size, bundle->offset);
+            if (nread != (ssize_t)bundle->size) {
+                fprintf(stderr, "ds4_expert_pager: pread failed at layer=%u expert=%u tid=%u "
+                        "off=%llu size=%llu: got %lld, %s\n",
+                        layer, expert, tensor_idx,
+                        (unsigned long long)bundle->offset,
+                        (unsigned long long)bundle->size,
+                        (long long)nread, strerror(errno));
+                free(ptr);
+                misses++;
+                continue;
+            }
+            pager->total_preads++;
+            pager->total_pread_bytes += bundle->size;
+            pager->total_misses++;
+            if (out_pointers) out_pointers[i] = ptr;
+            continue;
+        }
+
+        /* Cached: a resident bundle is a hit and costs no I/O at all. */
+        const int32_t slot = pager->bundle_lookup[idx];
+        if (slot >= 0) {
+            pager->total_hits++;
+            pager->cache_last_used[slot] = ++pager->cache_clock;
+            pager->cache_access[slot]++;
+            if (out_pointers) out_pointers[i] = pager->cache_data[slot];
+            continue;
+        }
+
+        const int32_t free_slot = pager_reserve_slot(pager, bundle->size);
+        if (free_slot < 0) {
+            PAGER_MISS_REPORT("no slot", layer, expert, tensor_idx, bundle->size);
             misses++;
             continue;
         }
@@ -423,7 +687,10 @@ int ds4_expert_pager_ensure(ds4_expert_pager *pager,
             continue;
         }
 
-        ssize_t nread = pread(pager->bin_fd, ptr, bundle->size, bundle->offset);
+        struct timespec ts0, ts1;
+        clock_gettime(CLOCK_MONOTONIC, &ts0);
+        const ssize_t nread = pread(pager->bin_fd, ptr, bundle->size, bundle->offset);
+        clock_gettime(CLOCK_MONOTONIC, &ts1);
         if (nread != (ssize_t)bundle->size) {
             fprintf(stderr, "ds4_expert_pager: pread failed at layer=%u expert=%u tid=%u "
                     "off=%llu size=%llu: got %lld, %s\n",
@@ -435,6 +702,17 @@ int ds4_expert_pager_ensure(ds4_expert_pager *pager,
             misses++;
             continue;
         }
+        latency += (ts1.tv_sec - ts0.tv_sec) * 1e3 +
+                   (ts1.tv_nsec - ts0.tv_nsec) / 1e6;
+
+        pager->cache_data[free_slot] = ptr;
+        pager->cache_size[free_slot] = bundle->size;
+        pager->cache_bundle[free_slot] = idx;
+        pager->cache_last_used[free_slot] = ++pager->cache_clock;
+        pager->cache_access[free_slot] = 1;
+        pager->bundle_lookup[idx] = free_slot;
+        pager->cache_used_bytes += bundle->size;
+        pager->cache_resident++;
 
         pager->total_preads++;
         pager->total_pread_bytes += bundle->size;
@@ -443,12 +721,19 @@ int ds4_expert_pager_ensure(ds4_expert_pager *pager,
         if (out_pointers) out_pointers[i] = ptr;
     }
 
-    clock_gettime(CLOCK_MONOTONIC, &ts1);
-    double latency = (ts1.tv_sec - ts0.tv_sec) * 1e3 +
-                     (ts1.tv_nsec - ts0.tv_nsec) / 1e6;
     pager->total_pread_latency_ms += latency;
-
     return misses;
+}
+
+void ds4_expert_pager_release_pointers(ds4_expert_pager *pager,
+                                       void **pointers,
+                                       uint32_t n) {
+    if (!pager || !pointers) return;
+    if (pager->cache_data) return;  /* cache owns them; they stay resident */
+    for (uint32_t i = 0; i < n; i++) {
+        free(pointers[i]);
+        pointers[i] = NULL;
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -707,6 +992,17 @@ void ds4_expert_pager_report_stats(const ds4_expert_pager *pager) {
             (unsigned long long)pread_bytes,
             pread_bytes / (1024.0 * 1024.0));
     fprintf(stderr, "Latency:         %.2f ms\n", latency_ms);
+    if (pager->cache_capacity) {
+        fprintf(stderr, "Cache:           %.2f/%.2f GiB, %u resident of %u slots, "
+                "%llu evictions, policy=%s\n",
+                (double)pager->cache_used_bytes / 1073741824.0,
+                (double)pager->cache_budget_bytes / 1073741824.0,
+                pager->cache_resident, pager->cache_capacity,
+                (unsigned long long)pager->cache_evictions,
+                pager->cache_policy == DS4_EXPERT_EVICT_LRU ? "E1-lru" : "E2-scored");
+    } else {
+        fprintf(stderr, "Cache:           disabled (every access is a pread)\n");
+    }
     fprintf(stderr, "==========================\n\n");
 }
 
@@ -810,140 +1106,4 @@ void ds4_expert_pager_get_prediction_stats(const ds4_expert_pager *pager,
     if (out_predictions) *out_predictions = g_predictor.total_selects;
     if (out_hits) *out_hits = 0; /* Will be updated when prediction is validated */
     if (out_hit_rate) *out_hit_rate = 0.0;
-}
-
-/* ---------------------------------------------------------------------------
- * Stage E: Eviction Ladder Implementation
- * --------------------------------------------------------------------------- */
-
-/* Bundle state for eviction tracking */
-typedef enum {
-    DS4_EXPERT_BUNDLE_COLD = 0,
-    DS4_EXPERT_BUNDLE_PREFETCHING,
-    DS4_EXPERT_BUNDLE_READY,
-    DS4_EXPERT_BUNDLE_IN_USE,
-    DS4_EXPERT_BUNDLE_EVICTING,
-} ds4_expert_bundle_state;
-
-/* Per-bundle eviction metadata */
-typedef struct {
-    ds4_expert_bundle_state state;
-    uint64_t access_count;      /* frequency */
-    double recency_score;       /* 1.0 = just used, decays over time */
-    double next_layer_prob;     /* predicted probability of next layer use */
-    uint64_t bundle_size;       /* for cost-aware eviction */
-    uint64_t last_access_time;  /* monotonic timestamp */
-} ds4_expert_eviction_meta;
-
-/* Eviction state */
-static ds4_expert_eviction_meta g_eviction_meta[DS4_EXPERT_PAGER_MAX_BUNDLES] = {0};
-static uint64_t g_eviction_time = 0;
-static pthread_mutex_t g_eviction_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-/* Initialize eviction tracking for a bundle */
-static void ds4_expert_eviction_init(ds4_expert_pager *pager, uint64_t bundle_idx) {
-    if (bundle_idx >= pager->bundles_count) return;
-    pthread_mutex_lock(&g_eviction_mutex);
-    
-    ds4_expert_eviction_meta *meta = &g_eviction_meta[bundle_idx];
-    meta->state = DS4_EXPERT_BUNDLE_READY;
-    meta->access_count = 0;
-    meta->recency_score = 1.0;
-    meta->next_layer_prob = 0.0;
-    meta->bundle_size = pager->bundles[bundle_idx].size;
-    meta->last_access_time = ++g_eviction_time;
-    
-    pthread_mutex_unlock(&g_eviction_mutex);
-}
-
-/* Update eviction metadata on bundle access */
-static void ds4_expert_eviction_update(ds4_expert_pager *pager, uint64_t bundle_idx) {
-    if (bundle_idx >= pager->bundles_count) return;
-    pthread_mutex_lock(&g_eviction_mutex);
-    
-    ds4_expert_eviction_meta *meta = &g_eviction_meta[bundle_idx];
-    meta->access_count++;
-    meta->recency_score = 1.0;
-    meta->last_access_time = ++g_eviction_time;
-    meta->state = DS4_EXPERT_BUNDLE_IN_USE;
-    
-    pthread_mutex_unlock(&g_eviction_mutex);
-}
-
-/* Compute eviction score for a bundle (lower = better to evict) */
-static double ds4_expert_eviction_score(const ds4_expert_eviction_meta *meta) {
-    /* Score = w1*freq + w2*recency + w3*next_layer_prob - w4*size
-     * Lower score = more likely to evict
-     * We invert: high score = keep, low score = evict
-     * So return -score for selection
-     */
-    static const double w1 = 0.3;
-    static const double w2 = 0.3;
-    static const double w3 = 0.2;
-    static const double w4 = 0.2;
-    
-    double freq_score = (double)meta->access_count / 100.0;  /* normalize */
-    double recency_score = meta->recency_score;
-    double prob_score = meta->next_layer_prob;
-    double cost_score = (double)meta->bundle_size / 500000.0;  /* normalize to ~1.0 */
-    
-    /* Return score where higher = better to keep */
-    return w1 * freq_score + w2 * recency_score + w3 * prob_score - w4 * cost_score;
-}
-
-/* Find victim bundle for eviction (lowest score, not in use) */
-static uint64_t ds4_expert_eviction_find_victim(ds4_expert_pager *pager) {
-    pthread_mutex_lock(&g_eviction_mutex);
-    
-    uint64_t best_idx = 0;
-    double best_score = 1e18;
-    
-    for (uint64_t i = 0; i < pager->bundles_count; i++) {
-        ds4_expert_eviction_meta *meta = &g_eviction_meta[i];
-        
-        /* Skip bundles that are IN_USE or PREFETCHING or EVICTING */
-        if (meta->state == DS4_EXPERT_BUNDLE_IN_USE ||
-            meta->state == DS4_EXPERT_BUNDLE_PREFETCHING ||
-            meta->state == DS4_EXPERT_BUNDLE_EVICTING) {
-            continue;
-        }
-        
-        /* Skip if already ready (will be handled by ensure) */
-        if (meta->state != DS4_EXPERT_BUNDLE_READY) {
-            continue;
-        }
-        
-        double score = ds4_expert_eviction_score(meta);
-        if (score < best_score) {
-            best_score = score;
-            best_idx = i;
-        }
-    }
-    
-    pthread_mutex_unlock(&g_eviction_mutex);
-    return best_idx;
-}
-
-/* Decays recency scores over time */
-static void ds4_expert_eviction_decay(void) {
-    pthread_mutex_lock(&g_eviction_mutex);
-    
-    double decay_rate = 0.95;  /* 5% decay per time step */
-    for (uint64_t i = 0; i < DS4_EXPERT_PAGER_MAX_BUNDLES; i++) {
-        ds4_expert_eviction_meta *meta = &g_eviction_meta[i];
-        if (meta->state == DS4_EXPERT_BUNDLE_READY) {
-            meta->recency_score *= decay_rate;
-        }
-    }
-    
-    pthread_mutex_unlock(&g_eviction_mutex);
-}
-
-/* Get eviction stats for reporting */
-void ds4_expert_pager_get_eviction_stats(const ds4_expert_pager *pager,
-                                          uint64_t *out_evictions,
-                                          double *out_avg_score) {
-    (void)pager;
-    if (out_evictions) *out_evictions = 0;  /* Will be incremented in ensure */
-    if (out_avg_score) *out_avg_score = 0.5;  /* Placeholder */
 }

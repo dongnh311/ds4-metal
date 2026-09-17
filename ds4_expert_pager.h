@@ -6,6 +6,9 @@
 
 #define DS4_EXPERT_PAGER_MAX_BUNDLES 73728  /* 48 layers × 512 experts × 3 tensors */
 #define DS4_EXPERT_PAGER_PAGE_SIZE   4096
+/* Experts a single MoE step asks for, per tensor. A cache that cannot hold
+ * this many bundles cannot hold the step in flight. */
+#define DS4_EXPERT_PAGER_MIN_SLOTS   10
 
 typedef struct {
     uint32_t layer;
@@ -45,7 +48,40 @@ typedef struct {
     uint64_t total_misses;
     uint64_t total_hits;
     double total_pread_latency_ms;
+
+    /* Resident bundle cache (Stage E).
+     *
+     * Without it every access is a fresh pread, so the hit rate is 0 by
+     * construction and a 2048-token prefill reads the whole expert working
+     * set 46 times: 1.24 TiB, 36x the read budget. The cache keeps the most
+     * valuable bundles in RAM under a byte budget.
+     *
+     * bundle_lookup maps a bundle index to its resident slot (or -1) and
+     * makes lookup O(1); the previous linear scan over all 73728 bundles ran
+     * once per expert per token. */
+    void **cache_data;             /* [cache_capacity] resident bytes */
+    uint64_t *cache_size;          /* [cache_capacity] bytes in the slot */
+    uint64_t *cache_last_used;     /* [cache_capacity] LRU clock at last hit */
+    uint64_t *cache_access;        /* [cache_capacity] lifetime hit count */
+    int32_t *key_to_bundle;        /* [key_count] bundle idx or -1, fixed */
+    uint64_t key_count;
+    int32_t *cache_bundle;         /* [cache_capacity] bundle idx or -1 */
+    int32_t *bundle_lookup;        /* [bundles_count] resident slot or -1 */
+    uint32_t cache_capacity;
+    uint32_t cache_resident;
+    uint64_t cache_budget_bytes;
+    uint64_t cache_used_bytes;
+    uint64_t cache_clock;
+    uint64_t cache_evictions;
+    uint32_t cache_policy;
 } ds4_expert_pager;
+
+/* Eviction policy. E1 keeps the most recently used; E2 also weights lifetime
+ * frequency so an expert that recurs across tokens survives a burst of
+ * one-shot experts. Selected with DS4_QWEN4_EXPERT_EVICT for the comparison;
+ * the default is whatever that comparison selects. */
+#define DS4_EXPERT_EVICT_LRU 0u
+#define DS4_EXPERT_EVICT_SCORED 1u
 
 /* Open pager — reads bundle file + JSON index */
 bool ds4_expert_pager_open(ds4_expert_pager *pager,
@@ -66,8 +102,20 @@ static inline uint64_t ds4_expert_pager_bundle_size(const ds4_expert_pager *p,
     }
 }
 
-/* Ensure expert is resident in L1 cache.
+/* Give the resident cache a byte budget and build it. Call once after open,
+ * before any ensure. bytes == 0 leaves the pager uncached (every access is a
+ * pread), which is the pre-Stage-E behaviour and is kept for A/B runs. */
+bool ds4_expert_pager_enable_cache(ds4_expert_pager *pager, uint64_t bytes);
+
+/* Ensure expert is resident.
  * tensor_idx: 0=gate, 1=up, 2=down — filters bundles to the requested tensor type.
+ *
+ * Pointers returned in out_pointers belong to the pager's cache, not to the
+ * caller: do not free them, and copy out of them before the next ensure for
+ * the same slot. A resident bundle the caller is still reading cannot be
+ * evicted mid-read because ensure and the copy are both on the calling
+ * thread, and eviction only happens at the top of a later ensure.
+ *
  * Returns: 0 = all resident, >0 = misses occurred */
 int ds4_expert_pager_ensure(ds4_expert_pager *pager,
                             uint32_t layer,
@@ -75,6 +123,14 @@ int ds4_expert_pager_ensure(ds4_expert_pager *pager,
                             uint32_t n_experts,
                             uint32_t tensor_idx,
                             void **out_pointers);
+
+/* Hand back pointers from a previous ensure. With the resident cache on they
+ * are owned by the cache and nothing is freed; without it they are the
+ * pager's own allocations and are released here. The pager owns the lifetime
+ * either way, so the caller never frees them itself. */
+void ds4_expert_pager_release_pointers(ds4_expert_pager *pager,
+                                       void **pointers,
+                                       uint32_t n);
 
 /* Get stats (call at exit for diagnostic report) */
 void ds4_expert_pager_get_stats(const ds4_expert_pager *pager,

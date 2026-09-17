@@ -58540,13 +58540,16 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                 const uint64_t bsize = ds4_expert_pager_bundle_size(g->pager, tid);
                 for (uint32_t e = 0; e < DS4_N_EXPERT_USED; e++) {
                     if (ptrs[e]) {
+                        /* The bytes belong to the pager's cache when the
+                         * resident cache is on, and to the pager's own
+                         * allocation when it is off; ds4_expert_pager_ensure
+                         * owns the lifetime either way. */
                         if (!ds4_gpu_tensor_write(staging, (uint64_t)e * bsize, ptrs[e], bsize)) {
                             ok = false;
                         }
-                        free(ptrs[e]);
-                        ptrs[e] = NULL;
                     }
                 }
+                ds4_expert_pager_release_pointers(g->pager, ptrs, DS4_N_EXPERT_USED);
             }
         }
         ds4_gpu_begin_commands();
@@ -68215,6 +68218,79 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e, int ctx_siz
         return false;
     }
 
+    /*
+     * A cache below one token's routed working set is not a small cache, it is
+     * a re-read storm: each token evicts what the next one is about to ask
+     * for. Measured on the locked artefact at ctx 2048, the plan collapses to
+     * 1 expert from ctx ~8192 onward (the resident model span alone is 41.72
+     * GiB of the 7/8 working-set target), and the pager then reads 1247 GiB
+     * for a 2048-token prefill against 3.6 GiB when the cache fits -- 349x.
+     *
+     * The streaming path already computes the minimum it considers usable
+     * (twice the per-token routed working set) and warns beneath it. Lift the
+     * plan to that floor whenever the working set can hold it, so the warning
+     * means "this machine genuinely cannot fit it" instead of "the budget
+     * arithmetic gave up".
+     *
+     * The floor has to be charged on top of the prefill staging window, not
+     * inside the plan's total. ds4_engine_configure_streaming_cache_budget
+     * carves that window out of the same total before the remainder becomes
+     * the cache, and it grows the window to swallow whatever the total cannot
+     * spare. Charged alone, a 1.36 GiB floor at ctx 8192 became a 1.36 GiB
+     * prefill reserve and a one-expert cache: the reserve is sized first here,
+     * so the floor is only the floor if the total carries both.
+     */
+    {
+        uint32_t routed_layers = 0;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const ds4_layer_weights *l = &e->weights.layer[il];
+            if (l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps) routed_layers++;
+        }
+        const uint64_t min_experts = (uint64_t)routed_layers * DS4_N_EXPERT_USED;
+        const uint64_t floor_experts = 2u * min_experts;
+        if (floor_experts != 0 && plan.cache_experts < floor_experts) {
+            const uint64_t floor_bytes = floor_experts * per_expert_bytes;
+            uint64_t prefill_headroom_bytes = 0;
+            if (!ds4_streaming_prefill_headroom_bytes(&e->weights,
+                                                      &prefill_headroom_bytes)) {
+                prefill_headroom_bytes = 0;
+            }
+            const uint64_t total_floor_bytes = ds4_add_sat_u64(
+                    floor_bytes, prefill_headroom_bytes);
+            const ds4_context_memory ctx_mem = ds4_context_memory_estimate_with_prefill_mode(
+                    e->backend, ctx_size > 0 ? ctx_size : 4096, e->prefill_chunk, true);
+            const uint64_t need = ds4_add_sat_u64(
+                    ds4_add_sat_u64(resident_model_bytes, ctx_mem.total_bytes),
+                    total_floor_bytes);
+            if (need <= recommended) {
+                fprintf(stderr,
+                        "ds4: SSD streaming expert cache raised from %u to %llu experts "
+                        "(%.2f GiB) plus a %.2f GiB prefill reserve to hold one token's "
+                        "routed working set; totals %.2f GiB of the %.2f GiB working set\n",
+                        plan.cache_experts, (unsigned long long)floor_experts,
+                        (double)floor_bytes / 1073741824.0,
+                        (double)prefill_headroom_bytes / 1073741824.0,
+                        (double)need / 1073741824.0,
+                        (double)recommended / 1073741824.0);
+                plan.cache_experts = (uint32_t)floor_experts;
+                plan.effective_cache_bytes = total_floor_bytes;
+            } else {
+                fprintf(stderr,
+                        "ds4: WARNING: SSD streaming expert cache stays at %u experts: "
+                        "the floor of %llu experts (%.2f GiB cache + %.2f GiB prefill "
+                        "reserve) plus the %.2f GiB resident model and %.2f GiB context "
+                        "does not fit the %.2f GiB working set; "
+                        "expect a re-read per access\n",
+                        plan.cache_experts, (unsigned long long)floor_experts,
+                        (double)floor_bytes / 1073741824.0,
+                        (double)prefill_headroom_bytes / 1073741824.0,
+                        (double)resident_model_bytes / 1073741824.0,
+                        (double)ctx_mem.total_bytes / 1073741824.0,
+                        (double)recommended / 1073741824.0);
+            }
+        }
+    }
+
     uint32_t cache_experts = plan.cache_experts;
     uint64_t effective_cache_bytes = plan.effective_cache_bytes;
     const bool glm_full_layer_reserve =
@@ -72919,6 +72995,22 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 s->qwen4_graph.pager = NULL;
             } else {
                 fprintf(stderr, "ds4: Expert pager opened, SSD streaming enabled\n");
+                /* Stage E: give the pager the expert share of the same budget
+                 * the engine's cache plan settled on. Reusing that figure
+                 * means the resident cache cannot over-commit: it is the
+                 * remainder of the working set after the model span, KV and
+                 * buffers, not a second independent claim on RAM. */
+                const uint64_t cache_budget =
+                    ds4_engine_dynamic_expert_cache_bytes(e);
+                if (cache_budget == 0) {
+                    fprintf(stderr,
+                            "ds4: Warning: no expert cache budget; pager stays "
+                            "uncached and every expert access will read the SSD\n");
+                } else if (!ds4_expert_pager_enable_cache(s->qwen4_graph.pager, cache_budget)) {
+                    fprintf(stderr,
+                            "ds4: Warning: pager resident cache unavailable; every "
+                            "expert access will read the SSD\n");
+                }
                 /* Stage C: Start async prefetch worker and allocate double buffers */
                 if (ds4_expert_pager_async_start()) {
                     uint64_t gate_bytes = ds4_expert_pager_bundle_size(s->qwen4_graph.pager, 0);
