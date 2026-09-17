@@ -70341,9 +70341,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
             e->backend == DS4_BACKEND_METAL ||
 #endif
             (opt->first_token_test && e->backend == DS4_BACKEND_CPU);
+        /* SSD streaming or paged expert cache mode is allowed when bundle paths
+         * are provided (Stage B+ pager mode). Otherwise keep the existing restrictions. */
+        const bool ssd_ok = !e->ssd_streaming ||
+                            (e->qwen4_expert_bundle_path && e->qwen4_expert_index_path);
         if (!backend_ok || opt->tp.role != DS4_TP_NONE || opt->cuda_tensor_parallel ||
             opt->distributed.role != DS4_DISTRIBUTED_NONE || load_slice ||
-            e->ssd_streaming || opt->dspark || e->power_percent != 100 ||
+            !ssd_ok || opt->dspark || e->power_percent != 100 ||
             (opt->mtp_path && opt->mtp_path[0])) {
             fprintf(stderr, "ds4: Qwen3.8 requires single-host Metal (or --cpu --first-token-test); "
                             "tensor parallelism, pipeline execution, SSD streaming, DSpark, "
@@ -72614,6 +72618,19 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         const uint32_t cap_tokens = e->prefill_chunk && e->prefill_chunk < (uint32_t)ctx_size ?
             e->prefill_chunk : qwen4_prefill_chunk_tokens((uint32_t)ctx_size);
+        /* Open expert pager early so qwen4_graph_alloc can reserve staging buffers.
+         * The pager is independent of --ssd-streaming; it activates when bundle
+         * paths are provided (Stage B+ paged expert cache mode). */
+        if (e->qwen4_expert_bundle_path && e->qwen4_expert_index_path) {
+            s->qwen4_graph.pager = xcalloc(1, sizeof(*s->qwen4_graph.pager));
+            if (!ds4_expert_pager_open(s->qwen4_graph.pager, e->qwen4_expert_bundle_path, e->qwen4_expert_index_path)) {
+                fprintf(stderr, "ds4: Failed to open expert pager, falling back to resident mode\n");
+                free(s->qwen4_graph.pager);
+                s->qwen4_graph.pager = NULL;
+            } else {
+                fprintf(stderr, "ds4: Expert pager opened, SSD streaming enabled\n");
+            }
+        }
         if (!qwen4_graph_alloc(&s->qwen4_graph, &e->weights, (uint32_t)ctx_size, cap_tokens, e->glm_mtp)) {
             free(s);
             return 1;
@@ -72628,17 +72645,6 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             return 1;
         }
         s->qwen4_graph_ready = true;
-        /* Open expert pager if bundle files are specified */
-        if (e->ssd_streaming && e->qwen4_expert_bundle_path && e->qwen4_expert_index_path) {
-            s->qwen4_graph.pager = xcalloc(1, sizeof(*s->qwen4_graph.pager));
-            if (!ds4_expert_pager_open(s->qwen4_graph.pager, e->qwen4_expert_bundle_path, e->qwen4_expert_index_path)) {
-                fprintf(stderr, "ds4: Failed to open expert pager, falling back to resident mode\n");
-                free(s->qwen4_graph.pager);
-                s->qwen4_graph.pager = NULL;
-            } else {
-                fprintf(stderr, "ds4: Expert pager opened, SSD streaming enabled\n");
-            }
-        }
         s->prefill_cap = (uint32_t)ctx_size;
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
