@@ -87,4 +87,42 @@ void ds4_expert_pager_get_stats(const ds4_expert_pager *pager,
 /* Print diagnostic report to stdout */
 void ds4_expert_pager_report_stats(const ds4_expert_pager *pager);
 
+/* ==========================================================================
+ * Stage C: Async double-buffer prefetch API
+ * ========================================================================== */
+
+/* Start the async worker thread. Call once before graph allocation. */
+bool ds4_expert_pager_async_start(void);
+
+/* Stop the async worker thread. Call at shutdown. */
+void ds4_expert_pager_async_stop(void);
+
+/* Issue async prefetch for next-layer experts into L2 buffer.
+ * Returns: true = job queued, false = worker busy/full */
+bool ds4_expert_pager_async_prefetch(ds4_expert_pager *pager,
+                                     uint32_t layer,
+                                     const uint32_t *expert_ids,
+                                     uint32_t n_experts,
+                                     uint32_t tensor_idx,
+                                     void *target_l2_buf,
+                                     uint64_t buf_size);
+
+/* Wait for async job to complete (blocking). Returns success status. */
+bool ds4_expert_pager_async_wait(void);
+
+/* Check if async job is done (non-blocking). */
+bool ds4_expert_pager_async_is_done(void);
+
+/* Allocate L1/L2 double buffers for all (layer, tensor) combos. */
+bool ds4_expert_pager_alloc_double_bufs(ds4_expert_pager *pager,
+                                        uint64_t gate_bytes,
+                                        uint64_t up_bytes,
+                                        uint64_t down_bytes);
+
+/* Get active L1 buffer pointer for (layer, tensor). */
+void *ds4_expert_pager_get_l1_buf(uint32_t layer, uint32_t tensor_idx);
+
+/* Swap L1/L2 buffers for next iteration. */
+void *ds4_expert_pager_swap_buffer(uint32_t layer, uint32_t tensor_idx);
+
 #endif

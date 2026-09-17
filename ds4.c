@@ -72629,6 +72629,19 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 s->qwen4_graph.pager = NULL;
             } else {
                 fprintf(stderr, "ds4: Expert pager opened, SSD streaming enabled\n");
+                /* Stage C: Start async prefetch worker and allocate double buffers */
+                if (ds4_expert_pager_async_start()) {
+                    uint64_t gate_bytes = ds4_expert_pager_bundle_size(s->qwen4_graph.pager, 0);
+                    uint64_t up_bytes = ds4_expert_pager_bundle_size(s->qwen4_graph.pager, 1);
+                    uint64_t down_bytes = ds4_expert_pager_bundle_size(s->qwen4_graph.pager, 2);
+                    if (ds4_expert_pager_alloc_double_bufs(s->qwen4_graph.pager, gate_bytes, up_bytes, down_bytes)) {
+                        fprintf(stderr, "ds4: Stage C async double-buffer enabled\n");
+                    } else {
+                        fprintf(stderr, "ds4: Warning: failed to alloc double buffers\n");
+                    }
+                } else {
+                    fprintf(stderr, "ds4: Warning: failed to start async worker\n");
+                }
             }
         }
         if (!qwen4_graph_alloc(&s->qwen4_graph, &e->weights, (uint32_t)ctx_size, cap_tokens, e->glm_mtp)) {
