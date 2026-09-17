@@ -66,9 +66,34 @@ the cache-sizing signal (auto cache 1.36 GiB ≪ prefill working set), documente
 in FINDINGS-item-1.4-cacheplan.md — expected per item 1.7, not a leak. The lever
 is cache budget (Phase 4 memory manager), not the eviction policy.
 
-## Next (Phase 2, per order)
-P4 paged-KV wiring (2.1 wire layer_k/v into the page table, 2.2 gate bit-identical,
-2.3 bench page sizes). Requirements being mapped; see the follow-up notes.
+## Next (Phase 2, per order) — MAPPED, decision needed
+Phase 2 = wire the paged KV cache into Qwen4 attention (currently the paged cache
+is ALLOCATED but never used; attention is 100% on the flat resident
+layer_k/v_cache). Two designs (mapped in detail):
+- **Design A "materialize" — CONTAINED, safe, but no memory win.** ~80-150 lines
+  in ds4.c ONLY, no .metal change; bit-identical BY CONSTRUCTION (kernels read a
+  byte-identical staging buffer). Scaffolding (paged_k_staging_full, materialize_kv)
+  is already present. Hooks: ds4.c attn_prep write :58429, attn_decode reads :58369
+  & :58395. It KEEPS the flat buffer, so it proves the plumbing + passes the gate
+  but does NOT reduce memory (the Phase-2 goal).
+- **Design B "in-kernel page table" — delivers the memory win, but SPRAWLING.**
+  3-4 files, 250-500 lines, touches 3 metal kernels (attn_prep :1153, attn_decode
+  :1785, attn_mm :1995) + wrappers; real risk: the paged cache's per-(layer,head)
+  one-head-per-page layout does NOT match the kernels' token-major Hkv-interleaved
+  access, and QSA block-selection assumes contiguous positions. FP-order bit-
+  identity risk if the fetch is restructured.
+Gate: clone run-logit-gate.sh toggling env DS4_QWEN4_KV_PAGED=1 (no new flag).
+Also note: GDN recurrent state + QSA indexer caches (ik_cache/block_key) are
+separate storage NOT covered by the current paged_kv scaffold.
+
+**DECISIONS NEEDED before I proceed on Phase 2:**
+1. Design A (correctness milestone now, memory win later) or Design B (memory win
+   now, higher risk)? My rec: A first (bit-identical, isolates risk), then B for
+   the memory win once plumbing is proven — but A alone won't move the 220K DoD.
+2. The Phase-2 foundation (ds4_kv_cache.c/.h +316 lines, 14/14 tests) is
+   UNCOMMITTED and not from this session. Commit it (yours?) before I build on it?
+I did not start Phase 2 autonomously: it needs these two calls and would entangle
+my commits with your uncommitted WIP / risk the clean Phase-1 state overnight.
 
 ## DoD status
 - **ds4-eval 18/20:** UNCHANGED by construction. The only code change this session
@@ -90,3 +115,15 @@ P4 paged-KV wiring (2.1 wire layer_k/v into the page table, 2.2 gate bit-identic
 - apply_mtp_flag.sh + mtp_on_runs.txt — ready-to-apply MTP-on (needs your OK, gr-7).
 - assemble_stageb.sh — rebuilds stageB-real.csv from run receipts.
 - eviction_ab.sh, run_1_1.sh — the run wrappers used.
+
+## Heads-up: uncommitted KV-cache WIP in the tree (not from this session)
+git status shows uncommitted changes to ds4_kv_cache.c/.h (+316 lines) and
+tests/test_kv_paged.c (+91) that predate this session. It is NOT broken WIP: it
+builds clean and passes **14/14** unit tests (adds ds4_kv_cache_write_token,
+get-page-pointer+offset, materialize_kv contiguous staging, CPU-malloc page
+storage, write_pos tracker — the Phase-2 paged-KV API). I did NOT commit it (not
+mine) and did NOT build Phase 2.1 on top of it, to avoid entangling my commits
+with your uncommitted work and to avoid leaving half-wired attention code
+overnight. Decision for you: commit this KV-cache API work (it is a solid
+foundation) before Phase 2.1 wiring, or tell me to. Phase 2.1 (wire attention to
+read/write K/V via the page table, gate bit-identical) is scoped next.
