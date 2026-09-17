@@ -58352,6 +58352,75 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
  * complete blocks than the budget attend densely; the rest score the pooled
  * block keys and attend their top-k blocks plus the incomplete tail.  The
  * chunk is split at that boundary so every selection list stays bounded. */
+/* Phase 2.1 (spec §25) — paged KV, "materialize" design (bit-identical gate).
+ *
+ * When DS4_QWEN4_KV_PAGED is set the paged_kv_cache is allocated (2*Hkv heads:
+ * heads [0,Hkv) hold K, heads [Hkv,2Hkv) hold V). This round-trip mirrors the
+ * flat resident K/V that attn_prep just wrote for tokens [pos0,pos0+T) INTO the
+ * paged store, then materializes the whole [0,pos0+T) range back OUT of the
+ * paged store into the full staging buffers, interleaved to the kernels'
+ * token-major [tok][Hkv][D] layout. The attention kernels then read the staging
+ * buffers instead of the flat cache. It is a pure memcpy round-trip -- no
+ * arithmetic, no re-quantization -- so it is bit-identical to resident IFF the
+ * paged store's addressing is correct, which is exactly what gate #KV proves.
+ * This is the plumbing milestone; it does NOT yet reduce memory (the flat cache
+ * still exists) -- that is Design B (in-kernel page table), a follow-up.
+ *
+ * attn_prep queues its K/V write on the GPU, so the flat cache must be committed
+ * (end_commands) before the CPU reads it here -- the same ordering the SSD pager
+ * fix required (a plain contents() read does not wait for the GPU). */
+static bool qwen4_paged_kv_active(const ds4_qwen4_gpu_graph *g) {
+    return g->paged_kv_cache.n_layers > 0 && g->paged_k_staging_full[0] != NULL;
+}
+static ds4_gpu_tensor *qwen4_kcache(ds4_qwen4_gpu_graph *g, uint32_t il) {
+    return qwen4_paged_kv_active(g) ? g->paged_k_staging_full[il] : g->layer_k_cache[il];
+}
+static ds4_gpu_tensor *qwen4_vcache(ds4_qwen4_gpu_graph *g, uint32_t il) {
+    return qwen4_paged_kv_active(g) ? g->paged_v_staging_full[il] : g->layer_v_cache[il];
+}
+static bool qwen4_paged_kv_roundtrip(ds4_qwen4_gpu_graph *g, uint32_t il,
+                                     uint32_t pos0, uint32_t T) {
+    if (!qwen4_paged_kv_active(g)) return true;
+    ds4_kv_cache *c = &g->paged_kv_cache;
+    const uint32_t Hkv = DS4_N_HEAD_KV;
+    const uint32_t D = DS4_N_HEAD_DIM;
+    const uint32_t head_bytes = D * 2u;            /* BF16, one head, one token */
+    const uint32_t tok_bytes  = Hkv * head_bytes;  /* kv_dim*2, flat stride/token */
+    /* attn_prep's GPU write of the flat cache must land before we read it. */
+    if (!ds4_gpu_end_commands()) return false;
+    bool ok = true;
+    const uint8_t *kflat = (const uint8_t *)ds4_gpu_tensor_contents(g->layer_k_cache[il]);
+    const uint8_t *vflat = (const uint8_t *)ds4_gpu_tensor_contents(g->layer_v_cache[il]);
+    uint8_t *kst = (uint8_t *)ds4_gpu_tensor_contents(g->paged_k_staging_full[il]);
+    uint8_t *vst = (uint8_t *)ds4_gpu_tensor_contents(g->paged_v_staging_full[il]);
+    if (!kflat || !vflat || !kst || !vst) ok = false;
+    /* mirror the new tokens flat -> paged */
+    for (uint32_t t = 0; t < T && ok; t++) {
+        const uint32_t pos = pos0 + t;
+        for (uint32_t h = 0; h < Hkv && ok; h++) {
+            const uint64_t foff = (uint64_t)pos * tok_bytes + (uint64_t)h * head_bytes;
+            ok = ds4_kv_cache_commit(c, il, h,       pos, kflat + foff, head_bytes) &&
+                 ds4_kv_cache_commit(c, il, Hkv + h, pos, vflat + foff, head_bytes);
+        }
+    }
+    /* materialize the whole [0, pos0+T) range paged -> staging, interleaved */
+    const uint32_t n = pos0 + T;
+    for (uint32_t t = 0; t < n && ok; t++) {
+        for (uint32_t h = 0; h < Hkv && ok; h++) {
+            uint32_t koff = 0, voff = 0;
+            const void *kp = ds4_kv_cache_get_page(c, il, h,       t, &koff);
+            const void *vp = ds4_kv_cache_get_page(c, il, Hkv + h, t, &voff);
+            if (!kp || !vp) { ok = false; break; }
+            const uint64_t soff = (uint64_t)t * tok_bytes + (uint64_t)h * head_bytes;
+            memcpy(kst + soff, (const uint8_t *)kp + koff, head_bytes);
+            memcpy(vst + soff, (const uint8_t *)vp + voff, head_bytes);
+        }
+    }
+    /* resume the command batch for the attention dispatches that follow */
+    if (!ds4_gpu_begin_commands()) return false;
+    return ok;
+}
+
 /* Dense-prefix + sparse-tail attention core for rows [0,T) of the given row
  * views at absolute position cpos0.  n_blocks_after covers the whole chunk
  * (the caller writes the pooled block keys once). */
@@ -58366,7 +58435,7 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
     const uint32_t clast = cpos0 + cT - 1u;
     const uint32_t n_dense = clast < sparse_pos ? cT : (sparse_pos > cpos0 ? sparse_pos - cpos0 : 0u);
     if (n_dense > 0 &&
-        !ds4_gpu_qwen4_attn_decode_tensor(o_rows, q_rows, gate_rows, g->layer_k_cache[il], g->layer_v_cache[il],
+        !ds4_gpu_qwen4_attn_decode_tensor(o_rows, q_rows, gate_rows, qwen4_kcache(g, il), qwen4_vcache(g, il),
                                           g->sel_tokens, g->n_sel, cT <= 2u ? g->attn_part : NULL, n_dense,
                                           DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, cpos0, false, g->sel_stride,
                                           scale)) {
@@ -58392,7 +58461,7 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
                          n_blocks_after, n_sparse, g->k_blocks) &&
         ds4_gpu_qwen4_idx_expand_tensor(g->sel_tokens, g->n_sel, g->sel_blocks, n_sparse, g->k_blocks, ratio,
                                         sp0, g->sel_stride) &&
-        ds4_gpu_qwen4_attn_decode_tensor(o, q, gate, g->layer_k_cache[il], g->layer_v_cache[il],
+        ds4_gpu_qwen4_attn_decode_tensor(o, q, gate, qwen4_kcache(g, il), qwen4_vcache(g, il),
                                          g->sel_tokens, g->n_sel, cT <= 2u ? g->attn_part : NULL, n_sparse,
                                          DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, sp0, true, g->sel_stride,
                                          scale);
@@ -58442,6 +58511,12 @@ static bool qwen4_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
                                             l->indexer_k_norm->abs_offset, first_block,
                                             n_blocks_after - first_block, ratio, DS4_N_INDEXER_HEAD_DIM,
                                             DS4_N_ROT, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS)) {
+        return false;
+    }
+    /* Phase 2.1: round-trip the just-written K/V through the paged store so the
+     * attention reads below consume the paged-materialized staging (no-op unless
+     * DS4_QWEN4_KV_PAGED). */
+    if (!qwen4_paged_kv_roundtrip(g, il, pos0, T)) {
         return false;
     }
     if (T == 3u && g->verify_rows_exact) {
@@ -73054,16 +73129,18 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 page_size = DS4_KV_CACHE_DEFAULT_PAGE_TOKENS;
             }
             fprintf(stderr, "ds4: Initializing paged KV cache (%u tokens/page)\n", page_size);
+            /* 2*Hkv heads: [0,Hkv) hold K, [Hkv,2Hkv) hold V (one cache, both
+             * tensors) -- see the Phase 2.1 round-trip in qwen4_graph_attention. */
             if (!ds4_kv_cache_init(&s->qwen4_graph.paged_kv_cache,
                                    (uint32_t)ctx_size,
                                    DS4_N_LAYER,
-                                   DS4_N_HEAD_KV,
+                                   2u * DS4_N_HEAD_KV,
                                    DS4_N_HEAD_DIM,
                                    page_size)) {
                 fprintf(stderr, "ds4: Warning: failed to init paged KV cache, using resident mode\n");
             } else {
-                fprintf(stderr, "ds4: Paged KV cache initialized for %u layers, %u heads, %u dim\n",
-                        DS4_N_LAYER, DS4_N_HEAD_KV, DS4_N_HEAD_DIM);
+                fprintf(stderr, "ds4: Paged KV cache initialized for %u layers, %u heads (K+V), %u dim\n",
+                        DS4_N_LAYER, 2u * DS4_N_HEAD_KV, DS4_N_HEAD_DIM);
             }
         }
 

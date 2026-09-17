@@ -44,3 +44,4 @@ __pycache__/
 *.corrupt-backup
 /speed-bench/stageb-runs/*.stderr
 /speed-bench/stageb-runs/*.decoded.txt
+/speed-bench/kv-gate/*/frontier_*.json
