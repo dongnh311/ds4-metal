@@ -125,4 +125,39 @@ void *ds4_expert_pager_get_l1_buf(uint32_t layer, uint32_t tensor_idx);
 /* Swap L1/L2 buffers for next iteration. */
 void *ds4_expert_pager_swap_buffer(uint32_t layer, uint32_t tensor_idx);
 
+/* ==========================================================================
+ * Stage D: Predictive next-layer prefetch API
+ * ========================================================================== */
+
+/* Record expert selection for predictor training.
+ * Call after each layer's router completes. */
+void ds4_expert_pager_record_selection(ds4_expert_pager *pager,
+                                       uint32_t layer,
+                                       const uint32_t *expert_ids,
+                                       uint32_t n_experts);
+
+/* Predict next layer's experts using simple heuristic:
+ * Returns: true = prediction available, false = no prediction
+ * Uses: same-expert recurrence (layer N experts ≈ layer N+1) */
+bool ds4_expert_pager_predict_next_layer(ds4_expert_pager *pager,
+                                         uint32_t next_layer,
+                                         uint32_t *out_expert_ids,
+                                         uint32_t *out_n_experts);
+
+/* Issue async prefetch for predicted next-layer experts.
+ * Returns: true = prefetch issued, false = no prediction/worker busy */
+bool ds4_expert_pager_prefetch_predicted(ds4_expert_pager *pager,
+                                         uint32_t next_layer,
+                                         const uint32_t *predicted_experts,
+                                         uint32_t n_experts,
+                                         uint32_t tensor_idx,
+                                         void *target_l2_buf,
+                                         uint64_t buf_size);
+
+/* Get prediction statistics */
+void ds4_expert_pager_get_prediction_stats(const ds4_expert_pager *pager,
+                                           uint64_t *out_predictions,
+                                           uint64_t *out_hits,
+                                           double *out_hit_rate);
+
 #endif
