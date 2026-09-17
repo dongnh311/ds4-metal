@@ -128,7 +128,7 @@ static int test_kv_stats(void) {
 static int test_kv_page_sizes(void) {
     /* Test all three valid page sizes */
     uint32_t page_sizes[] = {256, 512, 1024};
-    
+
     for (int i = 0; i < 3; i++) {
         ds4_kv_cache cache;
         bool ok = ds4_kv_cache_init(&cache, 2048, 4, 8, 64, page_sizes[i]);
@@ -136,7 +136,49 @@ static int test_kv_page_sizes(void) {
         assert(cache.page_size_tokens == page_sizes[i]);
         ds4_kv_cache_free(&cache);
     }
-    
+
+    return 1;
+}
+
+static int test_kv_fp8_enable(void) {
+    ds4_kv_cache cache;
+    bool ok = ds4_kv_cache_init(&cache, 1024, 4, 8, 64, 256);
+    assert(ok);
+    assert(cache.storage_mode == 0); /* BF16 default */
+
+    ok = ds4_kv_cache_enable_fp8(&cache);
+    assert(ok);
+    assert(cache.storage_mode == 1);
+    assert(cache.page_scales != NULL);
+    assert(cache.n_pages > 0);
+
+    /* Verify scales allocated for each page */
+    for (uint32_t i = 0; i < cache.n_pages; i++) {
+        assert(cache.page_scales[i] != NULL);
+    }
+
+    ds4_kv_cache_free(&cache);
+    return 1;
+}
+
+static int test_kv_fp8_enable_null_cache(void) {
+    bool ok = ds4_kv_cache_enable_fp8(NULL);
+    assert(!ok);
+    return 1;
+}
+
+static int test_kv_fp8_double_enable(void) {
+    ds4_kv_cache cache;
+    bool ok = ds4_kv_cache_init(&cache, 1024, 4, 8, 64, 256);
+    assert(ok);
+
+    ok = ds4_kv_cache_enable_fp8(&cache);
+    assert(ok);
+    ok = ds4_kv_cache_enable_fp8(&cache); /* already FP8, should succeed */
+    assert(ok);
+    assert(cache.storage_mode == 1);
+
+    ds4_kv_cache_free(&cache);
     return 1;
 }
 
@@ -152,7 +194,10 @@ int main(void) {
     TEST(kv_commit_null_data);
     TEST(kv_stats);
     TEST(kv_page_sizes);
-    
+    TEST(kv_fp8_enable);
+    TEST(kv_fp8_enable_null_cache);
+    TEST(kv_fp8_double_enable);
+
     printf("\nResults: %d passed, %d failed\n", tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

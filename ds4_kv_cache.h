@@ -23,15 +23,21 @@ typedef struct {
     uint32_t head_dim;           /* dimension per head */
     uint32_t n_pages;            /* total pages allocated */
     uint32_t n_tokens_used;      /* total tokens in cache */
-    
+
+    /* Storage mode: 0=BF16, 1=FP8 (per-token scale) */
+    uint32_t storage_mode;       /* 0=BF16, 1=FP8_E4M3 */
+
     /* Page table: maps logical token position to physical page */
     ds4_kv_page_entry *page_table;
     uint32_t page_table_capacity;
-    
+
     /* Physical page storage (GPU-visible) */
     void **page_buffers;         /* array of MTLBuffer pointers */
     uint32_t *page_refcount;     /* reference count for each page */
-    
+
+    /* Per-token scales for FP8 mode */
+    uint8_t **page_scales;       /* [page][tokens] FP8 E4M3 scales */
+
     /* Metadata */
     uint64_t total_bytes;
     uint64_t page_allocs;
@@ -45,6 +51,9 @@ bool ds4_kv_cache_init(ds4_kv_cache *cache,
                        uint32_t n_heads,
                        uint32_t head_dim,
                        uint32_t page_size_tokens);
+
+/* Enable FP8 storage mode (re-allocates with scales) */
+bool ds4_kv_cache_enable_fp8(ds4_kv_cache *cache);
 
 /* Free paged KV cache */
 void ds4_kv_cache_free(ds4_kv_cache *cache);

@@ -9,6 +9,9 @@
 
 #include "ds4_expert_pager.h"
 
+/* Weak stub for Metal symbol — tests don't need real Metal */
+void __attribute__((weak)) ds4_gpu_stream_expert_cache_note_service_thread(void) {}
+
 /* ---------------------------------------------------------------------------
  * Test fixtures
  * --------------------------------------------------------------------------- */

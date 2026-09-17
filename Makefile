@@ -126,6 +126,23 @@ tests/test_metal_tp_spec: tests/test_metal_tp_spec.o $(CORE_OBJS)
 tests/test_metal_tp_cancel: tests/test_metal_tp_cancel.c ds4.h ds4_tp.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
 
+# Unit tests for kv cache and expert pager
+tests/test_kv_paged.o: tests/test_kv_paged.c ds4_kv_cache.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_kv_paged: tests/test_kv_paged.o ds4_kv_cache.o
+	$(CC) $(CFLAGS) -o $@ $^ -lm -pthread
+
+tests/test_expert_pager.o: tests/test_expert_pager.c ds4_expert_pager.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_expert_pager: tests/test_expert_pager.o ds4_expert_pager.o
+	$(CC) $(CFLAGS) -o $@ $< ds4_expert_pager.o -lm -pthread
+
+test-unit: tests/test_kv_paged tests/test_expert_pager
+	./tests/test_kv_paged
+	./tests/test_expert_pager
+
 test-metal-session-batch: tests/test_metal_session_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_session_batch
 

@@ -95,7 +95,13 @@ bool ds4_kv_cache_init(ds4_kv_cache *cache,
 
 void ds4_kv_cache_free(ds4_kv_cache *cache) {
     if (!cache) return;
-    
+
+    if (cache->page_scales) {
+        for (uint32_t i = 0; i < cache->n_pages; i++) {
+            free(cache->page_scales[i]);
+        }
+        free(cache->page_scales);
+    }
     if (cache->page_buffers) {
         for (uint32_t i = 0; i < cache->n_pages; i++) {
             free(cache->page_buffers[i]);
@@ -104,8 +110,44 @@ void ds4_kv_cache_free(ds4_kv_cache *cache) {
     }
     free(cache->page_refcount);
     free(cache->page_table);
-    
+
     memset(cache, 0, sizeof(*cache));
+}
+
+/* ---------------------------------------------------------------------------
+ * FP8 storage mode (Phase 2)
+ * --------------------------------------------------------------------------- */
+
+bool ds4_kv_cache_enable_fp8(ds4_kv_cache *cache) {
+    if (!cache) return false;
+    if (cache->storage_mode != 0) return true; /* already FP8 */
+
+    cache->storage_mode = 1;
+
+    /* Allocate per-token scale buffers for each page */
+    cache->page_scales = calloc(cache->page_table_capacity, sizeof(uint8_t *));
+    if (!cache->page_scales) {
+        fprintf(stderr, "ds4_kv_cache: failed to alloc FP8 scales\n");
+        cache->storage_mode = 0;
+        return false;
+    }
+
+    for (uint32_t i = 0; i < cache->n_pages; i++) {
+        cache->page_scales[i] = malloc(cache->page_size_tokens);
+        if (!cache->page_scales[i]) {
+            /* Roll back allocated scales */
+            for (uint32_t j = 0; j < i; j++) {
+                free(cache->page_scales[j]);
+            }
+            free(cache->page_scales);
+            cache->page_scales = NULL;
+            cache->storage_mode = 0;
+            return false;
+        }
+    }
+
+    fprintf(stderr, "ds4_kv_cache: FP8 mode enabled for %u pages\n", cache->n_pages);
+    return true;
 }
 
 /* ---------------------------------------------------------------------------
