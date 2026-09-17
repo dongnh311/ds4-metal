@@ -8240,6 +8240,118 @@ static void model_map_span_vec_include_layer_decode_static(ds4_model_map_span_ve
 #undef DS4_INCLUDE_TENSOR
 }
 
+/* Expanded variant: includes routed-expert tensors for non-uniform-slab
+ * layers (e.g., Qwen4 blk.0 whose experts are larger than the common slab). */
+static void model_map_span_vec_include_layer_decode_static_full(
+        ds4_model_map_span_vec *spans, const ds4_layer_weights *l) {
+#define DS4_INCLUDE_TENSOR(t_) model_map_span_vec_include_one(spans, (t_))
+    DS4_INCLUDE_TENSOR(l->hc_attn_fn);
+    DS4_INCLUDE_TENSOR(l->hc_attn_scale);
+    DS4_INCLUDE_TENSOR(l->hc_attn_base);
+    DS4_INCLUDE_TENSOR(l->attn_norm);
+    DS4_INCLUDE_TENSOR(l->attn_q_a);
+    DS4_INCLUDE_TENSOR(l->attn_q_a_norm);
+    DS4_INCLUDE_TENSOR(l->attn_q_b);
+    DS4_INCLUDE_TENSOR(l->attn_kv);
+    DS4_INCLUDE_TENSOR(l->attn_kv_a_mqa);
+    DS4_INCLUDE_TENSOR(l->attn_kv_a_norm);
+    DS4_INCLUDE_TENSOR(l->attn_k_b);
+    DS4_INCLUDE_TENSOR(l->attn_v_b);
+    DS4_INCLUDE_TENSOR(l->attn_sinks);
+    DS4_INCLUDE_TENSOR(l->attn_output);
+    DS4_INCLUDE_TENSOR(l->attn_output_a);
+    DS4_INCLUDE_TENSOR(l->attn_output_b);
+    DS4_INCLUDE_TENSOR(l->kda_q);
+    DS4_INCLUDE_TENSOR(l->kda_k);
+    DS4_INCLUDE_TENSOR(l->kda_v);
+    DS4_INCLUDE_TENSOR(l->kda_q_conv);
+    DS4_INCLUDE_TENSOR(l->kda_k_conv);
+    DS4_INCLUDE_TENSOR(l->kda_v_conv);
+    DS4_INCLUDE_TENSOR(l->kda_f_a);
+    DS4_INCLUDE_TENSOR(l->kda_f_b);
+    DS4_INCLUDE_TENSOR(l->kda_dt_bias);
+    DS4_INCLUDE_TENSOR(l->kda_a_log);
+    DS4_INCLUDE_TENSOR(l->kda_beta);
+    DS4_INCLUDE_TENSOR(l->kda_g_a);
+    DS4_INCLUDE_TENSOR(l->kda_g_b);
+    DS4_INCLUDE_TENSOR(l->kda_o_norm);
+    DS4_INCLUDE_TENSOR(l->kda_output);
+    DS4_INCLUDE_TENSOR(l->attn_compressor_ape);
+    DS4_INCLUDE_TENSOR(l->attn_compressor_kv);
+    DS4_INCLUDE_TENSOR(l->attn_compressor_gate);
+    DS4_INCLUDE_TENSOR(l->attn_compressor_norm);
+    DS4_INCLUDE_TENSOR(l->indexer_attn_q_b);
+    DS4_INCLUDE_TENSOR(l->indexer_attn_k);
+    DS4_INCLUDE_TENSOR(l->indexer_k_norm);
+    DS4_INCLUDE_TENSOR(l->indexer_k_norm_b);
+    DS4_INCLUDE_TENSOR(l->indexer_proj);
+    DS4_INCLUDE_TENSOR(l->indexer_compressor_ape);
+    DS4_INCLUDE_TENSOR(l->indexer_compressor_kv);
+    DS4_INCLUDE_TENSOR(l->indexer_compressor_gate);
+    DS4_INCLUDE_TENSOR(l->indexer_compressor_norm);
+    DS4_INCLUDE_TENSOR(l->hc_ffn_fn);
+    DS4_INCLUDE_TENSOR(l->hc_ffn_scale);
+    DS4_INCLUDE_TENSOR(l->hc_ffn_base);
+    DS4_INCLUDE_TENSOR(l->ffn_norm);
+    DS4_INCLUDE_TENSOR(l->ffn_gate_tid2eid);
+    DS4_INCLUDE_TENSOR(l->ffn_gate);
+    DS4_INCLUDE_TENSOR(l->ffn_up);
+    DS4_INCLUDE_TENSOR(l->ffn_down);
+    DS4_INCLUDE_TENSOR(l->ffn_gate_inp);
+    DS4_INCLUDE_TENSOR(l->ffn_exp_probs_b);
+    DS4_INCLUDE_TENSOR(l->ffn_exp_probs_vl);
+    DS4_INCLUDE_TENSOR(l->ffn_gate_shexp);
+    DS4_INCLUDE_TENSOR(l->ffn_up_shexp);
+    DS4_INCLUDE_TENSOR(l->ffn_down_shexp);
+    /* Include routed-expert tensors for non-uniform-slab coverage */
+    DS4_INCLUDE_TENSOR(l->ffn_gate_exps);
+    DS4_INCLUDE_TENSOR(l->ffn_up_exps);
+    DS4_INCLUDE_TENSOR(l->ffn_down_exps);
+    DS4_INCLUDE_TENSOR(l->nextn_eh_proj);
+    DS4_INCLUDE_TENSOR(l->nextn_enorm);
+    DS4_INCLUDE_TENSOR(l->nextn_hnorm);
+    DS4_INCLUDE_TENSOR(l->nextn_shared_head_norm);
+    DS4_INCLUDE_TENSOR(l->engram_kv);
+    DS4_INCLUDE_TENSOR(l->engram_q_norm);
+    DS4_INCLUDE_TENSOR(l->engram_k_norm);
+    DS4_INCLUDE_TENSOR(l->hc_attn_norm);
+    DS4_INCLUDE_TENSOR(l->hc_attn_down);
+    DS4_INCLUDE_TENSOR(l->hc_attn_up);
+    DS4_INCLUDE_TENSOR(l->hc_attn_inject);
+    DS4_INCLUDE_TENSOR(l->hc_ffn_norm);
+    DS4_INCLUDE_TENSOR(l->hc_ffn_down);
+    DS4_INCLUDE_TENSOR(l->hc_ffn_up);
+    DS4_INCLUDE_TENSOR(l->hc_ffn_inject);
+    DS4_INCLUDE_TENSOR(l->attn_q);
+    DS4_INCLUDE_TENSOR(l->attn_k);
+    DS4_INCLUDE_TENSOR(l->attn_v);
+    DS4_INCLUDE_TENSOR(l->attn_q_norm);
+    DS4_INCLUDE_TENSOR(l->attn_k_norm);
+    DS4_INCLUDE_TENSOR(l->indexer_q_proj);
+    DS4_INCLUDE_TENSOR(l->indexer_k_proj);
+    DS4_INCLUDE_TENSOR(l->indexer_q_norm);
+    DS4_INCLUDE_TENSOR(l->lin_qkv);
+    DS4_INCLUDE_TENSOR(l->lin_gate);
+    DS4_INCLUDE_TENSOR(l->lin_conv);
+    DS4_INCLUDE_TENSOR(l->lin_dt_bias);
+    DS4_INCLUDE_TENSOR(l->lin_a);
+    DS4_INCLUDE_TENSOR(l->lin_beta);
+    DS4_INCLUDE_TENSOR(l->lin_alpha);
+    DS4_INCLUDE_TENSOR(l->lin_norm);
+    DS4_INCLUDE_TENSOR(l->lin_out);
+    DS4_INCLUDE_TENSOR(l->ple_key);
+    DS4_INCLUDE_TENSOR(l->ple_value);
+    DS4_INCLUDE_TENSOR(l->ple_norm_key);
+    DS4_INCLUDE_TENSOR(l->ple_norm_query);
+    DS4_INCLUDE_TENSOR(l->ple_norm_conv);
+    DS4_INCLUDE_TENSOR(l->ple_conv);
+    DS4_INCLUDE_TENSOR(l->ffn_gate_inp_shexp);
+    DS4_INCLUDE_TENSOR(l->nextn_hc_head_norm);
+    DS4_INCLUDE_TENSOR(l->nextn_hc_head_down);
+    DS4_INCLUDE_TENSOR(l->nextn_hc_head_up);
+#undef DS4_INCLUDE_TENSOR
+}
+
 static bool glm_stream_resident_decode_layer_supported(
         const ds4_layer_weights *l,
         uint32_t                 il) {
@@ -8574,6 +8686,23 @@ static DS4_MAYBE_UNUSED bool weights_model_map_decode_static_spans(
     if (include_token) model_map_span_vec_include_one(spans, w->token_embd);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         model_map_span_vec_include_layer_decode_static(spans, &w->layer[il]);
+    }
+    if (include_output) model_map_span_vec_include_output(spans, w);
+    return model_map_span_vec_finish(spans);
+}
+
+static DS4_MAYBE_UNUSED bool weights_model_map_decode_static_full_spans(
+        const ds4_weights *w,
+        bool include_token,
+        bool include_output,
+        ds4_model_map_span_vec *spans) {
+    if (!w || !spans) return false;
+    memset(spans, 0, sizeof(*spans));
+    if (include_token) model_map_span_vec_include_one(spans, w->token_embd);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        /* Use full variant to include routed-expert tensors, needed for
+         * non-uniform-slab layers (e.g., Qwen4 blk.0). */
+        model_map_span_vec_include_layer_decode_static_full(spans, &w->layer[il]);
     }
     if (include_output) model_map_span_vec_include_output(spans, w);
     return model_map_span_vec_finish(spans);
@@ -71216,7 +71345,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
                             &spans);
                 }
             } else {
-                spans_ok = weights_model_map_token_spans(&e->weights, &spans);
+                /* Qwen4 MoE: use full decode-static map including routed-expert
+                 * tensors so non-uniform-slab layers (e.g., blk.0) have their
+                 * expert blobs covered in the initial model view.
+                 * include_output=true so output.head tensors (output.weight,
+                 * output_hc_norm/down/up) are included — they sit in the gap
+                 * between token_embd and the first blk.0 tensor and are needed
+                 * for the final hc_mix pass during prefill. */
+                spans_ok = weights_model_map_decode_static_full_spans(&e->weights, true, true, &spans);
             }
             if (!spans_ok) {
                 fprintf(stderr, "ds4: invalid SSD streaming initial token embedding map\n");
