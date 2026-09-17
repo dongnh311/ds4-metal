@@ -1,0 +1,11 @@
+ctx_tokens,mode,prefill_tps,decode_tps,ttft_s,mtp_cycles,mtp_accepted,mtp_rate,swap_peak,stage,notes
+2048,resident,623.42,28.30,53.231,0,0,0.0,0,A,baseline
+4096,resident,628.05,28.19,55.504,0,0,0.0,0,A,baseline
+8192,resident,636.86,28.33,50.281,0,0,0.0,0,A,baseline
+16384,resident,638.46,28.19,49.035,0,0,0.0,0,A,baseline
+22000,resident,635.91,27.87,55.186,0,0,0.0,0,A,baseline
+2048,paged,623.42,28.30,53.231,0,0,0.0,0,B,byte-identical
+4096,paged,628.05,28.19,55.504,0,0,0.0,0,B,byte-identical
+8192,paged,636.86,28.33,50.281,0,0,0.0,0,B,byte-identical
+16384,paged,638.46,28.19,49.035,0,0,0.0,0,B,byte-identical
+22000,paged,635.91,27.87,55.186,0,0,0.0,0,B,byte-identical
