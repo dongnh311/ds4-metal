@@ -1,0 +1,9 @@
+== before ==
+model_sha256=ed238d8d50c6fb4b504c2796c3bc82b2a9f6c21566ad29bdbfdbadfe01e28d7a (verified in gate; file stat below)
+gguf/Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q2KDownPad768-MTP-NNgram.gguf size=147207127040 mtime=1789518632 inode=46852249
+qwen38-experts.bin size=36842766336 mtime=1789646965 inode=47552126
+qwen38-experts.index.json size=20541572 mtime=1789647045 inode=47552308
+== after (rc=0) ==
+gguf/Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q2KDownPad768-MTP-NNgram.gguf size=147207127040 mtime=1789518632 inode=46852249
+qwen38-experts.bin size=36842766336 mtime=1789646965 inode=47552126
+qwen38-experts.index.json size=20541572 mtime=1789647045 inode=47552308
