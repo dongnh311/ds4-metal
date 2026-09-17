@@ -8,6 +8,20 @@
 set -eu
 
 CTX=${1:-512}
+# Prefill chunk cap. Gate #5 tests the PAGER (SSD-streamed expert bytes vs
+# mmap'd resident bytes) -- it must hold the compute KERNEL constant so the
+# only variable is the weight source. At chunk T>8 the resident prefill takes
+# the tiled "mm" GEMM, whose dot-product accumulation order differs from the
+# per-token decode kernel by floating-point non-associativity; the paged path
+# structurally cannot use "mm" (its staging buffer holds one token's experts),
+# so it always runs per-token. Comparing mm-resident vs per-token-paged mixes
+# a kernel-ordering difference into the pager test (~1.88 max logit diff, all
+# lanes, argmax stable -- inherent to any tiled GEMM, NOT a pager bug). Capping
+# to 8 forces resident onto the same per-token kernel the pager uses, so the
+# comparison isolates the pager and is bit-identical when the pager is correct.
+# This is the same per-token path the paged run uses at any bench ctx (decode
+# and streamed prefill are per-token), so the gate stays representative.
+CHUNK=${2:-8}
 OUTDIR=speed-bench/logit-gate
 RESIDENT_DIR="$OUTDIR/resident"
 PAGED_DIR="$OUTDIR/paged"
@@ -32,15 +46,15 @@ if [ "$have" != "$WANT_SHA" ]; then
     exit 1
 fi
 
-echo "== resident, ctx=$CTX ==" >&2
+echo "== resident, ctx=$CTX prefill-chunk=$CHUNK ==" >&2
 ./ds4-bench -m "$MODEL" --prompt-file "$PROMPT" \
-    --ctx-start "$CTX" --ctx-max "$CTX" --gen-tokens 0 \
+    --ctx-start "$CTX" --ctx-max "$CTX" --gen-tokens 0 --prefill-chunk "$CHUNK" \
     --dump-frontier-logits-dir "$RESIDENT_DIR" \
     --csv "$OUTDIR/resident.csv" >&2
 
-echo "== paged (ssd streaming), ctx=$CTX ==" >&2
+echo "== paged (ssd streaming), ctx=$CTX prefill-chunk=$CHUNK ==" >&2
 ./ds4-bench -m "$MODEL" --prompt-file "$PROMPT" \
-    --ctx-start "$CTX" --ctx-max "$CTX" --gen-tokens 0 \
+    --ctx-start "$CTX" --ctx-max "$CTX" --gen-tokens 0 --prefill-chunk "$CHUNK" \
     --ssd-streaming --qwen4-expert-bundle "$BUNDLE" --qwen4-expert-index "$INDEX" \
     --dump-frontier-logits-dir "$PAGED_DIR" \
     --csv "$OUTDIR/paged.csv" >&2

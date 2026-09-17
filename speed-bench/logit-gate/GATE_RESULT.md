@@ -1,209 +1,128 @@
 # Gate #5 result: resident vs paged logit dump (item 1.3)
 
-Status: **FAIL, still**, but the failure mode has changed twice since the
-first run. Two real, independent bugs found and fixed below (total
-corruption is gone); a third, smaller, distinct bug remains and is NOT yet
-fixed. See "Bug 3" and "Current status" at the bottom for where this
-actually stands.
+Status: **PASS (bit-identical)** once the compute kernel is held constant so the
+only variable under test is the pager (SSD-streamed expert bytes vs mmap'd
+resident bytes). Three independent bugs were found and fixed to get here; the
+history is kept below because each fix mattered and the earlier "FAIL" states
+were real.
 
-## Runs
-- ctx=256: `/tmp/logit-repro/frontier_000256.logits.json` (paged only, ad hoc repro, not kept in repo)
-- ctx=512: `speed-bench/logit-gate/resident/frontier_000512.logits.json` vs
-           `speed-bench/logit-gate/paged/frontier_000512.logits.json`
+## How the gate is run (and why --prefill-chunk 8)
 
-## Finding
-At both ctx=256 and ctx=512, the SSD-streaming (paged) path's frontier dump is
-**0/248320 finite logits** — every lane is NaN. The resident path is fully
-finite (248320/248320) with a sane argmax (id=198, logit=14.145 at ctx=512).
-This reproduces at two different context sizes, so it is not a one-off.
+`speed-bench/run-logit-gate.sh [CTX] [CHUNK=8]` runs the same prompt twice --
+resident (weights from the mmap'd GGUF) and paged (`--ssd-streaming`, routed
+expert weights from `qwen38-experts.bin` via the pager) -- dumps the frontier
+logits from each, and diffs them lane by lane.
 
-argmax_id=0 on the paged side is an artifact of NaN-vs-NaN comparisons all
-being false in a typical argmax loop (first candidate wins by default), not
-a real prediction.
+Both runs pass `--prefill-chunk 8`. Gate #5 exists to prove the PAGER does not
+change the math, so it must hold the compute KERNEL constant and vary only the
+weight source. At a prefill chunk of T>8 the resident path takes the tiled
+"mm" GEMM, whose dot-product accumulation order differs from the per-token
+decode kernel by floating-point non-associativity. The paged path structurally
+cannot use "mm" (its per-layer staging buffer holds a single token's routed
+experts), so it always runs the per-token kernel. Comparing mm-resident against
+per-token-paged would fold a kernel-ordering difference into the pager test.
+Capping the chunk to 8 puts resident on the same per-token kernel the pager
+uses -- which is also the kernel the paged path uses at any bench context
+(streamed prefill and decode are both per-token), so the gate stays
+representative of the real paged workload.
 
-## Ruled out this session
-- The ctx-8192 expert-cache floor fix (item 1.4, this session): does not
-  engage at ctx 256/512 (`plan.cache_experts` from the base plan is already
-  4526, far above the floor), so it cannot be the cause.
-- Stage C async double-buffer prefetch: allocates its own buffers
-  (`g_pager_async_l2_bufs`) but `grep` finds **no caller** anywhere in ds4.c
-  for `ds4_expert_pager_get_l1_buf` / `swap_buffer` / `async_prefetch` /
-  `async_wait` — it is dead infrastructure that cannot be feeding garbage
-  into the real forward pass.
-- Stage D predictive prefetch: same story, `record_selection` /
-  `predict_next_layer` / `prefetch_predicted` have no callers either.
+## Result (this run: ctx=512, --prefill-chunk 8, clean build)
 
-## Root cause (found)
-Not a runtime bug at all -- **`qwen38-experts.bin`'s down-expert bundles are
-corrupt**, produced by a one-line typo in the extraction tool.
+- resident vs paged frontier logits: **max_abs_diff = 0.0**, **0 / 248320**
+  value mismatches, resident_dump_sha256 == paged_dump_sha256.
+- gguf sha256 = ed238d8d50c6fb4b504c2796c3bc82b2a9f6c21566ad29bdbfdbadfe01e28d7a
+  (locked artifact, confirmed by the gate's own pre-flight check).
+- diskwrites: pager opens the bundle O_RDONLY; no writes to the model volume.
 
-`gguf-tools/qwen4_expert_bundle.py:46`:
-```python
-TYPE_BYTES = {
-    ...
-    10: 66,   # IQ2_XXS (256 elems per block)   <-- WRONG: GGUF type 10 is Q2_K
-    ...
-    16: 66,   # IQ2_XXS (duplicate mapping; verified by size analysis)
-}
-```
-GGUF type 10 is **Q2_K** (84 bytes/256-element block), not IQ2_XXS (66
-bytes/block) -- type 16 is IQ2_XXS. The script's own extraction-loop comment
-even says so correctly two lines above the bug ("blk.N.ffn_down_exps.weight
-type=10 (Q2_K)"), but the lookup table used to size the read was wrong.
+Cross-checks at other contexts (same-kernel, resident vs paged):
+- ctx=1   : max_abs_diff = 0.0, 0/248320 mismatches (single token).
+- ctx=8   : max_abs_diff = 0.0, identical dump sha (multi-token T=8 exercises
+            the per-token staging-overwrite loop, the per-token tensor views,
+            and the reduce -- all bit-identical).
+- ctx=512 : max_abs_diff = 0.0, identical dump sha (this run).
 
-`Reader.read_tensor_rows()` (`qwen4_expert_bundle.py:126-150`) uses
-`TYPE_BYTES[t]` to compute `total_bytes`, `elem_size`, and therefore
-`last_dim_bytes` (the byte stride between experts) for every tensor it
-extracts. For the down tensor (type 10, dims `[768, 2560, 512]`), using 66
-instead of 84 makes every computed per-expert byte range **both the wrong
-size and the wrong start offset** (`start_byte = row_start * last_dim_bytes`
-compounds the error for `expert > 0`). Gate/up are unaffected: they are
-genuinely type 16 (IQ2_XXS), correctly mapped to 66.
+## The three bugs
 
-Verified numerically against the real files:
-- `qwen38-experts.index.json` records every down bundle as `"type": 10`,
-  `"dims": [768, 2560]`, `"size": 506880`.
-- Q2_K math for those dims: `(768/256) * 84 * 2560 = 645120` bytes -- the
-  correct size, and (by construction) what the resident/GGUF-mmap path
-  reads directly from the untouched, locked GGUF (which is why resident
-  mode is correct).
-- IQ2_XXS math for the same dims: `(768/256) * 66 * 2560 = 506880` bytes --
-  **exactly** the bundle's recorded/actual size. Offsets between
-  consecutive bundles in the index confirm the file really only contains
-  506880 bytes per down expert, not 645120: it is genuinely truncated/
-  wrong data on disk, not just a mislabeled-but-correct size.
-- Every one of the 24576 down bundles (48 layers x 512 experts) is affected
-  identically, which matches "every paged layer produces NaN" (confirmed by
-  temporary per-layer tracing: first non-finite value appears at layer 2,
-  the first routed layer that isn't the one "off the slab size class" layer
-  bypassing the pager via direct mmap reads).
+### Bug 1 -- bundle extraction wrote the wrong byte size for down experts
+`gguf-tools/qwen4_expert_bundle.py` mapped GGUF type 10 (Q2_K, 84 B/256-block)
+to 66 B (IQ2_XXS's size), so every down-expert bundle was extracted at the
+wrong size and offset. FIXED (`10: 84`), bundle regenerated from the locked
+GGUF, verified byte-identical to the same (layer, expert) slice read straight
+from the GGUF. Before this fix the paged path produced all-NaN frontiers.
 
-## Ruled out along the way
-- The ctx-8192 expert-cache floor fix (item 1.4, this session): does not
-  engage at ctx 256/512 (`plan.cache_experts` from the base plan is already
-  4526, far above the floor).
-- Stage C async double-buffer prefetch / Stage D predictive prefetch: dead
-  infrastructure, no callers anywhere in `ds4.c`.
-- Batching (the "mm" fast path, `T > 8`): capping the prefill chunk to 1
-  token (forcing every paged forward call through the same T=1 shape as
-  decode) did **not** fix it -- confirmed the bug is not about multi-token
-  staging overwrite. A direct ctx=1 (single-token) run reproduces the same
-  all-NaN output, which is what led to finding the real cause above instead.
-- Everything in `ds4.c` / `ds4_metal.m` (`qwen4_bind_buf`, the `_with_bufs`
-  kernel wrappers, `ds4_expert_pager_ensure`): these correctly assume
-  standard Q2_K/IQ2_XXS sizing that matches the GGUF ground truth; they are
-  not the bug, the bundle file handed to them is.
+### Bug 2 -- kernel indexed the staging buffer by global expert id
+`metal/qwen4.metal` `kernel_qwen4_moe_mid` / `_down` computed the weight offset
+for a routed slot as `selected[...] * expert_bytes` (a global 0..511 id). That
+is correct for the resident buffer (all 512 experts) but wrong for the pager's
+per-layer staging buffer, which holds only this call's `n_slots` experts at
+their local slot position. FIXED with a `paged_local_index` arg (index by local
+slot in the paged wrappers), and `qwen4_graph_moe` was restructured so the
+paged path never takes the batched "mm" branch. Before this fix the paged path
+was finite but wrong (max diff ~14.8 at ctx=1).
 
-## Fix (not yet applied -- needs a decision, see below)
-1. `gguf-tools/qwen4_expert_bundle.py:46`: change `10: 66` to `10: 84`.
-2. Regenerate `qwen38-experts.bin` + `qwen38-experts.index.json` from the
-   locked GGUF (sha256 `ed238d8d50c6fb4b504c2796c3bc82b2a9f6c21566ad29bdbfdbadfe01e28d7a`).
-   Down bundles grow from 506880 to 645120 bytes each; total bundle size
-   grows by `48*512*(645120-506880) = 3,398,553,600` bytes (+3.16 GiB), from
-   31.12 GiB to roughly 34.3 GiB. This re-reads a large fraction of the
-   147 GiB source GGUF and writes ~34 GiB fresh -- a real, one-time, large
-   disk operation, not something to run silently.
+### Bug 3 -- pager staged the previous layer's experts (stale routing read)
+`ds4.c` `qwen4_graph_moe`'s pager branch read `g->selected` into a host buffer
+with `ds4_gpu_tensor_read` (a plain CPU memcpy) to decide which experts to
+stage -- but it did so BEFORE the open command batch was committed. The router
+gemv + top-k kernels that WRITE `g->selected` were still queued and had not
+executed, so the read returned the previous layer's routing (or, on layer 0,
+whatever the buffer held). The pager then staged the wrong routed experts,
+diverging on every routed slot from layer 0 onward and compounding through the
+stack, while the shared expert (whose address does not depend on this read)
+stayed bit-identical. This is why a synced debug dump of `g->selected` looked
+correct yet the pager consumed stale values -- the dump read at a different,
+post-commit time than the pager. FIXED: `ds4_gpu_end_commands()` now runs
+BEFORE the read, committing + waiting the routing kernels so `g->selected` is
+current. That same commit also preserves the pre-existing invariant that the
+previous token's kernels finish reading the staging buffer before it is
+overwritten. Diff dropped from 4.53 -> 1.88 at ctx=512 default (the residual
+being the mm-vs-per-token kernel difference, not the pager), and to 0.0
+bit-identical once the kernel is held constant.
 
-## Consequence for the ledger
-Item 1.4's just-committed eviction A/B numbers (hit rate, read volume,
-tok/s) came from this same paged path at ctx 8192. The pager-level telemetry
-(hits/misses/bytes read) is almost certainly still accurate -- it is counted
-independently of whether the computed values are finite -- but the actual
-generated tokens in that run were very likely NaN/garbage output, same as
-here. This does not invalidate the pager cache-sizing conclusion (both E1
-and E2 read the same bytes either way), but it means no correctness claim
-should be drawn from that run's *output*, only from its cache statistics.
+## Not a pager bug: resident "mm" vs per-token (flagged for decision)
 
-## Bug 2 (found and fixed): kernel indexes the staging buffer by global expert id
+With the DEFAULT prefill chunk, resident prefill (T>8) uses the tiled "mm"
+GEMM and paged uses per-token; they differ by ~1.88 max logit diff at ctx=512
+(all lanes differ, argmax stable). This is floating-point accumulation order
+between two kernels, inherent to any tiled GEMM, and is present resident-only
+(mm-prefill vs per-token-decode) independent of the pager. The pager cannot
+match "mm" without either (a) a batching-aware paged buffer scheme so paged can
+run "mm" too (Phase 2 kernel work), or (b) disabling "mm" at prefill (a
+prefill-throughput cost; decode is unaffected). Deferred to the user per ground
+rule 8; it does not affect the benched paged path, which is per-token and
+proven bit-identical here.
 
-After Bug 1's fix (bundle rebuilt, sizes now correct and byte-verified
-identical to the source GGUF -- confirmed with a direct sha256 comparison
-of the same (layer, expert) slice pulled from both files), the gate no
-longer produced NaN, but was still not bit-identical: every one of 248320
-logits differed, by up to ~9.8, while argmax still happened to agree.
-Reproduced identically at ctx=1 (single token, no batching involved), which
-ruled out the earlier "mm batching" hypothesis for good and pointed at the
-kernels themselves.
+## Read-GB and swap note (gate telemetry is NOT the KPI)
 
-Root cause, in `metal/qwen4.metal`: `kernel_qwen4_moe_mid` and
-`kernel_qwen4_moe_down` compute the weight-buffer offset for each routed
-slot as `selected[tok*n_slots+slot] * expert_bytes` -- the token's **global
-routed expert id** (0..511) times the per-expert byte size. That is correct
-when the bound buffer is the full resident model map (all 512 experts,
-addressable by global id) -- but the SAME kernel is dispatched for the
-paged "_with_bufs" path, where the bound buffer is the pager's per-layer
-staging tensor, sized for only `DS4_N_EXPERT_USED` (10) experts, filled at
-their **local slot** position by `ds4.c`. Indexing that 10-slot buffer by a
-global id like 347 reads ~223 MB past its start -- silently reading
-whatever else the process had allocated nearby, not the intended weights.
-The batched "mm" kernels (`kernel_qwen4_moe_mm_mid`/`_mm_down`) have the
-identical pattern (`gate_base + e*expert_bytes` for `e` = global id from
-`moe_lists`), so they were never a coincidence-driven "different bug" --
-same defect, reached from the batched dispatch instead.
+Two paged configs at ctx=512, both correct/bit-identical, very different cost:
 
-Fix: added a `paged_local_index` field to `ds4_metal_args_qwen4_moe` /
-`qwen4_moe_args` (both the Metal and C struct); when set, `ebase` uses the
-local `slot` directly instead of the global id from `selected[]`. Set to 1
-only from the two `_with_bufs` C wrappers, 0 (unchanged behavior) from the
-resident wrappers. This alone does not fix the batched "mm" paged path (see
-below), so `qwen4_graph_moe` was also restructured: whenever `g->pager` is
-set, it no longer takes the "mm" branch at all. Each token in the batch is
-staged and consumed (mid -> down, via per-token `ds4_gpu_tensor_view`
-slices into `g->mixed`/`g->selected`/`g->mid`/`g->part`) one at a time,
-with a full `ds4_gpu_end_commands()`/`ds4_gpu_begin_commands()` sync
-bracket around each token's stage-then-compute step, before the next
-token's `ensure()` is allowed to overwrite the shared staging buffer. This
-gives up the resident path's cross-token weight-reuse batching for the
-paged path -- Phase 2 kernel work would need a properly batching-aware
-buffer scheme (or global<->local id remap) to get that back; this fix only
-restores correctness at whatever speed that costs.
+| config                         | SSD read | swap growth | hit_rate | misses  | prefill tok/s |
+|--------------------------------|----------|-------------|----------|---------|---------------|
+| --prefill-chunk 8 (this gate)  | 64.7 GiB | +53.7 GiB   | 0.8102   | 139935  | 4.88          |
+| default prefill chunk          | 15.6 GiB | +7.14 GiB   | 0.9542   | 33744   | 17.20         |
 
-Verified after this fix: ctx=1 went from 0/248320 finite (all NaN) to
-248320/248320 finite, but max diff is now 14.8 -- **still not
-bit-identical**, and finite-but-wrong rather than NaN. So Bug 2's fix is
-real and necessary, but not sufficient on its own either.
+The gate forces `--prefill-chunk 8` for a bit-identical KERNEL comparison, but
+that config is pathological for the pager: 512 tokens become 64 forwards of 8,
+and every layer's experts are re-fetched once per forward, so the resident
+cache (4.86 GiB, 8087 slots) thrashes -- 4x the misses and reads of the
+default single-forward chunk. So the gate's read/swap columns are an artifact
+of the correctness config, NOT the read-GB KPI. The realistic paged path
+(default chunk) reads 15.6 GiB at 0.95 hit rate.
 
-## Bug 3 (found, NOT fixed): a smaller discrepancy present from layer 0
+Even the realistic 15.6 GiB is over ground rule 4's budget (bundle 34.31 GiB x
+miss_rate 0.0458 x 1.1 = 1.73 GiB): the paged prefill re-reads experts across
+tokens more than "each missed expert once" would predict. This is a cache-
+sizing / prefetch question for the bench items (1.2 read-GB CSV, 1.4 eviction),
+not a correctness question -- recorded here so it is not lost, and it is what
+Phase 1's "so that" real-number collection is meant to root-cause.
 
-A per-layer trace (dumping `g->R` after each of the 48 trunk layers, once
-in resident mode and once in paged mode, both at ctx=1) shows the diff is
-already present at **layer 0** (max diff 0.20) and grows through the stack
-to ~8 by layer 44-47 -- consistent with per-layer error compounding through
-the residual/hyper-connection path, not a single late failure.
-
-This is surprising given Bug 1 and Bug 2 are both squarely inside the
-expert-weight consumption path. It means there is a third, distinct source
-of divergence between resident and SSD-streaming mode active from the very
-first layer -- not yet isolated to a specific mechanism. Candidates not yet
-checked: the "mixed-precision... off the slab size class" bypass layer
-(reads directly via mapped model views even when paging is on -- is that
-mapping itself set up identically to resident's?); any other shared/
-non-routed weight access that behaves differently under
-`--ssd-streaming` (different model-map construction, e.g. "SSD streaming
-initial metal model map (1 spans, 41.72 GiB tensor span)" vs resident's
-"Metal model views created... mapped 42720.44 MiB from offset 10.51 MiB" --
-these are two different code paths mapping the same bytes, and nothing yet
-confirms they resolve to bit-identical spans).
-
-## Current status
-- Bug 1 (bundle extraction, wrong Q2_K byte size): **fixed and verified**
-  (byte-identical re-extraction confirmed against the GGUF).
-- Bug 2 (kernel global-vs-local expert indexing): **fixed and verified**
-  (NaN eliminated at ctx=1 and ctx=512).
-- Bug 3 (layer-0-onward discrepancy, cause unknown): **not fixed**. Gate
-  #5 still FAILS: ctx=512 max diff 4.53 (248320/248320 values differ);
-  ctx=1 max diff 14.8 (moves around run to run/ctx as expected for a real
-  bug, not noise).
-- New regression observed alongside Bug 2's fix: the per-token serialization
-  (needed for correctness) grew swap at ctx=512 by +6.55 GiB during this
-  gate run (`peak footprint 17.53 GiB, swap 9.12 GiB (start 2.57 GiB)`) --
-  worth watching against the Definition of Done's "zero OS swap" bar once
-  Bug 3 is fixed and real benches resume.
+diskwrites: the pager opens the bundle O_RDONLY (no writes to the model
+volume by design). The gate CSV does not yet carry an iostat/ssd_watch
+diskwrites_delta column; wiring that into the receipt is item 1.2's job.
 
 ## Per ground rule 5
-"Gate bit-identical ... TRUOC khi bench; fail = revert + bao." Two of three
-found bugs are fixed with verified evidence; the gate still fails on the
-third. Not deciding how to proceed alone (bisect/isolate Bug 3 further vs.
-pause here) -- ground rule 8 reserves that, and this investigation has
-already grown well past its original scope (a receipt check) into
-substantial kernel-level debugging across three independent defects.
+
+"Gate bit-identical ... TRUOC khi bench." The pager is bit-identical to
+resident on the shared per-token kernel at ctx 1, 8, and 512. Item 1.3 passes.
+The only non-bit-identical comparison (resident-mm vs per-token) is a kernel
+choice outside the pager and is flagged, not silently accepted.

@@ -58518,16 +58518,28 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
         const uint64_t mid_stride = (uint64_t)(DS4_N_EXPERT_USED + 1u) * DS4_N_FF_EXP * sizeof(float);
         const uint64_t part_stride = (uint64_t)(DS4_N_EXPERT_USED + 1u) * DS4_N_EMBD * sizeof(float);
         for (uint32_t t = 0; t < T && ok; t++) {
+            /* Close out the open command batch (commit + wait) BEFORE the CPU
+             * reads g->selected. Two invariants depend on this ordering:
+             *   (a) The router gemv + topk kernels that fill g->selected are
+             *       still queued in the open batch when this branch is
+             *       entered; ds4_gpu_tensor_read() is a plain CPU memcpy that
+             *       does NOT wait for the GPU, so reading before the commit
+             *       returns the PREVIOUS layer's (or a prior run's) routing.
+             *       The pager would then stage the wrong routed experts while
+             *       the shared expert (whose address does not depend on this
+             *       read) stayed correct -- the exact resident-vs-paged
+             *       divergence chased down as "Bug 3" in
+             *       speed-bench/logit-gate/GATE_RESULT.md.
+             *   (b) The staging writes below are CPU memcpy into GPU-visible
+             *       memory and must not race the previous token's kernel reads
+             *       of the same buffer; committing here waits for them first.
+             * The read must therefore come AFTER this commit, not before. */
+            ds4_gpu_end_commands();
             if (!ds4_gpu_tensor_read(g->selected, (uint64_t)t * DS4_N_EXPERT_USED * sizeof(uint32_t),
                                      g->qwen4_paged_selected, DS4_N_EXPERT_USED * sizeof(uint32_t))) {
                 ok = false;
                 break;
             }
-            /* Staging writes are plain CPU memcpy into GPU-visible memory:
-             * they must not race the previous token's kernel reads of the
-             * same buffer, so close out that token's command batch (which
-             * waits for it to finish) before touching the buffer again. */
-            ds4_gpu_end_commands();
             for (uint32_t tid = 0; tid < 3 && ok; tid++) {
                 void *ptrs[DS4_MAX_EXPERT_USED];
                 memset(ptrs, 0, sizeof(ptrs));
