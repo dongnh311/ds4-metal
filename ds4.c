@@ -73018,6 +73018,13 @@ void ds4_session_free(ds4_session *s) {
                         s->qwen4_spec_cycles, s->qwen4_spec_accepted,
                         100.0 * (double)s->qwen4_spec_accepted / (double)s->qwen4_spec_cycles);
             }
+#ifdef DS4_QWEN4_MTP_STATS
+            if (s->qwen4_spec_cycles > 0) {
+                fprintf(stderr, "ds4: Qwen3.8 MTP stats (DS4_QWEN4_MTP_STATS=1): cycles=%" PRIu64 " accepted=%" PRIu64 " rate=%.1f%%\n",
+                        s->qwen4_spec_cycles, s->qwen4_spec_accepted,
+                        100.0 * (double)s->qwen4_spec_accepted / (double)s->qwen4_spec_cycles);
+            }
+#endif
             free(s->qwen4_verify_logits);
             if (s->qwen4_graph.pager) {
                 ds4_expert_pager_close(s->qwen4_graph.pager);
