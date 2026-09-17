@@ -479,6 +479,17 @@ static void pager_evict_slot(ds4_expert_pager *pager, uint32_t slot) {
     if (pager->cache_bundle[slot] >= 0) {
         pager->bundle_lookup[pager->cache_bundle[slot]] = -1;
     }
+    /* Release the resident bundle bytes. Each slot's cache_data buffer is a
+     * distinct malloc (ensure() at cache_data[free_slot] = ptr); the caller
+     * of ds4_expert_pager_ensure only ever BORROWS this pointer (it is copied
+     * straight into the GPU staging buffer, and release_pointers is a no-op in
+     * cached mode), so the cache owns the lifetime and eviction must free it.
+     * Omitting this free leaked one bundle (~0.4-0.6 MiB) per eviction, which
+     * on a cache-thrashing prefill grew MALLOC_SMALL without bound (80+ GiB
+     * observed at ctx 8192) -> jetsam OOM. NULL so destroy's free() is a safe
+     * no-op if the slot is never reused. */
+    free(pager->cache_data[slot]);
+    pager->cache_data[slot] = NULL;
     pager->cache_used_bytes -= pager->cache_size[slot];
     pager->cache_bundle[slot] = -1;
     pager->cache_size[slot] = 0;
