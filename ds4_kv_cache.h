@@ -22,7 +22,7 @@ typedef struct {
     uint32_t n_heads;            /* number of KV heads per layer */
     uint32_t head_dim;           /* dimension per head */
     uint32_t n_pages;            /* total pages allocated */
-    uint32_t n_tokens_used;      /* total tokens in cache */
+    uint32_t n_tokens_used;      /* total tokens written so far */
 
     /* Storage mode: 0=BF16, 1=FP8 (per-token scale) */
     uint32_t storage_mode;       /* 0=BF16, 1=FP8_E4M3 */
@@ -31,9 +31,12 @@ typedef struct {
     ds4_kv_page_entry *page_table;
     uint32_t page_table_capacity;
 
-    /* Physical page storage (GPU-visible) */
-    void **page_buffers;         /* array of MTLBuffer pointers */
+    /* Physical page storage (CPU malloc; staged to GPU before kernel call) */
+    void **page_buffers;         /* array of page buffers */
     uint32_t *page_refcount;     /* reference count for each page */
+
+    /* Per-(layer,head) write position tracker */
+    uint32_t *write_pos;         /* [n_layers × n_heads] */
 
     /* Per-token scales for FP8 mode */
     uint8_t **page_scales;       /* [page][tokens] FP8 E4M3 scales */
@@ -58,23 +61,42 @@ bool ds4_kv_cache_enable_fp8(ds4_kv_cache *cache);
 /* Free paged KV cache */
 void ds4_kv_cache_free(ds4_kv_cache *cache);
 
-/* Allocate new page for token position */
+/* Allocate new pages to accommodate more tokens */
 bool ds4_kv_cache_grow(ds4_kv_cache *cache, uint32_t n_new_tokens);
 
-/* Get page pointer for a given (layer, head, token_position) */
+/* Get page pointer for a given (layer, head_idx, token_pos).
+ * Returns the page buffer and sets *out_offset to byte offset within page. */
 void *ds4_kv_cache_get_page(ds4_kv_cache *cache,
                             uint32_t layer,
                             uint32_t head_idx,
                             uint32_t token_pos,
                             uint32_t *out_offset);
 
-/* Commit KV data to page (called after attention computation) */
+/* Write one token's KV data (auto-advances write position for this layer/head).
+ * kv_bytes must equal head_dim * (storage_mode==1 ? 1 : 2). */
+bool ds4_kv_cache_write_token(ds4_kv_cache *cache,
+                              uint32_t layer,
+                              uint32_t head_idx,
+                              const void *kv_data,
+                              uint32_t kv_bytes);
+
+/* Commit arbitrary data at arbitrary position (legacy API) */
 bool ds4_kv_cache_commit(ds4_kv_cache *cache,
                          uint32_t layer,
                          uint32_t head_idx,
                          uint32_t token_pos,
                          const void *data,
                          uint32_t data_bytes);
+
+/* Materialize a contiguous [pos0, pos0+n_tokens) range into staging_buf.
+ * Returns bytes written, or 0 on error. */
+uint64_t ds4_kv_cache_materialize_kv(ds4_kv_cache *cache,
+                                     uint32_t layer,
+                                     uint32_t head_idx,
+                                     uint32_t pos0,
+                                     uint32_t n_tokens,
+                                     void *staging_buf,
+                                     uint64_t staging_bytes);
 
 /* Get stats for diagnostic reporting */
 void ds4_kv_cache_get_stats(const ds4_kv_cache *cache,
@@ -85,5 +107,8 @@ void ds4_kv_cache_get_stats(const ds4_kv_cache *cache,
 
 /* Print diagnostic report */
 void ds4_kv_cache_report_stats(const ds4_kv_cache *cache);
+
+/* Reset (zero-out pages and write positions) for a new run */
+void ds4_kv_cache_reset(ds4_kv_cache *cache);
 
 #endif
