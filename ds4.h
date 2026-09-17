@@ -610,6 +610,20 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 #define DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS 14u
 
 uint64_t ds4_session_payload_bytes(ds4_session *s);
+
+/* Bytes of K/V the live session actually holds: the per-layer resident K/V
+ * tensors plus the paged store when paged KV is enabled.  This is a measured
+ * allocation, not the context-memory estimate; 0 when no graph is resident. */
+uint64_t ds4_session_kv_cache_bytes(ds4_session *s);
+
+/* Expert-pager I/O counters for this session.  Returns 0 when no pager is
+ * attached, leaving every out-pointer untouched. */
+int ds4_session_pager_stats(ds4_session *s,
+                            uint64_t *out_hits,
+                            uint64_t *out_misses,
+                            uint64_t *out_pread_bytes,
+                            double *out_latency_ms);
+
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
                               char *err, size_t errlen);
 int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,

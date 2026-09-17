@@ -17,12 +17,19 @@
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
 #include <time.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/task_info.h>
+#endif
 
 /* CUDA builds resolve these weak symbols through libcudart; other builds
  * remain independent of CUDA headers and libraries. */
@@ -104,6 +111,93 @@ static uint64_t bench_snapshot_max_bytes(void) {
 
 static double bytes_to_gib(uint64_t bytes) {
     return (double)bytes / (1024.0 * 1024.0 * 1024.0);
+}
+
+/* ---------------------------------------------------------------------------
+ * Resident-set sampler
+ *
+ * The throughput numbers alone cannot show whether a run stayed inside RAM:
+ * the interesting quantity is the peak, and a peak reached three minutes in
+ * is invisible to an end-of-run reading.  A sampler thread therefore polls
+ * phys_footprint and the system swap totals for the whole benchmark and keeps
+ * the maxima.
+ * --------------------------------------------------------------------------- */
+
+typedef struct {
+    pthread_t thread;
+    pthread_mutex_t mu;
+    bool stopping;
+    bool running;
+    bool sampled;
+    uint64_t rss_peak_bytes;
+    uint64_t swap_peak_bytes;
+    uint64_t swap_start_bytes;
+} bench_mem_sampler;
+
+static uint64_t bench_swap_used_bytes(void) {
+    struct xsw_usage usage;
+    size_t size = sizeof(usage);
+    if (sysctlbyname("vm.swapusage", &usage, &size, NULL, 0) != 0) return 0;
+    return (uint64_t)usage.xsu_used;
+}
+
+static uint64_t bench_phys_footprint_bytes(void) {
+#if defined(__APPLE__)
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO,
+                  (task_info_t)&info, &count) != KERN_SUCCESS) {
+        return 0;
+    }
+    return (uint64_t)info.phys_footprint;
+#else
+    return 0;
+#endif
+}
+
+static void *bench_mem_sampler_main(void *ud) {
+    bench_mem_sampler *s = ud;
+    for (;;) {
+        const uint64_t rss = bench_phys_footprint_bytes();
+        const uint64_t swap = bench_swap_used_bytes();
+        pthread_mutex_lock(&s->mu);
+        if (rss > s->rss_peak_bytes) s->rss_peak_bytes = rss;
+        if (swap > s->swap_peak_bytes) s->swap_peak_bytes = swap;
+        const bool stop = s->stopping;
+        pthread_mutex_unlock(&s->mu);
+        if (stop) break;
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 50 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
+static void bench_mem_sampler_start(bench_mem_sampler *s) {
+    memset(s, 0, sizeof(*s));
+    pthread_mutex_init(&s->mu, NULL);
+    s->swap_start_bytes = bench_swap_used_bytes();
+    s->swap_peak_bytes = s->swap_start_bytes;
+    s->rss_peak_bytes = bench_phys_footprint_bytes();
+    s->running = pthread_create(&s->thread, NULL, bench_mem_sampler_main, s) == 0;
+}
+
+static void bench_mem_sampler_stop(bench_mem_sampler *s) {
+    if (s->running) {
+        pthread_mutex_lock(&s->mu);
+        s->stopping = true;
+        pthread_mutex_unlock(&s->mu);
+        pthread_join(s->thread, NULL);
+        s->running = false;
+    }
+    s->sampled = true;
+}
+
+/* Peak swap held above the level at start, and the read of it, are kept
+ * separate so a machine that was already swapping before the run is not
+ * reported as a regression caused by this run. */
+static uint64_t bench_mem_sampler_swap_growth(const bench_mem_sampler *s) {
+    return s->swap_peak_bytes > s->swap_start_bytes ?
+        s->swap_peak_bytes - s->swap_start_bytes : 0;
 }
 
 static void usage(FILE *fp, const char *topic) {
@@ -787,7 +881,10 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes\n");
+    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,"
+                 "gen_steady_tokens,gen_steady_tps,snapshot_payload_bytes,kv_cache_bytes,"
+                 "pager_hits,pager_misses,pager_hit_rate,pager_pread_bytes,pager_latency_ms,"
+                 "ssd_read_bytes,ses_read_gb_per_token,rss_peak_bytes,swap_peak_bytes,swap_growth_bytes\n");
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
@@ -814,6 +911,13 @@ int main(int argc, char **argv) {
     char err[256];
     int previous = 0;
     int rc = 0;
+    bench_mem_sampler mem;
+    bench_mem_sampler_start(&mem);
+    /* The pager counters are cumulative over the session; each frontier reports
+     * only the I/O its own interval caused, so the read-GB budget of ground
+     * rule 4 can be checked per row instead of against a running total. */
+    uint64_t prev_pager_hits = 0, prev_pager_misses = 0, prev_pager_pread_bytes = 0;
+    double prev_pager_latency_ms = 0.0;
 
     for (int frontier = cfg.ctx_start; ; frontier = next_frontier(&cfg, frontier)) {
         ds4_tokens prefix = {
@@ -1025,8 +1129,27 @@ int main(int argc, char **argv) {
         const double gen_sec = gen_t1 - gen_t0;
         const int gen_steady_tokens = gen_done > gen_first_tokens ?
             gen_done - gen_first_tokens : 0;
+        uint64_t pager_hits = 0, pager_misses = 0, pager_pread_bytes = 0;
+        double pager_latency_ms = 0.0;
+        const bool has_pager = ds4_session_pager_stats(session, &pager_hits, &pager_misses,
+                                                      &pager_pread_bytes, &pager_latency_ms) != 0;
+        const uint64_t delta_hits = pager_hits - prev_pager_hits;
+        const uint64_t delta_misses = pager_misses - prev_pager_misses;
+        const uint64_t delta_pread_bytes = pager_pread_bytes - prev_pager_pread_bytes;
+        const double delta_latency_ms = pager_latency_ms - prev_pager_latency_ms;
+        prev_pager_hits = pager_hits;
+        prev_pager_misses = pager_misses;
+        prev_pager_pread_bytes = pager_pread_bytes;
+        prev_pager_latency_ms = pager_latency_ms;
+        const uint64_t pager_requests = delta_hits + delta_misses;
+        const double pager_hit_rate = pager_requests ?
+            (double)delta_hits / (double)pager_requests : 0.0;
+        const int total_tokens = prefill_tokens + gen_done;
+        const double read_gb_per_token = total_tokens ?
+            bytes_to_gib(delta_pread_bytes) / (double)total_tokens : 0.0;
         fprintf(out,
-                "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
+                "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu,%llu,%llu,%llu,%.4f,%llu,%.3f,"
+                "%llu,%.6f,%llu,%llu,%llu\n",
                 frontier,
                 prefill_tokens,
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
@@ -1035,7 +1158,18 @@ int main(int argc, char **argv) {
                 gen_first_sec * 1000.0,
                 gen_steady_tokens,
                 gen_steady_sec > 0.0 ? (double)gen_steady_tokens / gen_steady_sec : 0.0,
-                (unsigned long long)(have_snapshot ? snap.len : 0));
+                (unsigned long long)(have_snapshot ? snap.len : 0),
+                (unsigned long long)ds4_session_kv_cache_bytes(session),
+                has_pager ? (unsigned long long)delta_hits : 0ull,
+                has_pager ? (unsigned long long)delta_misses : 0ull,
+                has_pager ? pager_hit_rate : 0.0,
+                has_pager ? (unsigned long long)delta_pread_bytes : 0ull,
+                has_pager ? delta_latency_ms : 0.0,
+                (unsigned long long)delta_pread_bytes,
+                read_gb_per_token,
+                (unsigned long long)mem.rss_peak_bytes,
+                (unsigned long long)mem.swap_peak_bytes,
+                (unsigned long long)bench_mem_sampler_swap_growth(&mem));
         fflush(out);
 
         previous = frontier;
@@ -1045,6 +1179,13 @@ int main(int argc, char **argv) {
     if (out != stdout) fclose(out);
     ds4_session_snapshot_free(&snap);
     ds4_session_free(session);
+    bench_mem_sampler_stop(&mem);
+    fprintf(stderr,
+            "ds4-bench: peak footprint %.2f GiB, swap %.2f GiB (start %.2f GiB, +%.2f GiB)\n",
+            bytes_to_gib(mem.rss_peak_bytes), bytes_to_gib(mem.swap_peak_bytes),
+            bytes_to_gib(mem.swap_start_bytes),
+            bytes_to_gib(bench_mem_sampler_swap_growth(&mem)));
+    pthread_mutex_destroy(&mem.mu);
     ds4_tokens_free(&prompt);
     close_engine(engine, tp_leader);
     return rc;

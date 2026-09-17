@@ -57697,12 +57697,19 @@ typedef struct {
     ds4_gpu_tensor *expert_gate_buf[DS4_MAX_LAYER];
     ds4_gpu_tensor *expert_up_buf[DS4_MAX_LAYER];
     ds4_gpu_tensor *expert_down_buf[DS4_MAX_LAYER];
-    /* Pager state: opened when --ssd-streaming is set and bundle files exist.
+/* Pager state: opened when --ssd-streaming is set and bundle files exist.
      * NULL means pager not available (resident path). */
     ds4_expert_pager *pager;
     /* Paged KV cache for memory-efficient context expansion (Task 1 Plan 4)
      * Enabled via DS4_QWEN4_KV_PAGED=1 env var */
     ds4_kv_cache paged_kv_cache;
+    /* Per-layer staging buffers for paged KV materialization (CPU->GPU copy).
+     * - paged_k/v_staging: one page-sized buffer for incremental writes (CPU->staging, then staging->paged pages)
+     * - paged_k/v_staging_full: full [0, ctx_cap) buffer for materialize_kv before GPU write-back */
+    ds4_gpu_tensor *paged_k_staging[DS4_MAX_LAYER];
+    ds4_gpu_tensor *paged_v_staging[DS4_MAX_LAYER];
+    ds4_gpu_tensor *paged_k_staging_full[DS4_MAX_LAYER];
+    ds4_gpu_tensor *paged_v_staging_full[DS4_MAX_LAYER];
     /* For paged MOE: cached selected expert IDs per layer (read from GPU each time) */
     uint32_t qwen4_paged_selected[DS4_MAX_EXPERT_USED];
 } ds4_qwen4_gpu_graph;
@@ -57832,7 +57839,16 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         g->expert_gate_buf[il] = NULL;
         g->expert_up_buf[il] = NULL;
         g->expert_down_buf[il] = NULL;
+        ds4_gpu_tensor_free(g->paged_k_staging[il]);
+        ds4_gpu_tensor_free(g->paged_v_staging[il]);
+        g->paged_k_staging[il] = NULL;
+        g->paged_v_staging[il] = NULL;
+        ds4_gpu_tensor_free(g->paged_k_staging_full[il]);
+        ds4_gpu_tensor_free(g->paged_v_staging_full[il]);
+        g->paged_k_staging_full[il] = NULL;
+        g->paged_v_staging_full[il] = NULL;
     }
+    ds4_kv_cache_free(&g->paged_kv_cache);
     free(g->host_row);
     free(g->host_logits);
     memset(g, 0, sizeof(*g));
@@ -57846,7 +57862,14 @@ static ds4_gpu_tensor *qwen4_graph_alloc_f32(uint64_t n) {
 
 static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint32_t ctx_cap, uint32_t cap_tokens,
                               bool mtp) {
+    /* The pager is opened by the caller before this call and is not part of
+     * the graph's own allocation, so it has to survive the reset below.
+     * Zeroing it here left g->pager NULL for the whole session: the bundle was
+     * opened and reported, then never read, and every "paged expert" number
+     * was really a resident-model number. */
+    ds4_expert_pager *pager = g->pager;
     memset(g, 0, sizeof(*g));
+    g->pager = pager;
     if (!qwen4_graph_weights_supported(w)) return false;
     mtp = mtp && DS4_N_NEXTN_PREDICT != 0;
     const uint64_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc, T = cap_tokens;
@@ -57928,7 +57951,7 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
         QWEN4_ALLOC(snap_ple_hist, (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * hc_dim);
     }
 #undef QWEN4_ALLOC
-    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+    for (uint32_t il = 0; il < DS4_MAX_LAYER && ok; il++) {
         if (ds4_qwen4_layer_is_linear(il)) {
             g->layer_lin_state[il] = qwen4_graph_alloc_f32(v_dim * DS4_N_LIN_HEAD_DIM);
             g->layer_lin_hist[il] = qwen4_graph_alloc_f32((uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim);
@@ -57943,7 +57966,22 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
             g->layer_v_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 2u);
             g->layer_ik_cache[il] = qwen4_graph_alloc_f32((uint64_t)ctx_cap * DS4_N_INDEXER_HEAD_DIM);
             g->layer_block_key[il] = ds4_gpu_tensor_alloc((uint64_t)g->n_block_cap * DS4_N_INDEXER_HEAD_DIM * 2u);
+            /* Paged KV staging:
+             * - per-page buffers for incremental writes (page_size_tokens × kv_dim × 2)
+             * - full-range buffer for materialization → GPU write-back (ctx_cap × kv_dim × 2) */
+            if (g->paged_kv_cache.n_layers > 0) {
+                uint64_t page_bytes = (uint64_t)g->paged_kv_cache.page_size_tokens * kv_dim * 2u;
+                uint64_t full_bytes = (uint64_t)ctx_cap * kv_dim * 2u;
+                g->paged_k_staging[il] = ds4_gpu_tensor_alloc(page_bytes);
+                g->paged_v_staging[il] = ds4_gpu_tensor_alloc(page_bytes);
+                g->paged_k_staging_full[il] = ds4_gpu_tensor_alloc(full_bytes);
+                g->paged_v_staging_full[il] = ds4_gpu_tensor_alloc(full_bytes);
+            }
             ok = ok && g->layer_k_cache[il] && g->layer_v_cache[il] && g->layer_ik_cache[il] && g->layer_block_key[il];
+            if (ok && g->paged_kv_cache.n_layers > 0) {
+                ok = ok && g->paged_k_staging[il] && g->paged_v_staging[il] &&
+                     g->paged_k_staging_full[il] && g->paged_v_staging_full[il];
+            }
         }
     }
     g->pos3 = qwen4_graph_alloc_f32((uint64_t)ctx_cap * 4u);
@@ -58086,6 +58124,9 @@ static void qwen4_graph_reset(ds4_qwen4_gpu_graph *g) {
     g->snap0_valid = false;
     g->snap_after_first = false;
     g->snap_after_second = false;
+    if (g->paged_kv_cache.n_layers > 0) {
+        ds4_kv_cache_reset(&g->paged_kv_cache);
+    }
 }
 
 /* rows > 0 limits the product to the leading rows of w (a contiguous prefix
@@ -58517,9 +58558,9 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                           DS4_N_EXPERT, g->cap_tokens) &&
                      qwen4_moe_profile_boundary(profile, &last, &elapsed[1]) &&
                      ds4_gpu_qwen4_moe_mm_mid_tensor_with_bufs(g->mid, g->mixed, g->moe_lists, g->moe_counts,
-                                                               (void**)g->expert_gate_buf[layer_idx],
+                                                               (void**)&g->expert_gate_buf[layer_idx],
                                                                (uint64_t[1]){0},
-                                                               (void**)g->expert_up_buf[layer_idx],
+                                                               (void**)&g->expert_up_buf[layer_idx],
                                                                (uint64_t[1]){0},
                                                                l->ffn_gate_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED,
                                                                DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP, g->cap_tokens) &&
@@ -58546,7 +58587,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
         if (ok) {
             if (g->pager) {
                 ok = ds4_gpu_qwen4_moe_mm_down_tensor_with_bufs(g->part, g->mid, g->moe_lists, g->moe_counts,
-                                                                (void**)g->expert_down_buf[layer_idx],
+                                                                (void**)&g->expert_down_buf[layer_idx],
                                                                 (uint64_t[1]){0},
                                                                 l->ffn_down_exps->type, DS4_N_EXPERT, T,
                                                                 DS4_N_EXPERT_USED, DS4_N_EXPERT_USED, DS4_N_FF_EXP,
@@ -58580,9 +58621,9 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     if (ok) {
         if (g->pager) {
             ok = ds4_gpu_qwen4_moe_mid_tensor_with_bufs(g->mid, g->mixed, g->selected,
-                                                        (void**)g->expert_gate_buf[layer_idx],
+                                                        (void**)&g->expert_gate_buf[layer_idx],
                                                         (uint64_t[1]){0},
-                                                        (void**)g->expert_up_buf[layer_idx],
+                                                        (void**)&g->expert_up_buf[layer_idx],
                                                         (uint64_t[1]){0},
                                                         m->map, m->size,
                                                         l->ffn_gate_exps->type, DS4_N_EXPERT, T,
@@ -58600,7 +58641,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     if (ok) {
         if (g->pager) {
             ok = ds4_gpu_qwen4_moe_down_tensor_with_bufs(g->part, g->mid, g->selected,
-                                                         (void**)g->expert_down_buf[layer_idx],
+                                                         (void**)&g->expert_down_buf[layer_idx],
                                                          (uint64_t[1]){0},
                                                          m->map, m->size,
                                                          l->ffn_down_exps->type, DS4_N_EXPERT, T,
@@ -62406,6 +62447,48 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
 #ifdef DS4_HAS_QWEN4_METAL
 static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows);
 #endif
+
+uint64_t ds4_session_kv_cache_bytes(ds4_session *s) {
+    if (!s || s->distributed) return 0;
+    if (ds4_session_is_qwen4(s)) {
+#ifndef DS4_HAS_QWEN4_METAL
+        return 0;
+#else
+        const ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+        if (!s->qwen4_graph_ready) return 0;
+        uint64_t bytes = 0;
+        for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+            bytes += ds4_gpu_tensor_bytes(g->layer_k_cache[il]);
+            bytes += ds4_gpu_tensor_bytes(g->layer_v_cache[il]);
+            bytes += ds4_gpu_tensor_bytes(g->layer_ik_cache[il]);
+        }
+        /* The paged store duplicates the resident K/V; report both so the
+         * paged mode's cost shows up in the receipt instead of hiding. */
+        return bytes + g->paged_kv_cache.total_bytes;
+#endif
+    }
+    /* Other families keep K/V inside a single graph allocation with no
+     * separable K/V split, so report 0 rather than guess a share of it. */
+    return 0;
+}
+
+int ds4_session_pager_stats(ds4_session *s,
+                            uint64_t *out_hits,
+                            uint64_t *out_misses,
+                            uint64_t *out_pread_bytes,
+                            double *out_latency_ms) {
+    if (!s) return 0;
+#ifndef DS4_HAS_QWEN4_METAL
+    return 0;
+#else
+    ds4_expert_pager *p = s->qwen4_graph.pager;
+    if (!p) return 0;
+    double hit_rate = 0.0;
+    ds4_expert_pager_get_stats(p, out_misses, out_hits, &hit_rate,
+                               out_pread_bytes, out_latency_ms);
+    return 1;
+#endif
+}
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (s && !s->distributed && ds4_session_is_qwen4(s)) {
@@ -72573,6 +72656,42 @@ static void ds4_format_len_hist(
     }
 }
 
+/* Expert-pager I/O receipt.  One machine-readable line plus a human block, so
+ * the read-GB budget of ground rule 4 can be checked straight from the log
+ * instead of inferred from wall-clock. */
+static void ds4_session_print_pager_stats(ds4_session *s) {
+    const char *env = getenv("DS4_QWEN4_PAGER_STATS");
+    if (!env || !env[0] || strcmp(env, "0") == 0) return;
+    uint64_t hits = 0, misses = 0, pread_bytes = 0;
+    double latency_ms = 0.0;
+    if (!ds4_session_pager_stats(s, &hits, &misses, &pread_bytes, &latency_ms)) return;
+    const uint64_t requests = hits + misses;
+    const double hit_rate = requests ? (100.0 * (double)hits / (double)requests) : 0.0;
+    const uint64_t layers = s->qwen4_graph.pager->header.layer_count;
+    const uint64_t per_expert = (uint64_t)s->qwen4_graph.pager->header.bundle_bytes_gate +
+                                (uint64_t)s->qwen4_graph.pager->header.bundle_bytes_up +
+                                (uint64_t)s->qwen4_graph.pager->header.bundle_bytes_down;
+    const uint64_t n_experts = layers * (uint64_t)s->qwen4_graph.pager->header.expert_count;
+    const uint64_t bundle_bytes = s->qwen4_graph.pager->bundle_size;
+    fprintf(stderr,
+            "DS4_PAGER_STATS requests=%llu hits=%llu misses=%llu hit_rate=%.4f "
+            "pread_bytes=%llu pread_MB=%.2f latency_ms=%.3f "
+            "bundle_bytes=%llu n_experts=%llu per_expert_bytes=%llu\n",
+            (unsigned long long)requests, (unsigned long long)hits,
+            (unsigned long long)misses, hit_rate,
+            (unsigned long long)pread_bytes, (double)pread_bytes / 1048576.0,
+            latency_ms, (unsigned long long)bundle_bytes,
+            (unsigned long long)n_experts, (unsigned long long)per_expert);
+    fprintf(stderr,
+            "ds4: expert pager stats requests=%llu hits=%llu misses=%llu "
+            "hit_rate=%.2f%% read=%.2f MB latency=%.1f ms "
+            "(bundle %.2f GiB, %llu experts)\n",
+            (unsigned long long)requests, (unsigned long long)hits,
+            (unsigned long long)misses, hit_rate,
+            (double)pread_bytes / 1048576.0, latency_ms,
+            (double)bundle_bytes / 1073741824.0, (unsigned long long)n_experts);
+}
+
 static void ds4_session_print_dspark_stats(const ds4_session *s) {
     if (!s || !ds4_dspark_stats_enabled()) return;
     const ds4_dspark_spec_stats *st = &s->dspark_stats;
@@ -73166,6 +73285,7 @@ void ds4_session_free(ds4_session *s) {
         s->tp_session_id = 0;
     }
 #ifndef DS4_NO_GPU
+    ds4_session_print_pager_stats(s);
     ds4_session_print_dspark_stats(s);
 #endif
     ds4_dist_session_free(s->distributed);

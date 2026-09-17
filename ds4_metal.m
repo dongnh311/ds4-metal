@@ -48081,15 +48081,21 @@ static bool qwen4_bind_weight(qwen4_bind *b, const void *map, uint64_t size,
     return b->buf != nil;
 }
 
-/* Direct buffer binding for SSD-paged expert cache: bypass model_map lookup */
-static bool qwen4_bind_buf(qwen4_bind *b, void *buf, NSUInteger off,
+/* Direct buffer binding for SSD-paged expert cache: bypass model_map lookup.
+ *
+ * The staging buffers arrive as ds4_gpu_tensor handles, never as MTLBuffer
+ * ids.  Treating one as an id<MTLBuffer> sent objc_retain a non-object
+ * pointer and crashed the first time the paged expert path actually ran;
+ * unwrap the tensor the same way qwen4_bind_tensor does. */
+static bool qwen4_bind_buf(qwen4_bind *b, const ds4_gpu_tensor *t, NSUInteger off,
                            uint64_t bytes, const char *what) {
-    if (!buf || bytes == 0) {
-        fprintf(stderr, "ds4: Qwen3.8 %s buffer is NULL or zero-sized\n", what);
+    if (!t || !ds4_gpu_tensor_buffer(t) || ds4_gpu_tensor_bytes(t) < bytes) {
+        fprintf(stderr, "ds4: Qwen3.8 %s buffer is missing or undersized (%" PRIu64 " < %" PRIu64 ")\n",
+                what, t ? ds4_gpu_tensor_bytes(t) : 0, bytes);
         return false;
     }
-    b->buf = (__bridge id<MTLBuffer>)buf;
-    b->off = off;
+    b->buf = ds4_gpu_tensor_buffer(t);
+    b->off = ds4_gpu_tensor_offset(t) + off;
     return true;
 }
 
@@ -49552,8 +49558,8 @@ int ds4_gpu_qwen4_moe_mid_tensor_with_bufs(
                             has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, n_total_expert };
     qwen4_bind b[7];
     if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || ff_dim == 0 || (has_shared && sh_row_bytes == 0) ||
-        !qwen4_bind_buf(&b[0], gate_bufs[0], gate_inners ? (NSUInteger)gate_inners[0] : 0, expert_bytes, "moe gate experts") ||
-        !qwen4_bind_buf(&b[1], up_bufs[0], up_inners ? (NSUInteger)up_inners[0] : 0, expert_bytes, "moe up experts") ||
+        !qwen4_bind_buf(&b[0], (const ds4_gpu_tensor *)gate_bufs[0], gate_inners ? (NSUInteger)gate_inners[0] : 0, expert_bytes, "moe gate experts") ||
+        !qwen4_bind_buf(&b[1], (const ds4_gpu_tensor *)up_bufs[0], up_inners ? (NSUInteger)up_inners[0] : 0, expert_bytes, "moe up experts") ||
         !qwen4_bind_tensor(&b[2], selected, (uint64_t)n_tokens * n_slots * sizeof(int32_t), "moe selected") ||
         !qwen4_bind_tensor(&b[3], x, (uint64_t)n_tokens * in_dim * sizeof(float), "moe input") ||
         !qwen4_bind_tensor(&b[4], mid, (uint64_t)n_tokens * n_out * ff_dim * sizeof(float), "moe mid")) {
@@ -49611,7 +49617,7 @@ int ds4_gpu_qwen4_moe_down_tensor_with_bufs(
     qwen4_bind b[5];
     if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || (ff_dim % 32u) != 0 ||
         out_dim == 0 || (has_shared && sh_row_bytes == 0) ||
-        !qwen4_bind_buf(&b[0], down_bufs[0], down_inners ? (NSUInteger)down_inners[0] : 0, expert_bytes, "moe down experts") ||
+        !qwen4_bind_buf(&b[0], (const ds4_gpu_tensor *)down_bufs[0], down_inners ? (NSUInteger)down_inners[0] : 0, expert_bytes, "moe down experts") ||
         !qwen4_bind_tensor(&b[1], selected, (uint64_t)n_tokens * n_slots * sizeof(int32_t), "moe selected") ||
         !qwen4_bind_tensor(&b[2], mid, (uint64_t)n_tokens * n_out * ff_dim * sizeof(float), "moe mid") ||
         !qwen4_bind_tensor(&b[3], part, (uint64_t)n_tokens * n_out * out_dim * sizeof(float), "moe partial")) {
@@ -49647,8 +49653,8 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor_with_bufs(
                                0, n_expert, tiles, 0, qwen4_moe_mm_expert_major() };
     qwen4_bind b[5];
     if (n_tokens == 0 || n_slots == 0 || n_out < n_slots ||
-        !qwen4_bind_buf(&b[0], gate_bufs[0], gate_inners ? (NSUInteger)gate_inners[0] : 0, 1u, "moe gate experts") ||
-        !qwen4_bind_buf(&b[1], up_bufs[0], up_inners ? (NSUInteger)up_inners[0] : 0, 1u, "moe up experts") ||
+        !qwen4_bind_buf(&b[0], (const ds4_gpu_tensor *)gate_bufs[0], gate_inners ? (NSUInteger)gate_inners[0] : 0, 1u, "moe gate experts") ||
+        !qwen4_bind_buf(&b[1], (const ds4_gpu_tensor *)up_bufs[0], up_inners ? (NSUInteger)up_inners[0] : 0, 1u, "moe up experts") ||
         !qwen4_bind_tensor(&b[2], lists, (uint64_t)n_expert * list_cap * sizeof(int32_t), "moe lists") ||
         !qwen4_bind_tensor(&b[3], counts, (uint64_t)n_expert * sizeof(int32_t), "moe counts") ||
         !qwen4_bind_tensor(&b[4], x, (uint64_t)n_tokens * in_dim * sizeof(float), "moe input")) {
@@ -49678,7 +49684,7 @@ int ds4_gpu_qwen4_moe_mm_down_tensor_with_bufs(
     if (tails) args.tail_base = nt * 8u;
     qwen4_bind b[6];
     if (n_tokens == 0 || n_slots == 0 || n_out < n_slots || row_bytes == 0 ||
-        !qwen4_bind_buf(&b[0], down_bufs[0], down_inners ? (NSUInteger)down_inners[0] : 0, expert_bytes, "moe down experts") ||
+        !qwen4_bind_buf(&b[0], (const ds4_gpu_tensor *)down_bufs[0], down_inners ? (NSUInteger)down_inners[0] : 0, expert_bytes, "moe down experts") ||
         !qwen4_bind_tensor(&b[1], lists, (uint64_t)n_expert * list_cap * sizeof(int32_t), "moe lists") ||
         !qwen4_bind_tensor(&b[2], counts, (uint64_t)n_expert * sizeof(int32_t), "moe counts") ||
         !qwen4_bind_tensor(&b[3], mid, (uint64_t)n_tokens * n_out * ff_dim * sizeof(float), "moe mid") ||

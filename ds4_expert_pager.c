@@ -142,21 +142,62 @@ static uint64_t json_get_uint(const char *json, const char *key) {
     return strtoull(pos, NULL, 10);
 }
 
-/* Parse nested numeric field from JSON */
+/* Parse nested numeric field from JSON.
+ *
+ * The index is written pretty-printed, so the child key never sits directly
+ * after the parent's opening brace: matching on the literal
+ * `"parent": {"child": ` always failed and every nested size read back as 0.
+ * Scan the parent object's own brace span and look for the child key inside
+ * it instead, so formatting changes cannot silently zero a size again. */
 static uint64_t json_get_nested_uint(const char *json, const char *parent, const char *child) {
-    char pattern[512];
-    snprintf(pattern, sizeof(pattern), "\"%s\": {\"%s\": ", parent, child);
+    char parent_pattern[256];
+    snprintf(parent_pattern, sizeof(parent_pattern), "\"%s\"", parent);
 
-    const char *pos = strstr(json, pattern);
+    const char *pos = strstr(json, parent_pattern);
     if (!pos) return 0;
 
-    pos += strlen(pattern);
-    return strtoull(pos, NULL, 10);
+    const char *open = strchr(pos + strlen(parent_pattern), '{');
+    if (!open) return 0;
+
+    int depth = 0;
+    const char *end = open;
+    for (; *end; end++) {
+        if (*end == '{') depth++;
+        else if (*end == '}') {
+            depth--;
+            if (depth == 0) break;
+        }
+    }
+    if (depth != 0) return 0;
+
+    char child_pattern[256];
+    snprintf(child_pattern, sizeof(child_pattern), "\"%s\"", child);
+    const char *cpos = strstr(open, child_pattern);
+    if (!cpos || cpos > end) return 0;
+
+    const char *colon = strchr(cpos + strlen(child_pattern), ':');
+    if (!colon || colon > end) return 0;
+
+    return strtoull(colon + 1, NULL, 10);
 }
 
 /* ---------------------------------------------------------------------------
  * Bundle loading
  * --------------------------------------------------------------------------- */
+
+/* Value of `"key": <number>` at or after `from`, or NULL.
+ *
+ * The offset into the pattern is derived from the pattern itself. Hand-counted
+ * skips had already gone wrong twice here: `"size": ` is 8 characters and was
+ * skipped as 9, `"offset": ` is 10 and was skipped as 11. Every bundle then
+ * read back a truncated size and the previous bundle's offset, so the paged
+ * experts were silently the wrong bytes. */
+static const char *json_field(const char *from, const char *key) {
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\": ", key);
+    const char *pos = strstr(from, pattern);
+    return pos ? pos + strlen(pattern) : NULL;
+}
 
 static bool ds4_expert_pager_load_bundles(ds4_expert_pager *pager,
                                           const char *json_str) {
@@ -199,17 +240,17 @@ static bool ds4_expert_pager_load_bundles(ds4_expert_pager *pager,
             ds4_expert_bundle *bundle = &pager->bundles[pager->bundles_count];
             memset(bundle, 0, sizeof(*bundle));
 
-            const char *layer_str = strstr(p, "\"layer\": ");
-            if (layer_str) bundle->layer = (uint32_t)strtoul(layer_str + 9, NULL, 10);
+            const char *layer_str = json_field(p, "layer");
+            if (layer_str) bundle->layer = (uint32_t)strtoul(layer_str, NULL, 10);
 
-            const char *expert_str = strstr(p, "\"expert\": ");
-            if (expert_str) bundle->expert = (uint32_t)strtoul(expert_str + 10, NULL, 10);
+            const char *expert_str = json_field(p, "expert");
+            if (expert_str) bundle->expert = (uint32_t)strtoul(expert_str, NULL, 10);
 
-            const char *offset_str = strstr(p, "\"offset\": ");
-            if (offset_str) bundle->offset = strtoull(offset_str + 11, NULL, 10);
+            const char *offset_str = json_field(p, "offset");
+            if (offset_str) bundle->offset = strtoull(offset_str, NULL, 10);
 
-            const char *size_str = strstr(p, "\"size\": ");
-            if (size_str) bundle->size = strtoull(size_str + 9, NULL, 10);
+            const char *size_str = json_field(p, "size");
+            if (size_str) bundle->size = strtoull(size_str, NULL, 10);
 
             const char *type_str = strstr(p, "\"type\": ");
             if (type_str) bundle->type = (uint32_t)strtoul(type_str + 9, NULL, 10);
@@ -239,12 +280,18 @@ bool ds4_expert_pager_open(ds4_expert_pager *pager,
                            const char *index_path) {
     memset(pager, 0, sizeof(*pager));
 
-    /* Open bundle file */
+    /* Open bundle file.  O_RDONLY is load-bearing: the pager must never write
+     * to the artifact, and the read-only receipt of ground rule 3 depends on
+     * this descriptor being read-only. */
     pager->bin_fd = open(bin_path, O_RDONLY);
     if (pager->bin_fd < 0) {
         fprintf(stderr, "ds4_expert_pager: failed to open %s: %s\n",
                 bin_path, strerror(errno));
         return false;
+    }
+    struct stat st;
+    if (fstat(pager->bin_fd, &st) == 0 && st.st_size > 0) {
+        pager->bundle_size = (uint64_t)st.st_size;
     }
 
     /* Read and parse index JSON */
@@ -281,6 +328,30 @@ bool ds4_expert_pager_open(ds4_expert_pager *pager,
     fprintf(stderr, "ds4_expert_pager: opened %llu bundles from %s\n",
             (unsigned long long)pager->bundles_count, index_path);
 
+    /*
+     * Authoritative sizing line.  Every expert-cache budget, resident-set
+     * estimate and prefetch bound downstream must be derived from these
+     * counts and this per-expert size; hand-written "experts x MiB" figures
+     * in planning documents have drifted from the artefact before, and the
+     * pager is the only place that reads the real index.
+     */
+    const ds4_expert_index_header *h = &pager->header;
+    const uint64_t per_expert = (uint64_t)h->bundle_bytes_gate +
+                                (uint64_t)h->bundle_bytes_up +
+                                (uint64_t)h->bundle_bytes_down;
+    const uint64_t n_experts = (uint64_t)h->layer_count * (uint64_t)h->expert_count;
+    fprintf(stderr,
+            "ds4_expert_pager: index says %u layers x %u experts = %llu experts, "
+            "%llu B/expert (%.4f MiB), %llu B total (%.2f GiB); "
+            "bin=%llu B (%.2f GiB); gguf_sha256=%s\n",
+            h->layer_count, h->expert_count, (unsigned long long)n_experts,
+            (unsigned long long)per_expert, (double)per_expert / 1048576.0,
+            (unsigned long long)(n_experts * per_expert),
+            (double)(n_experts * per_expert) / 1073741824.0,
+            (unsigned long long)pager->bundle_size,
+            (double)pager->bundle_size / 1073741824.0,
+            h->gguf_sha256[0] ? h->gguf_sha256 : "(none)");
+
     return true;
 }
 
@@ -298,6 +369,21 @@ void ds4_expert_pager_close(ds4_expert_pager *pager) {
 /* ---------------------------------------------------------------------------
  * Core ensure (synchronous, Stage B)
  * --------------------------------------------------------------------------- */
+
+/* A miss on this path is fatal to the run, so the reason has to be in the
+ * log: "no bundle" means the router produced an id the index does not cover,
+ * the other two are I/O and allocation failures.  Diagnostic only, gated on
+ * the same env var as the summary line. */
+static void pager_miss_report(const char *why, uint32_t layer, uint32_t expert,
+                              uint32_t tensor_idx, uint64_t size) {
+    const char *env = getenv("DS4_QWEN4_PAGER_STATS");
+    if (!env || !env[0] || strcmp(env, "0") == 0) return;
+    fprintf(stderr, "ds4_expert_pager: miss (%s) layer=%u expert=%u tid=%u size=%llu\n",
+            why, layer, expert, tensor_idx, (unsigned long long)size);
+}
+
+#define PAGER_MISS_REPORT(why, layer, expert, tid, size) \
+    do { pager_miss_report((why), (layer), (expert), (tid), (size)); } while (0)
 
 int ds4_expert_pager_ensure(ds4_expert_pager *pager,
                             uint32_t layer,
@@ -325,16 +411,26 @@ int ds4_expert_pager_ensure(ds4_expert_pager *pager,
         }
 
         if (!bundle) {
+            PAGER_MISS_REPORT("no bundle", layer, expert, tensor_idx, 0);
             misses++;
             continue;
         }
 
         void *ptr = malloc(bundle->size);
-        if (!ptr) { misses++; continue; }
+        if (!ptr) {
+            PAGER_MISS_REPORT("malloc failed", layer, expert, tensor_idx, bundle->size);
+            misses++;
+            continue;
+        }
 
         ssize_t nread = pread(pager->bin_fd, ptr, bundle->size, bundle->offset);
         if (nread != (ssize_t)bundle->size) {
-            fprintf(stderr, "ds4_expert_pager: pread failed: %s\n", strerror(errno));
+            fprintf(stderr, "ds4_expert_pager: pread failed at layer=%u expert=%u tid=%u "
+                    "off=%llu size=%llu: got %lld, %s\n",
+                    layer, expert, tensor_idx,
+                    (unsigned long long)bundle->offset,
+                    (unsigned long long)bundle->size,
+                    (long long)nread, strerror(errno));
             free(ptr);
             misses++;
             continue;
