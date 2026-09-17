@@ -1169,7 +1169,15 @@ kernel void kernel_qwen4_router_topk(
     float mx = -3.0e38f;
     for (uint k = 0; k < QWEN4_ROUTER_LANE_MAX; k++) {
         const uint e = (uint)sgitg * 32 + tiisg + 32 * nsg * k;
-        mine[k] = e < NE ? lg[e] : -3.0e38f;
+        const float raw = e < NE ? lg[e] : -3.0e38f;
+        /* A single non-finite logit poisons the whole token: exp(raw - mx)
+         * turns every lane NaN, so no candidate ever beats the -1.0f seed in
+         * the ranking below and selected[] is written as the 0x7fffffff
+         * sentinel, routing the token to no expert. max() hides it (fmax
+         * drops the NaN) while the value stays in mine[], so the poison has
+         * to be removed here. A non-finite logit means "no opinion", which is
+         * what the out-of-range sentinel already means. */
+        mine[k] = isfinite(raw) ? raw : -3.0e38f;
         mx = max(mx, mine[k]);
     }
     mx = simd_max(mx);
