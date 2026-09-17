@@ -58,6 +58,8 @@ typedef struct {
     uint32_t ssd_streaming_full_layers;
     uint32_t ssd_streaming_preload_experts;
     uint64_t simulate_used_memory_bytes;
+    const char *qwen4_expert_bundle_path;
+    const char *qwen4_expert_index_path;
     double step_mul;
     const char *dump_frontier_logits_dir;
     ds4_dist_options dist;
@@ -375,6 +377,10 @@ static bench_config parse_options(int argc, char **argv) {
             c.show_output = true;
         } else if (!strcmp(arg, "--teacher-forced-decode")) {
             c.teacher_forced_decode = true;
+        } else if (!strcmp(arg, "--qwen4-expert-bundle")) {
+            c.qwen4_expert_bundle_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--qwen4-expert-index")) {
+            c.qwen4_expert_index_path = need_arg(&i, argc, argv, arg);
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr, NULL);
@@ -668,6 +674,8 @@ int main(int argc, char **argv) {
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
         .expert_profile_path = cfg.expert_profile_path,
+        .qwen4_expert_bundle_path = cfg.qwen4_expert_bundle_path,
+        .qwen4_expert_index_path = cfg.qwen4_expert_index_path,
         .distributed = cfg.dist,
         .tp = cfg.tp,
     };

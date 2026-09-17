@@ -90,3 +90,5 @@ __pycache__/
 # Large data artifacts — stored on HuggingFace, not in git
 *.bin
 *.index.json
+/tests/test_expert_pager
+/tests/test_kv_paged
