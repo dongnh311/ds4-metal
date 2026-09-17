@@ -2082,6 +2082,10 @@ static cli_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.engine.ssd_streaming_preload_experts = (uint32_t)v;
+        } else if (!strcmp(arg, "--qwen4-expert-bundle")) {
+            c.engine.qwen4_expert_bundle_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--qwen4-expert-index")) {
+            c.engine.qwen4_expert_index_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--simulate-used-memory")) {
             if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
                                    &c.engine.simulate_used_memory_bytes)) {

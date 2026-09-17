@@ -269,6 +269,7 @@ int ds4_expert_pager_ensure(ds4_expert_pager *pager,
                             uint32_t layer,
                             const uint32_t *expert_ids,
                             uint32_t n_experts,
+                            uint32_t tensor_idx,
                             void **out_pointers) {
     if (!pager || !expert_ids || n_experts == 0) {
         return -1;
@@ -279,19 +280,20 @@ int ds4_expert_pager_ensure(ds4_expert_pager *pager,
     for (uint32_t i = 0; i < n_experts; i++) {
         uint32_t expert = expert_ids[i];
 
-        /* Find bundle in index */
+        /* Find bundle in index for this layer + expert + tensor type */
         ds4_expert_bundle *bundle = NULL;
         for (uint64_t j = 0; j < pager->bundles_count; j++) {
             if (pager->bundles[j].layer == layer &&
-                pager->bundles[j].expert == expert) {
+                pager->bundles[j].expert == expert &&
+                pager->bundles[j].tensor_idx == tensor_idx) {
                 bundle = &pager->bundles[j];
                 break;
             }
         }
 
         if (!bundle) {
-            fprintf(stderr, "ds4_expert_pager: bundle not found for layer=%u expert=%u\n",
-                    layer, expert);
+            fprintf(stderr, "ds4_expert_pager: bundle not found for layer=%u expert=%u tensor=%u\n",
+                    layer, expert, tensor_idx);
             misses++;
             continue;
         }

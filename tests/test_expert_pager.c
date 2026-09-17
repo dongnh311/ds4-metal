@@ -126,7 +126,7 @@ static void test_pager_ensure() {
     uint32_t experts[] = {0, 1, 2};
     void *pointers[3] = {NULL};
 
-    int misses = ds4_expert_pager_ensure(&pager, 0, experts, 3, pointers);
+    int misses = ds4_expert_pager_ensure(&pager, 0, experts, 3, 0, pointers);
     assert(misses == 0);
 
     /* Verify pointers are valid */
@@ -139,7 +139,7 @@ static void test_pager_ensure() {
 
     /* Test ensure — request invalid expert */
     uint32_t invalid_expert = 999;
-    misses = ds4_expert_pager_ensure(&pager, 0, &invalid_expert, 1, NULL);
+    misses = ds4_expert_pager_ensure(&pager, 0, &invalid_expert, 1, 0, NULL);
     assert(misses > 0);
 
     /* Cleanup */
@@ -164,8 +164,8 @@ static void test_pager_stats() {
 
     /* Do some operations */
     uint32_t experts[] = {0, 1};
-    ds4_expert_pager_ensure(&pager, 0, experts, 2, NULL);
-    ds4_expert_pager_ensure(&pager, 1, experts, 2, NULL);
+    ds4_expert_pager_ensure(&pager, 0, experts, 2, 0, NULL);
+    ds4_expert_pager_ensure(&pager, 1, experts, 2, 0, NULL);
 
     /* Get stats */
     uint64_t misses, hits, pread_bytes;

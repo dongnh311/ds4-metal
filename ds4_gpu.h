@@ -3419,6 +3419,40 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
         const void *model_map, uint64_t model_size, uint64_t down_offset,
         uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
         uint32_t ff_dim, uint32_t out_dim, uint32_t list_cap);
+/* SSD-paged variants: accept per-layer staging buffers (loaded by the pager
+ * into g->expert_gate_buf[layer] etc.) instead of model_map+offset.  Used
+ * when qwen4_graph_moe runs with --ssd-streaming and the pager has populated
+ * the staging buffers before the MOE kernel is called.
+ *
+ * shared_map/shared_size must be non-NULL so that shared-expert weights can
+ * be resolved via ds4_gpu_wrap_model_range() while the pager's staging buffers
+ * sit beside (not replacing) the model map. */
+int ds4_gpu_qwen4_moe_mid_tensor_with_bufs(
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
+        void **gate_bufs, uint64_t *gate_inners,
+        void **up_bufs, uint64_t *up_inners,
+        const void *shared_map, uint64_t shared_size,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t in_dim, uint32_t ff_dim,
+        uint64_t shared_gate_offset, uint64_t shared_up_offset, uint32_t shared_type);
+int ds4_gpu_qwen4_moe_down_tensor_with_bufs(
+        ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
+        void **down_bufs, uint64_t *down_inners,
+        const void *shared_map, uint64_t shared_size,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t ff_dim, uint32_t out_dim,
+        uint64_t shared_down_offset, uint32_t shared_type);
+int ds4_gpu_qwen4_moe_mm_mid_tensor_with_bufs(
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
+        void **gate_bufs, uint64_t *gate_inners,
+        void **up_bufs, uint64_t *up_inners,
+        uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
+        uint32_t in_dim, uint32_t ff_dim, uint32_t list_cap);
+int ds4_gpu_qwen4_moe_mm_down_tensor_with_bufs(
+        ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
+        void **down_bufs, uint64_t *down_inners,
+        uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
+        uint32_t ff_dim, uint32_t out_dim, uint32_t list_cap);
 /* weight_type covers both the alpha and the beta projection */
 int ds4_gpu_qwen4_gdn_front_tensor(
         ds4_gpu_tensor *qkv, ds4_gpu_tensor *state, const ds4_gpu_tensor *mixed,

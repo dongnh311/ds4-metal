@@ -175,6 +175,8 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "SSD streaming cache target. N requests dynamic expert slots; NGB also reserves two full prefill layers. Either may be reduced to fit the model, graph, context, and backend working set.");
     opt(fp, c, "--ssd-streaming-full-layers N", "GLM Metal streaming: keep the first N routed layers fully resident. Default: auto from NGB expert budget; use 0 to disable.");
     opt(fp, c, "--ssd-streaming-preload-experts N", "SSD streaming: upfront popularity preload count. DeepSeek auto-seeds by default; GLM demand-fills unless N is explicit.");
+    opt(fp, c, "--qwen4-expert-bundle FILE", "Qwen4 SSD expert cache: path to the paged expert bundle (qwen38-experts.bin). Requires --ssd-streaming and --qwen4-expert-index.");
+    opt(fp, c, "--qwen4-expert-index FILE", "Qwen4 SSD expert cache: path to the JSON index (qwen38-experts.index.json). Requires --ssd-streaming and --qwen4-expert-bundle.");
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
     opt(fp, c, "--prefill-chunk N", "Graph prefill chunk size. Default: CUDA TP 2048; PRO long prompts 8192; others 4096.");
     if (full) {

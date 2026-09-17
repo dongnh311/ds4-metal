@@ -55,12 +55,25 @@ bool ds4_expert_pager_open(ds4_expert_pager *pager,
 /* Close pager */
 void ds4_expert_pager_close(ds4_expert_pager *pager);
 
-/* Ensure expert is resident in L1 cache
+/* Return per-tensor bundle sizes from the pager header (gate/up/down).
+ * Caller must ensure 0 <= tensor_idx < 3. */
+static inline uint64_t ds4_expert_pager_bundle_size(const ds4_expert_pager *p,
+                                                    uint32_t tensor_idx) {
+    switch (tensor_idx) {
+        case 0: return (uint64_t)p->header.bundle_bytes_gate;
+        case 1: return (uint64_t)p->header.bundle_bytes_up;
+        default: return (uint64_t)p->header.bundle_bytes_down;
+    }
+}
+
+/* Ensure expert is resident in L1 cache.
+ * tensor_idx: 0=gate, 1=up, 2=down — filters bundles to the requested tensor type.
  * Returns: 0 = all resident, >0 = misses occurred */
 int ds4_expert_pager_ensure(ds4_expert_pager *pager,
                             uint32_t layer,
                             const uint32_t *expert_ids,
                             uint32_t n_experts,
+                            uint32_t tensor_idx,
                             void **out_pointers);
 
 /* Get stats (call at exit for diagnostic report) */

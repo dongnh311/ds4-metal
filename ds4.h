@@ -161,6 +161,11 @@ typedef struct {
     bool ssd_streaming;
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
+    /* Path to qwen38-experts.bin bundle for qwen4 SSD expert paging.
+     * NULL = pager disabled; set when --ssd-streaming is used with a
+     * qwen4 model and the bundle+index files are present on disk. */
+    const char *qwen4_expert_bundle_path;
+    const char *qwen4_expert_index_path;
     bool inspect_only;
     /* Multi-GPU placement uses this to price per-layer KV storage. */
     int placement_ctx_hint;
