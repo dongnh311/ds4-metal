@@ -608,3 +608,241 @@ void ds4_expert_pager_report_stats(const ds4_expert_pager *pager) {
     fprintf(stderr, "Latency:         %.2f ms\n", latency_ms);
     fprintf(stderr, "==========================\n\n");
 }
+
+/* ---------------------------------------------------------------------------
+ * Stage D: Predictive next-layer prefetch implementation
+ * --------------------------------------------------------------------------- */
+
+/* Predictor state for simple recurrence model */
+typedef struct {
+    uint32_t layer_history[64];  /* ring buffer of last 64 layers */
+    uint32_t n_layers;
+    uint32_t expert_counts[512]; /* per-expert hit count across all layers */
+    uint32_t total_selects;
+} ds4_expert_predictor;
+
+static ds4_expert_predictor g_predictor = {0};
+static pthread_mutex_t g_predictor_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void ds4_expert_pager_record_selection(ds4_expert_pager *pager,
+                                        uint32_t layer,
+                                        const uint32_t *expert_ids,
+                                        uint32_t n_experts) {
+    (void)pager;
+    pthread_mutex_lock(&g_predictor_mutex);
+    
+    /* Update ring buffer */
+    g_predictor.layer_history[g_predictor.n_layers % 64] = layer;
+    g_predictor.n_layers++;
+    
+    /* Update expert counts */
+    for (uint32_t i = 0; i < n_experts && i < 16; i++) {
+        if (expert_ids[i] < 512) {
+            g_predictor.expert_counts[expert_ids[i]]++;
+            g_predictor.total_selects++;
+        }
+    }
+    
+    pthread_mutex_unlock(&g_predictor_mutex);
+}
+
+bool ds4_expert_pager_predict_next_layer(ds4_expert_pager *pager,
+                                          uint32_t next_layer,
+                                          uint32_t *out_expert_ids,
+                                          uint32_t *out_n_experts) {
+    (void)pager;
+    (void)next_layer;
+    
+    pthread_mutex_lock(&g_predictor_mutex);
+    
+    /* Simple heuristic: use the most frequent experts from history */
+    /* Sort by count (simple bubble sort for small array) */
+    uint32_t sorted_ids[512];
+    for (uint32_t i = 0; i < 512; i++) {
+        sorted_ids[i] = i;
+    }
+    
+    /* Bubble sort by descending count (only top N matter) */
+    for (uint32_t i = 0; i < 512 && i < 10; i++) {
+        for (uint32_t j = i + 1; j < 512; j++) {
+            if (g_predictor.expert_counts[sorted_ids[j]] > g_predictor.expert_counts[sorted_ids[i]]) {
+                uint32_t tmp = sorted_ids[i];
+                sorted_ids[i] = sorted_ids[j];
+                sorted_ids[j] = tmp;
+            }
+        }
+    }
+    
+    /* Only predict if we have enough history */
+    if (g_predictor.n_layers < 3) {
+        pthread_mutex_unlock(&g_predictor_mutex);
+        return false;
+    }
+    
+    /* Output top 10 experts */
+    *out_n_experts = 10;
+    for (uint32_t i = 0; i < 10; i++) {
+        out_expert_ids[i] = sorted_ids[i];
+    }
+    
+    pthread_mutex_unlock(&g_predictor_mutex);
+    return true;
+}
+
+bool ds4_expert_pager_prefetch_predicted(ds4_expert_pager *pager,
+                                          uint32_t next_layer,
+                                          const uint32_t *predicted_experts,
+                                          uint32_t n_experts,
+                                          uint32_t tensor_idx,
+                                          void *target_l2_buf,
+                                          uint64_t buf_size) {
+    return ds4_expert_pager_async_prefetch(pager, next_layer, 
+                                           predicted_experts, n_experts,
+                                           tensor_idx, target_l2_buf, buf_size);
+}
+
+void ds4_expert_pager_get_prediction_stats(const ds4_expert_pager *pager,
+                                            uint64_t *out_predictions,
+                                            uint64_t *out_hits,
+                                            double *out_hit_rate) {
+    (void)pager;
+    if (out_predictions) *out_predictions = g_predictor.total_selects;
+    if (out_hits) *out_hits = 0; /* Will be updated when prediction is validated */
+    if (out_hit_rate) *out_hit_rate = 0.0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Stage E: Eviction Ladder Implementation
+ * --------------------------------------------------------------------------- */
+
+/* Bundle state for eviction tracking */
+typedef enum {
+    DS4_EXPERT_BUNDLE_COLD = 0,
+    DS4_EXPERT_BUNDLE_PREFETCHING,
+    DS4_EXPERT_BUNDLE_READY,
+    DS4_EXPERT_BUNDLE_IN_USE,
+    DS4_EXPERT_BUNDLE_EVICTING,
+} ds4_expert_bundle_state;
+
+/* Per-bundle eviction metadata */
+typedef struct {
+    ds4_expert_bundle_state state;
+    uint64_t access_count;      /* frequency */
+    double recency_score;       /* 1.0 = just used, decays over time */
+    double next_layer_prob;     /* predicted probability of next layer use */
+    uint64_t bundle_size;       /* for cost-aware eviction */
+    uint64_t last_access_time;  /* monotonic timestamp */
+} ds4_expert_eviction_meta;
+
+/* Eviction state */
+static ds4_expert_eviction_meta g_eviction_meta[DS4_EXPERT_PAGER_MAX_BUNDLES] = {0};
+static uint64_t g_eviction_time = 0;
+static pthread_mutex_t g_eviction_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Initialize eviction tracking for a bundle */
+static void ds4_expert_eviction_init(ds4_expert_pager *pager, uint64_t bundle_idx) {
+    if (bundle_idx >= pager->bundles_count) return;
+    pthread_mutex_lock(&g_eviction_mutex);
+    
+    ds4_expert_eviction_meta *meta = &g_eviction_meta[bundle_idx];
+    meta->state = DS4_EXPERT_BUNDLE_READY;
+    meta->access_count = 0;
+    meta->recency_score = 1.0;
+    meta->next_layer_prob = 0.0;
+    meta->bundle_size = pager->bundles[bundle_idx].size;
+    meta->last_access_time = ++g_eviction_time;
+    
+    pthread_mutex_unlock(&g_eviction_mutex);
+}
+
+/* Update eviction metadata on bundle access */
+static void ds4_expert_eviction_update(ds4_expert_pager *pager, uint64_t bundle_idx) {
+    if (bundle_idx >= pager->bundles_count) return;
+    pthread_mutex_lock(&g_eviction_mutex);
+    
+    ds4_expert_eviction_meta *meta = &g_eviction_meta[bundle_idx];
+    meta->access_count++;
+    meta->recency_score = 1.0;
+    meta->last_access_time = ++g_eviction_time;
+    meta->state = DS4_EXPERT_BUNDLE_IN_USE;
+    
+    pthread_mutex_unlock(&g_eviction_mutex);
+}
+
+/* Compute eviction score for a bundle (lower = better to evict) */
+static double ds4_expert_eviction_score(const ds4_expert_eviction_meta *meta) {
+    /* Score = w1*freq + w2*recency + w3*next_layer_prob - w4*size
+     * Lower score = more likely to evict
+     * We invert: high score = keep, low score = evict
+     * So return -score for selection
+     */
+    static const double w1 = 0.3;
+    static const double w2 = 0.3;
+    static const double w3 = 0.2;
+    static const double w4 = 0.2;
+    
+    double freq_score = (double)meta->access_count / 100.0;  /* normalize */
+    double recency_score = meta->recency_score;
+    double prob_score = meta->next_layer_prob;
+    double cost_score = (double)meta->bundle_size / 500000.0;  /* normalize to ~1.0 */
+    
+    /* Return score where higher = better to keep */
+    return w1 * freq_score + w2 * recency_score + w3 * prob_score - w4 * cost_score;
+}
+
+/* Find victim bundle for eviction (lowest score, not in use) */
+static uint64_t ds4_expert_eviction_find_victim(ds4_expert_pager *pager) {
+    pthread_mutex_lock(&g_eviction_mutex);
+    
+    uint64_t best_idx = 0;
+    double best_score = 1e18;
+    
+    for (uint64_t i = 0; i < pager->bundles_count; i++) {
+        ds4_expert_eviction_meta *meta = &g_eviction_meta[i];
+        
+        /* Skip bundles that are IN_USE or PREFETCHING or EVICTING */
+        if (meta->state == DS4_EXPERT_BUNDLE_IN_USE ||
+            meta->state == DS4_EXPERT_BUNDLE_PREFETCHING ||
+            meta->state == DS4_EXPERT_BUNDLE_EVICTING) {
+            continue;
+        }
+        
+        /* Skip if already ready (will be handled by ensure) */
+        if (meta->state != DS4_EXPERT_BUNDLE_READY) {
+            continue;
+        }
+        
+        double score = ds4_expert_eviction_score(meta);
+        if (score < best_score) {
+            best_score = score;
+            best_idx = i;
+        }
+    }
+    
+    pthread_mutex_unlock(&g_eviction_mutex);
+    return best_idx;
+}
+
+/* Decays recency scores over time */
+static void ds4_expert_eviction_decay(void) {
+    pthread_mutex_lock(&g_eviction_mutex);
+    
+    double decay_rate = 0.95;  /* 5% decay per time step */
+    for (uint64_t i = 0; i < DS4_EXPERT_PAGER_MAX_BUNDLES; i++) {
+        ds4_expert_eviction_meta *meta = &g_eviction_meta[i];
+        if (meta->state == DS4_EXPERT_BUNDLE_READY) {
+            meta->recency_score *= decay_rate;
+        }
+    }
+    
+    pthread_mutex_unlock(&g_eviction_mutex);
+}
+
+/* Get eviction stats for reporting */
+void ds4_expert_pager_get_eviction_stats(const ds4_expert_pager *pager,
+                                          uint64_t *out_evictions,
+                                          double *out_avg_score) {
+    (void)pager;
+    if (out_evictions) *out_evictions = 0;  /* Will be incremented in ensure */
+    if (out_avg_score) *out_avg_score = 0.5;  /* Placeholder */
+}
