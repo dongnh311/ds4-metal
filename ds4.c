@@ -58499,29 +58499,35 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                l->ffn_gate_inp_shexp->abs_offset, l->ffn_gate_inp_shexp->type,
                                                DS4_N_EMBD, g->sh_gate_logit, T, DS4_N_EXPERT, DS4_N_EXPERT_USED) &&
               qwen4_moe_profile_boundary(profile, &last, &elapsed[0]);
-    /* Prefill-sized batches route each expert's tokens through tiled GEMMs
-     * (weights read once per 32 tokens) and run the shared expert as dense
-     * GEMMs; decode keeps the per-(token, slot) row kernels with the shared
-     * expert as an extra slot. */
-    const bool mm = T > 8u && (DS4_N_EMBD % 64u) == 0 && (DS4_N_FF_EXP % 64u) == 0 &&
-        qwen4_expert_type_has_mm(l->ffn_gate_exps->type) &&
-        l->ffn_up_exps->type == l->ffn_gate_exps->type &&
-        qwen4_expert_type_has_mm(l->ffn_down_exps->type) &&
-        qwen4_graph_dense_ok(l->ffn_gate_shexp) && qwen4_graph_dense_ok(l->ffn_up_shexp) &&
-        qwen4_graph_dense_ok(l->ffn_down_shexp);
-    /* Page-aside path: when pager is active, ensure resident and use _with_bufs */
+
     if (ok && g->pager) {
-        ds4_gpu_end_commands();
-        /* Upload staging buffers for each token.
-         * We call ensure per-tensor so the pager can filter by tensor_idx. */
+        /* SSD-paged experts: the pager's per-layer staging buffer
+         * (expert_{gate,up,down}_buf[layer_idx]) is sized for exactly one
+         * token's routed set (DS4_N_EXPERT_USED slots), and the "_with_bufs"
+         * kernels index it by local slot, not by the routed global expert
+         * id (that indexing bug, and this buffer-per-token sizing, are the
+         * root causes documented in speed-bench/logit-gate/GATE_RESULT.md).
+         * So each token must be staged and consumed -- ensure(), write(),
+         * dispatch(), and a GPU sync -- before the next token's ensure()
+         * call is allowed to overwrite the same buffer. This forgoes the
+         * resident path's cross-token weight-reuse ("mm" tiled) batching
+         * for correctness; restoring batched throughput on the paged path
+         * is Phase 2 kernel work, not this gate fix. */
+        const uint64_t mixed_stride = (uint64_t)DS4_N_EMBD * sizeof(float);
+        const uint64_t sel_stride = (uint64_t)DS4_N_EXPERT_USED * sizeof(uint32_t);
+        const uint64_t mid_stride = (uint64_t)(DS4_N_EXPERT_USED + 1u) * DS4_N_FF_EXP * sizeof(float);
+        const uint64_t part_stride = (uint64_t)(DS4_N_EXPERT_USED + 1u) * DS4_N_EMBD * sizeof(float);
         for (uint32_t t = 0; t < T && ok; t++) {
-            /* Read selected expert IDs from GPU */
             if (!ds4_gpu_tensor_read(g->selected, (uint64_t)t * DS4_N_EXPERT_USED * sizeof(uint32_t),
                                      g->qwen4_paged_selected, DS4_N_EXPERT_USED * sizeof(uint32_t))) {
                 ok = false;
                 break;
             }
-            /* Load gate / up / down bundles for this token's experts into staging */
+            /* Staging writes are plain CPU memcpy into GPU-visible memory:
+             * they must not race the previous token's kernel reads of the
+             * same buffer, so close out that token's command batch (which
+             * waits for it to finish) before touching the buffer again. */
+            ds4_gpu_end_commands();
             for (uint32_t tid = 0; tid < 3 && ok; tid++) {
                 void *ptrs[DS4_MAX_EXPERT_USED];
                 memset(ptrs, 0, sizeof(ptrs));
@@ -58551,62 +58557,81 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                 }
                 ds4_expert_pager_release_pointers(g->pager, ptrs, DS4_N_EXPERT_USED);
             }
+            ds4_gpu_begin_commands();
+            if (!ok) break;
+
+            ds4_gpu_tensor *x_view = ds4_gpu_tensor_view(g->mixed, (uint64_t)t * mixed_stride, mixed_stride);
+            ds4_gpu_tensor *sel_view = ds4_gpu_tensor_view(g->selected, (uint64_t)t * sel_stride, sel_stride);
+            ds4_gpu_tensor *mid_view = ds4_gpu_tensor_view(g->mid, (uint64_t)t * mid_stride, mid_stride);
+            ds4_gpu_tensor *part_view = ds4_gpu_tensor_view(g->part, (uint64_t)t * part_stride, part_stride);
+            ok = x_view != NULL && sel_view != NULL && mid_view != NULL && part_view != NULL;
+            if (ok) {
+                ok = ds4_gpu_qwen4_moe_mid_tensor_with_bufs(mid_view, x_view, sel_view,
+                                                            (void**)&g->expert_gate_buf[layer_idx],
+                                                            (uint64_t[1]){0},
+                                                            (void**)&g->expert_up_buf[layer_idx],
+                                                            (uint64_t[1]){0},
+                                                            m->map, m->size,
+                                                            l->ffn_gate_exps->type, DS4_N_EXPERT, 1u,
+                                                            DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
+                                                            l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+                                                            l->ffn_gate_shexp->type) != 0;
+            }
+            if (ok) {
+                ok = ds4_gpu_qwen4_moe_down_tensor_with_bufs(part_view, mid_view, sel_view,
+                                                             (void**)&g->expert_down_buf[layer_idx],
+                                                             (uint64_t[1]){0},
+                                                             m->map, m->size,
+                                                             l->ffn_down_exps->type, DS4_N_EXPERT, 1u,
+                                                             DS4_N_EXPERT_USED, DS4_N_FF_EXP,
+                                                             DS4_N_EMBD, l->ffn_down_shexp->abs_offset, l->ffn_down_shexp->type) != 0;
+            }
+            ds4_gpu_tensor_free(x_view);
+            ds4_gpu_tensor_free(sel_view);
+            ds4_gpu_tensor_free(mid_view);
+            ds4_gpu_tensor_free(part_view);
         }
-        ds4_gpu_begin_commands();
+        if (ok) {
+            ok = ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, g->sh_gate_logit, NULL, g->R, g->inj, T,
+                                                 DS4_N_EXPERT_USED, DS4_N_EXPERT_USED + 1u, DS4_N_EMBD, DS4_N_HC) != 0;
+        }
+        return ok;
     }
+
+    /* Prefill-sized batches route each expert's tokens through tiled GEMMs
+     * (weights read once per 32 tokens) and run the shared expert as dense
+     * GEMMs; decode keeps the per-(token, slot) row kernels with the shared
+     * expert as an extra slot. Resident only (paged experts return above:
+     * the pager's staging buffer can't serve either kernel's addressing). */
+    const bool mm = T > 8u && (DS4_N_EMBD % 64u) == 0 && (DS4_N_FF_EXP % 64u) == 0 &&
+        qwen4_expert_type_has_mm(l->ffn_gate_exps->type) &&
+        l->ffn_up_exps->type == l->ffn_gate_exps->type &&
+        qwen4_expert_type_has_mm(l->ffn_down_exps->type) &&
+        qwen4_graph_dense_ok(l->ffn_gate_shexp) && qwen4_graph_dense_ok(l->ffn_up_shexp) &&
+        qwen4_graph_dense_ok(l->ffn_down_shexp);
     if (mm) {
         if (ok) {
-            if (g->pager) {
-                ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, DS4_N_EXPERT_USED,
-                                                          DS4_N_EXPERT, g->cap_tokens) &&
-                     qwen4_moe_profile_boundary(profile, &last, &elapsed[1]) &&
-                     ds4_gpu_qwen4_moe_mm_mid_tensor_with_bufs(g->mid, g->mixed, g->moe_lists, g->moe_counts,
-                                                               (void**)&g->expert_gate_buf[layer_idx],
-                                                               (uint64_t[1]){0},
-                                                               (void**)&g->expert_up_buf[layer_idx],
-                                                               (uint64_t[1]){0},
-                                                               l->ffn_gate_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED,
-                                                               DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP, g->cap_tokens) &&
-                     qwen4_moe_profile_boundary(profile, &last, &elapsed[2]) &&
-                     qwen4_gemv(g->sh_gate, m, l->ffn_gate_shexp, g->mixed, T) &&
-                     qwen4_gemv(g->sh_up, m, l->ffn_up_shexp, g->mixed, T) &&
-                     ds4_gpu_swiglu_tensor(g->sh_mid, g->sh_gate, g->sh_up, T * DS4_N_FF_EXP, 0.0f, 1.0f) &&
-                     qwen4_moe_profile_boundary(profile, &last, &elapsed[3]);
-            } else {
-                ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, DS4_N_EXPERT_USED,
-                                                          DS4_N_EXPERT, g->cap_tokens) &&
-                     qwen4_moe_profile_boundary(profile, &last, &elapsed[1]) &&
-                     ds4_gpu_qwen4_moe_mm_mid_tensor(g->mid, g->mixed, g->moe_lists, g->moe_counts, m->map, m->size,
-                                                     l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
-                                                     l->ffn_gate_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED,
-                                                     DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP, g->cap_tokens) &&
-                     qwen4_moe_profile_boundary(profile, &last, &elapsed[2]) &&
-                     qwen4_gemv(g->sh_gate, m, l->ffn_gate_shexp, g->mixed, T) &&
-                     qwen4_gemv(g->sh_up, m, l->ffn_up_shexp, g->mixed, T) &&
-                     ds4_gpu_swiglu_tensor(g->sh_mid, g->sh_gate, g->sh_up, T * DS4_N_FF_EXP, 0.0f, 1.0f) &&
-                     qwen4_moe_profile_boundary(profile, &last, &elapsed[3]);
-            }
+            ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, DS4_N_EXPERT_USED,
+                                                      DS4_N_EXPERT, g->cap_tokens) &&
+                 qwen4_moe_profile_boundary(profile, &last, &elapsed[1]) &&
+                 ds4_gpu_qwen4_moe_mm_mid_tensor(g->mid, g->mixed, g->moe_lists, g->moe_counts, m->map, m->size,
+                                                 l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                                                 l->ffn_gate_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED,
+                                                 DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP, g->cap_tokens) &&
+                 qwen4_moe_profile_boundary(profile, &last, &elapsed[2]) &&
+                 qwen4_gemv(g->sh_gate, m, l->ffn_gate_shexp, g->mixed, T) &&
+                 qwen4_gemv(g->sh_up, m, l->ffn_up_shexp, g->mixed, T) &&
+                 ds4_gpu_swiglu_tensor(g->sh_mid, g->sh_gate, g->sh_up, T * DS4_N_FF_EXP, 0.0f, 1.0f) &&
+                 qwen4_moe_profile_boundary(profile, &last, &elapsed[3]);
         }
         if (ok) {
-            if (g->pager) {
-                ok = ds4_gpu_qwen4_moe_mm_down_tensor_with_bufs(g->part, g->mid, g->moe_lists, g->moe_counts,
-                                                                (void**)&g->expert_down_buf[layer_idx],
-                                                                (uint64_t[1]){0},
-                                                                l->ffn_down_exps->type, DS4_N_EXPERT, T,
-                                                                DS4_N_EXPERT_USED, DS4_N_EXPERT_USED, DS4_N_FF_EXP,
-                                                                DS4_N_EMBD, g->cap_tokens) &&
-                     qwen4_moe_profile_boundary(profile, &last, &elapsed[4]) &&
-                     qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->sh_mid, T) &&
-                     qwen4_moe_profile_boundary(profile, &last, &elapsed[5]);
-            } else {
-                ok = ds4_gpu_qwen4_moe_mm_down_tensor(g->part, g->mid, g->moe_lists, g->moe_counts, m->map, m->size,
-                                                      l->ffn_down_exps->abs_offset, l->ffn_down_exps->type, DS4_N_EXPERT, T,
-                                                      DS4_N_EXPERT_USED, DS4_N_EXPERT_USED, DS4_N_FF_EXP, DS4_N_EMBD,
-                                                      g->cap_tokens) &&
-                     qwen4_moe_profile_boundary(profile, &last, &elapsed[4]) &&
-                     qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->sh_mid, T) &&
-                     qwen4_moe_profile_boundary(profile, &last, &elapsed[5]);
-            }
+            ok = ds4_gpu_qwen4_moe_mm_down_tensor(g->part, g->mid, g->moe_lists, g->moe_counts, m->map, m->size,
+                                                  l->ffn_down_exps->abs_offset, l->ffn_down_exps->type, DS4_N_EXPERT, T,
+                                                  DS4_N_EXPERT_USED, DS4_N_EXPERT_USED, DS4_N_FF_EXP, DS4_N_EMBD,
+                                                  g->cap_tokens) &&
+                 qwen4_moe_profile_boundary(profile, &last, &elapsed[4]) &&
+                 qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->sh_mid, T) &&
+                 qwen4_moe_profile_boundary(profile, &last, &elapsed[5]);
         }
         if (ok) {
             ok = ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, g->sh_gate_logit, g->sh_out, g->R, g->inj,
@@ -58620,41 +58645,18 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                 elapsed[4] * 1e3, elapsed[5] * 1e3, elapsed[6] * 1e3);
         return ok;
     }
-    /* Non-mm path (decode) */
+    /* Non-mm path (decode), resident only. */
     if (ok) {
-        if (g->pager) {
-            ok = ds4_gpu_qwen4_moe_mid_tensor_with_bufs(g->mid, g->mixed, g->selected,
-                                                        (void**)&g->expert_gate_buf[layer_idx],
-                                                        (uint64_t[1]){0},
-                                                        (void**)&g->expert_up_buf[layer_idx],
-                                                        (uint64_t[1]){0},
-                                                        m->map, m->size,
-                                                        l->ffn_gate_exps->type, DS4_N_EXPERT, T,
-                                                        DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
-                                                        l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
-                                                        l->ffn_gate_shexp->type) != 0;
-        } else {
-            ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
-                                              l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,
-                                              DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
-                                              l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
-                                              l->ffn_gate_shexp->type) != 0;
-        }
+        ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
+                                          l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,
+                                          DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
+                                          l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+                                          l->ffn_gate_shexp->type) != 0;
     }
     if (ok) {
-        if (g->pager) {
-            ok = ds4_gpu_qwen4_moe_down_tensor_with_bufs(g->part, g->mid, g->selected,
-                                                         (void**)&g->expert_down_buf[layer_idx],
-                                                         (uint64_t[1]){0},
-                                                         m->map, m->size,
-                                                         l->ffn_down_exps->type, DS4_N_EXPERT, T,
-                                                         DS4_N_EXPERT_USED, DS4_N_FF_EXP,
-                                                         DS4_N_EMBD, l->ffn_down_shexp->abs_offset, l->ffn_down_shexp->type) != 0;
-        } else {
-            ok = ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, l->ffn_down_exps->abs_offset,
-                                               l->ffn_down_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED, DS4_N_FF_EXP,
-                                               DS4_N_EMBD, l->ffn_down_shexp->abs_offset, l->ffn_down_shexp->type) != 0;
-        }
+        ok = ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, l->ffn_down_exps->abs_offset,
+                                           l->ffn_down_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED, DS4_N_FF_EXP,
+                                           DS4_N_EMBD, l->ffn_down_shexp->abs_offset, l->ffn_down_shexp->type) != 0;
     }
     if (ok) {
         ok = ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, g->sh_gate_logit, NULL, g->R, g->inj, T,

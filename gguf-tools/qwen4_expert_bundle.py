@@ -47,9 +47,11 @@ TYPE_BYTES = {
     2: 18,    # Q4_0
     3: 20,    # Q4_1
     8: 34,    # Q8_0
-    10: 66,   # IQ2_XXS (256 elems per block)
+    10: 84,   # Q2_K (256 elems per block) -- was wrongly 66 (IQ2_XXS's size);
+              # see speed-bench/logit-gate/GATE_RESULT.md for the corruption
+              # this caused in every down-expert bundle before this fix.
     12: 144,  # Q4_K (256 elems per block)
-    16: 66,   # IQ2_XXS (duplicate mapping; verified by size analysis)
+    16: 66,   # IQ2_XXS (256 elems per block)
     27: 8,    # I64
     30: 2,    # BF16
     39: 17,   # MXFP4 (32 elems per block)
@@ -152,6 +154,26 @@ class Reader:
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: str, chunk_bytes: int = 64 * 1024 * 1024) -> str:
+    """Stream a whole-file sha256 in bounded-size chunks.
+
+    A single f.read() with no size argument loads the entire file into one
+    Python bytes object first. For the ~34 GiB bundle that is wasteful; for
+    the 147 GiB source GGUF on a 64 GiB machine it does not fit in RAM at
+    all -- the earlier version of this function used exactly that pattern
+    and the process was silently OOM-killed here, after already spending
+    the time to write the bundle and hash every per-bundle digest.
+    """
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_bytes)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -284,12 +306,12 @@ def main() -> None:
             bundle["sha256"] = sha256_bytes(data)
 
     # Compute bundle file sha256
-    with open(args.output, "rb") as f:
-        file_sha = sha256_bytes(f.read())
+    print("Hashing bundle file...")
+    file_sha = sha256_file(args.output)
 
     # Compute input GGUF sha256
-    with open(args.input, "rb") as f:
-        gguf_sha = sha256_bytes(f.read())
+    print("Hashing input GGUF (147 GiB, streamed)...")
+    gguf_sha = sha256_file(args.input)
 
     # Build index JSON
     gate_sample = bundles[0]

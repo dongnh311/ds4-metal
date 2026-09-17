@@ -2112,6 +2112,14 @@ struct ds4_metal_args_qwen4_moe {
     uint32_t shared_type;
     uint32_t shared_row_bytes;
     uint32_t n_total_expert;
+    /* When 0 (resident): the weight buffer holds every expert, so a slot's
+     * weight offset comes from its routed global expert id (selected[]).
+     * When 1 (SSD-paged "_with_bufs" callers): the bound buffer is the
+     * pager's small per-layer staging tensor, which only ever holds this
+     * call's n_slots experts, written at their local slot position -- using
+     * the global expert id as an offset into that tiny buffer reads whatever
+     * memory happens to follow it. Index by the local slot instead. */
+    uint32_t paged_local_index;
 };
 
 /* dot of one quantized expert row with x, lanes split as in the K3 kernels:
@@ -2309,7 +2317,14 @@ kernel void kernel_qwen4_moe_mid(
     const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
     device const char *gb = shared ? sh_gate : gate_base;
     device const char *ub = shared ? sh_up : up_base;
-    const uint64_t ebase = shared ? 0 : (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot] * args.expert_bytes;
+    /* Resident: the bound buffer holds every expert, so a slot's offset
+     * comes from its routed global id. SSD-paged _with_bufs callers bind
+     * the pager's small per-layer staging buffer instead, which only ever
+     * holds this call's n_slots experts at their local slot position --
+     * indexing that by the global id reads past it. */
+    const uint64_t ebase = shared ? 0 :
+        (args.paged_local_index ? (uint64_t)slot :
+         (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot]) * args.expert_bytes;
     device const float *xt = x + (uint64_t)tok * args.in_dim;
     for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
         const uint64_t off = ebase + (uint64_t)r * row_bytes;
@@ -2442,7 +2457,14 @@ kernel void kernel_qwen4_moe_down(
     const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
     device const char *db = shared ? sh_down : down_base;
     const uint64_t pair = (uint64_t)tok * n_out + slot;
-    const uint64_t ebase = shared ? 0 : (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot] * args.expert_bytes;
+    /* Resident: the bound buffer holds every expert, so a slot's offset
+     * comes from its routed global id. SSD-paged _with_bufs callers bind
+     * the pager's small per-layer staging buffer instead, which only ever
+     * holds this call's n_slots experts at their local slot position --
+     * indexing that by the global id reads past it. */
+    const uint64_t ebase = shared ? 0 :
+        (args.paged_local_index ? (uint64_t)slot :
+         (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot]) * args.expert_bytes;
     device const float *m = mid + pair * args.in_dim;
     for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
         const float v = qwen4_row_dot(db + ebase + (uint64_t)r * row_bytes, m, type, dim, tiisg);

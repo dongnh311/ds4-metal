@@ -1,6 +1,10 @@
 # Gate #5 result: resident vs paged logit dump (item 1.3)
 
-Status: **FAIL** — not "not bit-identical", but total corruption.
+Status: **FAIL, still**, but the failure mode has changed twice since the
+first run. Two real, independent bugs found and fixed below (total
+corruption is gone); a third, smaller, distinct bug remains and is NOT yet
+fixed. See "Bug 3" and "Current status" at the bottom for where this
+actually stands.
 
 ## Runs
 - ctx=256: `/tmp/logit-repro/frontier_000256.logits.json` (paged only, ad hoc repro, not kept in repo)
@@ -110,9 +114,96 @@ here. This does not invalidate the pager cache-sizing conclusion (both E1
 and E2 read the same bytes either way), but it means no correctness claim
 should be drawn from that run's *output*, only from its cache statistics.
 
+## Bug 2 (found and fixed): kernel indexes the staging buffer by global expert id
+
+After Bug 1's fix (bundle rebuilt, sizes now correct and byte-verified
+identical to the source GGUF -- confirmed with a direct sha256 comparison
+of the same (layer, expert) slice pulled from both files), the gate no
+longer produced NaN, but was still not bit-identical: every one of 248320
+logits differed, by up to ~9.8, while argmax still happened to agree.
+Reproduced identically at ctx=1 (single token, no batching involved), which
+ruled out the earlier "mm batching" hypothesis for good and pointed at the
+kernels themselves.
+
+Root cause, in `metal/qwen4.metal`: `kernel_qwen4_moe_mid` and
+`kernel_qwen4_moe_down` compute the weight-buffer offset for each routed
+slot as `selected[tok*n_slots+slot] * expert_bytes` -- the token's **global
+routed expert id** (0..511) times the per-expert byte size. That is correct
+when the bound buffer is the full resident model map (all 512 experts,
+addressable by global id) -- but the SAME kernel is dispatched for the
+paged "_with_bufs" path, where the bound buffer is the pager's per-layer
+staging tensor, sized for only `DS4_N_EXPERT_USED` (10) experts, filled at
+their **local slot** position by `ds4.c`. Indexing that 10-slot buffer by a
+global id like 347 reads ~223 MB past its start -- silently reading
+whatever else the process had allocated nearby, not the intended weights.
+The batched "mm" kernels (`kernel_qwen4_moe_mm_mid`/`_mm_down`) have the
+identical pattern (`gate_base + e*expert_bytes` for `e` = global id from
+`moe_lists`), so they were never a coincidence-driven "different bug" --
+same defect, reached from the batched dispatch instead.
+
+Fix: added a `paged_local_index` field to `ds4_metal_args_qwen4_moe` /
+`qwen4_moe_args` (both the Metal and C struct); when set, `ebase` uses the
+local `slot` directly instead of the global id from `selected[]`. Set to 1
+only from the two `_with_bufs` C wrappers, 0 (unchanged behavior) from the
+resident wrappers. This alone does not fix the batched "mm" paged path (see
+below), so `qwen4_graph_moe` was also restructured: whenever `g->pager` is
+set, it no longer takes the "mm" branch at all. Each token in the batch is
+staged and consumed (mid -> down, via per-token `ds4_gpu_tensor_view`
+slices into `g->mixed`/`g->selected`/`g->mid`/`g->part`) one at a time,
+with a full `ds4_gpu_end_commands()`/`ds4_gpu_begin_commands()` sync
+bracket around each token's stage-then-compute step, before the next
+token's `ensure()` is allowed to overwrite the shared staging buffer. This
+gives up the resident path's cross-token weight-reuse batching for the
+paged path -- Phase 2 kernel work would need a properly batching-aware
+buffer scheme (or global<->local id remap) to get that back; this fix only
+restores correctness at whatever speed that costs.
+
+Verified after this fix: ctx=1 went from 0/248320 finite (all NaN) to
+248320/248320 finite, but max diff is now 14.8 -- **still not
+bit-identical**, and finite-but-wrong rather than NaN. So Bug 2's fix is
+real and necessary, but not sufficient on its own either.
+
+## Bug 3 (found, NOT fixed): a smaller discrepancy present from layer 0
+
+A per-layer trace (dumping `g->R` after each of the 48 trunk layers, once
+in resident mode and once in paged mode, both at ctx=1) shows the diff is
+already present at **layer 0** (max diff 0.20) and grows through the stack
+to ~8 by layer 44-47 -- consistent with per-layer error compounding through
+the residual/hyper-connection path, not a single late failure.
+
+This is surprising given Bug 1 and Bug 2 are both squarely inside the
+expert-weight consumption path. It means there is a third, distinct source
+of divergence between resident and SSD-streaming mode active from the very
+first layer -- not yet isolated to a specific mechanism. Candidates not yet
+checked: the "mixed-precision... off the slab size class" bypass layer
+(reads directly via mapped model views even when paging is on -- is that
+mapping itself set up identically to resident's?); any other shared/
+non-routed weight access that behaves differently under
+`--ssd-streaming` (different model-map construction, e.g. "SSD streaming
+initial metal model map (1 spans, 41.72 GiB tensor span)" vs resident's
+"Metal model views created... mapped 42720.44 MiB from offset 10.51 MiB" --
+these are two different code paths mapping the same bytes, and nothing yet
+confirms they resolve to bit-identical spans).
+
+## Current status
+- Bug 1 (bundle extraction, wrong Q2_K byte size): **fixed and verified**
+  (byte-identical re-extraction confirmed against the GGUF).
+- Bug 2 (kernel global-vs-local expert indexing): **fixed and verified**
+  (NaN eliminated at ctx=1 and ctx=512).
+- Bug 3 (layer-0-onward discrepancy, cause unknown): **not fixed**. Gate
+  #5 still FAILS: ctx=512 max diff 4.53 (248320/248320 values differ);
+  ctx=1 max diff 14.8 (moves around run to run/ctx as expected for a real
+  bug, not noise).
+- New regression observed alongside Bug 2's fix: the per-token serialization
+  (needed for correctness) grew swap at ctx=512 by +6.55 GiB during this
+  gate run (`peak footprint 17.53 GiB, swap 9.12 GiB (start 2.57 GiB)`) --
+  worth watching against the Definition of Done's "zero OS swap" bar once
+  Bug 3 is fixed and real benches resume.
+
 ## Per ground rule 5
-"Gate bit-identical ... TRUOC khi bench; fail = revert + bao." Stopping here
-to report rather than deciding a revert target unilaterally (ground rule 8):
-I cannot yet point to the single commit that introduced this without a
-bisection, and reverting a broad range of Phase 1 SSD-streaming commits is a
-bigger call than this item's scope.
+"Gate bit-identical ... TRUOC khi bench; fail = revert + bao." Two of three
+found bugs are fixed with verified evidence; the gate still fails on the
+third. Not deciding how to proceed alone (bisect/isolate Bug 3 further vs.
+pause here) -- ground rule 8 reserves that, and this investigation has
+already grown well past its original scope (a receipt check) into
+substantial kernel-level debugging across three independent defects.
