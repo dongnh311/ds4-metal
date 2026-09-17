@@ -38,3 +38,9 @@ __pycache__/
 # Large data artifacts — stored on HuggingFace, not in git
 *.bin
 *.index.json
+
+# Phase 1 stageB run receipts: keep the CSV + findings + diskwrites proofs in git,
+# but not the large per-run stderr logs / decoded-text dumps or corrupt backups.
+*.corrupt-backup
+/speed-bench/stageb-runs/*.stderr
+/speed-bench/stageb-runs/*.decoded.txt
