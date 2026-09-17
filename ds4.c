@@ -68140,6 +68140,28 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e, int ctx_siz
         return false;
     }
 
+    /* What the model actually keeps resident on the Metal streaming path is
+     * its decode-static tensor span, not the weight payload of the non-routed
+     * tensors. The two differ by a factor of six for Qwen4 (6.32 vs 41.72
+     * GiB) because the span also covers the n-gram and embedding tables the
+     * backend maps rather than streams. Charging only the payload is what
+     * planned a 32.68 GiB expert cache beside a 41.72 GiB resident model on a
+     * 64 GiB machine -- 77.63 GiB of intent, and the swap this budget exists
+     * to prevent. The span is computable here, before the map is created. */
+    uint64_t resident_model_bytes = non_routed_bytes;
+    if (e->backend == DS4_BACKEND_METAL && e->ssd_streaming &&
+        e->distributed.role == DS4_DISTRIBUTED_NONE) {
+        ds4_model_map_span_vec spans;
+        if (weights_model_map_decode_static_full_spans(&e->weights, true, true, &spans)) {
+            uint64_t span_bytes = 0;
+            for (uint32_t i = 0; i < spans.len; i++) {
+                span_bytes += spans.v[i].end - spans.v[i].off;
+            }
+            free(spans.v);
+            if (span_bytes > resident_model_bytes) resident_model_bytes = span_bytes;
+        }
+    }
+
     uint64_t per_expert_bytes = 0;
     if (!ds4_streaming_routed_expert_bytes(&e->weights, &per_expert_bytes)) {
         /* A valid distributed GLM slice can contain only the leading dense
@@ -68184,7 +68206,7 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e, int ctx_siz
     if (!ds4_ssd_auto_cache_plan(recommended,
                                  cache_percent,
                                  model_limit,
-                                 non_routed_bytes,
+                                 resident_model_bytes,
                                  per_expert_bytes,
                                  max_model_experts,
                                  &plan)) {
@@ -68296,8 +68318,9 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e, int ctx_siz
                 0.0,
             (double)plan.model_target_bytes / 1073741824.0);
     fprintf(stderr,
-            "ds4:   non-routed weights: %.2f GiB\n",
-            (double)non_routed_bytes / 1073741824.0);
+            "ds4:   non-routed weights: %.2f GiB (resident model span charged: %.2f GiB)\n",
+            (double)non_routed_bytes / 1073741824.0,
+            (double)resident_model_bytes / 1073741824.0);
     fprintf(stderr,
             "ds4:   routed expert size: %.2f MiB\n",
             (double)per_expert_bytes / 1048576.0);
