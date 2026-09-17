@@ -1,0 +1,4 @@
+label,git_commit,model_sha256,ctx_tokens,prefill_tps,decode_tps,ttft_ms,kv_cache_bytes_GiB,hit_pct,miss_per_tok,read_GB,read_budget_GB_gr4,read_over_budget_x,stall_ms_per_tok,rss_peak_GiB,swap_peak_GiB,swap_growth_GiB,diskwrites_delta,output_checksum
+evict_lru_32768,04abb4d,ed238d8d50c6fb4b...,32768,35.01,4.62,1327.8,3.363,99.43,8.18,133.2,0.215,619,1.722,9.49,3.42,0.00,0,b3fb11ca51554f39
+evict_scored_32768,04abb4d,ed238d8d50c6fb4b...,32768,34.88,4.52,989.6,3.363,99.43,8.18,133.2,0.215,619,1.719,9.49,3.71,0.00,0,b3fb11ca51554f39
+stageB_32k_mtpoff,04abb4d,ed238d8d50c6fb4b...,32768,34.58,4.52,1046.9,3.373,99.29,10.16,165.9,0.268,619,2.092,9.50,3.00,0.00,0,
