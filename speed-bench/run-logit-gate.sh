@@ -54,13 +54,27 @@ fi
 
 set +e
 python3 - "$RES_FILE" "$PAGED_FILE" "$CTX" << 'PYEOF'
-import json, sys, hashlib
+import json, sys, hashlib, re
 
 res_path, paged_path, ctx = sys.argv[1], sys.argv[2], sys.argv[3]
-with open(res_path) as f:
-    res = json.load(f)
-with open(paged_path) as f:
-    paged = json.load(f)
+
+def load_relaxed(path):
+    # The C side writes non-finite floats as bare `nan`/`inf` tokens (via
+    # %.9g), which json.load rejects outright. A dump that is not valid
+    # JSON is itself gate evidence -- a fully-NaN frontier -- not a script
+    # bug, so patch those tokens to null rather than crashing before we
+    # can even report it.
+    with open(path) as f:
+        raw = f.read()
+    patched = re.sub(r'(?<=[:,\[])\s*-?(?:nan|inf)\b', ' null', raw)
+    return json.loads(patched)
+
+res = load_relaxed(res_path)
+paged = load_relaxed(paged_path)
+
+for label, doc in (("resident", res), ("paged", paged)):
+    if doc.get("argmax_logit") is None or not isinstance(doc.get("argmax_logit"), (int, float)):
+        print(f"WARNING: {label} argmax_logit is non-finite (dumped as nan/null)")
 
 rl = res["logits"]
 pl = paged["logits"]
