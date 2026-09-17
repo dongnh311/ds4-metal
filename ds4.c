@@ -138,6 +138,7 @@ static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
 #include "ds4_expert_pager.h"
+#include "ds4_kv_cache.h"
 #endif
 
 /* Non-CUDA builds (Mac/Metal, CPU-only) never link ds4_cuda.cu. Provide
@@ -14279,7 +14280,7 @@ typedef struct {
 typedef struct {
     ds4_layer_cache layer[DS4_MAX_LAYER];
     uint32_t head_dim;
-} ds4_kv_cache;
+} ds4_cpu_kv_cache;  /* CPU-side KV cache for non-Metal paths */
 
 static uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
     uint32_t raw_cap = DS4_N_SWA;
@@ -14463,7 +14464,7 @@ static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
 
 /* Allocate per-layer KV state: a raw sliding window for all layers, plus
  * compressed attention/indexer caches for layers whose ratio is nonzero. */
-static void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_cap) {
+static void kv_cache_init(ds4_cpu_kv_cache *cache, uint32_t ctx_size, uint32_t raw_cap) {
     memset(cache, 0, sizeof(*cache));
     if (raw_cap == 0) raw_cap = ds4_default_raw_cap(ctx_size);
     if (raw_cap > ctx_size) raw_cap = ctx_size;
@@ -14505,7 +14506,7 @@ static void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_c
     }
 }
 
-static void kv_cache_free(ds4_kv_cache *cache) {
+static void kv_cache_free(ds4_cpu_kv_cache *cache) {
     if (!cache) return;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         free(cache->layer[il].raw_kv);
@@ -14566,7 +14567,7 @@ static void compressor_finish_prefill_state_cpu(
     }
 }
 
-static void kv_cache_finish_prefill_states(ds4_kv_cache *cache, uint32_t n_tokens) {
+static void kv_cache_finish_prefill_states(ds4_cpu_kv_cache *cache, uint32_t n_tokens) {
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_layer_cache *layer = &cache->layer[il];
         const uint32_t ratio = layer->compress_ratio;
@@ -15838,7 +15839,7 @@ static void forward_token_raw_swa_cpu_decode_scratch(
         float             * logits,
         const ds4_model   * model,
         const ds4_weights * weights,
-        ds4_kv_cache      * cache,
+        ds4_cpu_kv_cache      * cache,
         int                 token,
         uint32_t            pos,
         const float       * steering_dirs,
@@ -15873,7 +15874,7 @@ static void forward_token_raw_swa_cpu(
         float             * logits,
         const ds4_model   * model,
         const ds4_weights * weights,
-        ds4_kv_cache      * cache,
+        ds4_cpu_kv_cache      * cache,
         int                 token,
         uint32_t            pos) {
     ds4_cpu_decode_scratch scratch;
@@ -15898,7 +15899,7 @@ static void prefill_layer_major_cpu(
         float             * logits,
         const ds4_model   * model,
         const ds4_weights * weights,
-        ds4_kv_cache      * cache,
+        ds4_cpu_kv_cache      * cache,
         const token_vec   * prompt,
         const float       * steering_dirs,
         float               steering_attn_scale,
@@ -39788,7 +39789,7 @@ static int metal_graph_prompt_logits_test(
     const bool memory_report = getenv("DS4_METAL_MEMORY_REPORT") != NULL;
     if (memory_report) ds4_gpu_print_memory_report("after graph alloc");
 
-    ds4_kv_cache cpu_cache;
+    ds4_cpu_kv_cache cpu_cache;
     kv_cache_init(&cpu_cache, (uint32_t)ctx_size, raw_cap);
     float *cpu_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     float *gpu_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
@@ -44761,7 +44762,7 @@ static int generate_raw_swa_cpu(
     (void)progress_ud;
     fprintf(stderr, "ds4: using CPU generation with layer-major prefill\n");
 
-    ds4_kv_cache cache;
+    ds4_cpu_kv_cache cache;
     kv_cache_init(&cache, (uint32_t)ctx_size, 0);
     ds4_cpu_decode_scratch decode_scratch;
     cpu_decode_scratch_init(&decode_scratch, (uint32_t)ctx_size);
@@ -57570,6 +57571,9 @@ typedef struct {
     /* Pager state: opened when --ssd-streaming is set and bundle files exist.
      * NULL means pager not available (resident path). */
     ds4_expert_pager *pager;
+    /* Paged KV cache for memory-efficient context expansion (Task 1 Plan 4)
+     * Enabled via DS4_QWEN4_KV_PAGED=1 env var */
+    ds4_kv_cache paged_kv_cache;
     /* For paged MOE: cached selected expert IDs per layer (read from GPU each time) */
     uint32_t qwen4_paged_selected[DS4_MAX_EXPERT_USED];
 } ds4_qwen4_gpu_graph;
@@ -60070,7 +60074,7 @@ struct ds4_session {
     float *glm_mtp_logits0;
     ds4_spec_frontier greedy_splitkv_anchor;
 #endif
-    ds4_kv_cache cpu_cache;
+    ds4_cpu_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
     token_vec checkpoint;
     ds4_vision_identity *checkpoint_images;
@@ -72657,6 +72661,28 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             return 1;
         }
         qwen4_graph_reset(&s->qwen4_graph);
+
+        /* Task 1 Step 2: Initialize paged KV cache if enabled via env var */
+        if (getenv("DS4_QWEN4_KV_PAGED") != NULL) {
+            const char *page_env = getenv("DS4_QWEN4_KV_PAGE_TOKENS");
+            uint32_t page_size = page_env ? atoi(page_env) : DS4_KV_CACHE_DEFAULT_PAGE_TOKENS;
+            if (page_size != 256 && page_size != 512 && page_size != 1024) {
+                page_size = DS4_KV_CACHE_DEFAULT_PAGE_TOKENS;
+            }
+            fprintf(stderr, "ds4: Initializing paged KV cache (%u tokens/page)\n", page_size);
+            if (!ds4_kv_cache_init(&s->qwen4_graph.paged_kv_cache,
+                                   (uint32_t)ctx_size,
+                                   DS4_N_LAYER,
+                                   DS4_N_HEAD_KV,
+                                   DS4_N_HEAD_DIM,
+                                   page_size)) {
+                fprintf(stderr, "ds4: Warning: failed to init paged KV cache, using resident mode\n");
+            } else {
+                fprintf(stderr, "ds4: Paged KV cache initialized for %u layers, %u heads, %u dim\n",
+                        DS4_N_LAYER, DS4_N_HEAD_KV, DS4_N_HEAD_DIM);
+            }
+        }
+
         if (!qwen4_graph_load_steering(&s->qwen4_graph,
                                        e->directional_steering_file,
                                        e->directional_steering_attn_scale,
