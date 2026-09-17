@@ -58358,8 +58358,10 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                      g->qwen4_paged_selected,
                                                      DS4_N_EXPERT_USED, tid, ptrs);
                 if (misses > 0) {
-                    fprintf(stderr, "ds4: Expert pager miss=%d tid=%u layer=%u token=%u\n",
+                    fprintf(stderr, "ds4: Expert pager miss=%d tid=%u layer=%u token=%u (FATAL)\n",
                             misses, tid, layer_idx, t);
+                    ok = false;
+                    break;
                 }
                 const uint64_t bsize = ds4_expert_pager_bundle_size(g->pager, tid);
                 for (uint32_t e = 0; e < DS4_N_EXPERT_USED; e++) {
@@ -58382,8 +58384,10 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                           DS4_N_EXPERT, g->cap_tokens) &&
                      qwen4_moe_profile_boundary(profile, &last, &elapsed[1]) &&
                      ds4_gpu_qwen4_moe_mm_mid_tensor_with_bufs(g->mid, g->mixed, g->moe_lists, g->moe_counts,
-                                                               (void**)g->expert_gate_buf[layer_idx], NULL,
-                                                               (void**)g->expert_up_buf[layer_idx], NULL,
+                                                               (void**)g->expert_gate_buf[layer_idx],
+                                                               (uint64_t[1]){0},
+                                                               (void**)g->expert_up_buf[layer_idx],
+                                                               (uint64_t[1]){0},
                                                                l->ffn_gate_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED,
                                                                DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP, g->cap_tokens) &&
                      qwen4_moe_profile_boundary(profile, &last, &elapsed[2]) &&
@@ -58409,7 +58413,8 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
         if (ok) {
             if (g->pager) {
                 ok = ds4_gpu_qwen4_moe_mm_down_tensor_with_bufs(g->part, g->mid, g->moe_lists, g->moe_counts,
-                                                                (void**)g->expert_down_buf[layer_idx], NULL,
+                                                                (void**)g->expert_down_buf[layer_idx],
+                                                                (uint64_t[1]){0},
                                                                 l->ffn_down_exps->type, DS4_N_EXPERT, T,
                                                                 DS4_N_EXPERT_USED, DS4_N_EXPERT_USED, DS4_N_FF_EXP,
                                                                 DS4_N_EMBD, g->cap_tokens) &&
@@ -58442,8 +58447,10 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     if (ok) {
         if (g->pager) {
             ok = ds4_gpu_qwen4_moe_mid_tensor_with_bufs(g->mid, g->mixed, g->selected,
-                                                        (void**)g->expert_gate_buf[layer_idx], NULL,
-                                                        (void**)g->expert_up_buf[layer_idx], NULL,
+                                                        (void**)g->expert_gate_buf[layer_idx],
+                                                        (uint64_t[1]){0},
+                                                        (void**)g->expert_up_buf[layer_idx],
+                                                        (uint64_t[1]){0},
                                                         m->map, m->size,
                                                         l->ffn_gate_exps->type, DS4_N_EXPERT, T,
                                                         DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
@@ -58460,7 +58467,8 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     if (ok) {
         if (g->pager) {
             ok = ds4_gpu_qwen4_moe_down_tensor_with_bufs(g->part, g->mid, g->selected,
-                                                         (void**)g->expert_down_buf[layer_idx], NULL,
+                                                         (void**)g->expert_down_buf[layer_idx],
+                                                         (uint64_t[1]){0},
                                                          m->map, m->size,
                                                          l->ffn_down_exps->type, DS4_N_EXPERT, T,
                                                          DS4_N_EXPERT_USED, DS4_N_FF_EXP,

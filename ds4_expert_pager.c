@@ -216,7 +216,7 @@ static bool ds4_expert_pager_load_bundles(ds4_expert_pager *pager,
 
             const char *tensor_str = strstr(p, "\"tensor\": \"");
             if (tensor_str) {
-                tensor_str += 10;
+                tensor_str += 11; /* skip "tensor": " (11 chars) to point past opening quote */
                 if (strncmp(tensor_str, "gate", 4) == 0) bundle->tensor_idx = 0;
                 else if (strncmp(tensor_str, "up", 2) == 0) bundle->tensor_idx = 1;
                 else if (strncmp(tensor_str, "down", 4) == 0) bundle->tensor_idx = 2;
@@ -432,6 +432,11 @@ static void *ds4_pager_async_worker_main(void *arg) {
     for (;;) {
         pthread_mutex_lock(&g_pager_async_mutex);
         while (!g_pager_async_has_job) {
+            /* Exit if shutdown requested */
+            if (!g_pager_async_started) {
+                pthread_mutex_unlock(&g_pager_async_mutex);
+                return NULL;
+            }
             pthread_cond_wait(&g_pager_async_cond, &g_pager_async_mutex);
         }
 
