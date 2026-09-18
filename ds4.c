@@ -58536,6 +58536,8 @@ static void qwen4_kvr_report(void) {
  * (staging is still BF16) -- it is a QUALITY probe only, and it is LOSSY, so it
  * is gated behind its own env and is OFF by default (ground rule 6: FP8 uses the
  * quality matrix, not the bit-identical gate). */
+static bool qwen4_mtp_stats_enabled(void); /* Item P2 MTP diagnostic (defined near qwen4_spec_depth) */
+
 static int qwen4_fp8sim_enabled(void) {
     static int v = -1;
     if (v < 0) v = getenv("DS4_QWEN4_KV_FP8SIM") != NULL ? 1 : 0;
@@ -58872,7 +58874,16 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                DS4_N_EMBD, g->sh_gate_logit, T, DS4_N_EXPERT, DS4_N_EXPERT_USED) &&
               qwen4_moe_profile_boundary(profile, &last, &elapsed[0]);
 
-    if (ok && g->pager) {
+    if (ok && g->pager && !ds4_qwen4_layer_is_nextn(layer_idx)) {
+        /* Item P2 MTP fix: the nextn (MTP) layer's experts are RESIDENT-only —
+         * the SSD bundle covers only the 48 trunk MoE layers (index.json
+         * layer_count=48), so paging layer 48 read trunk-layer-0's experts
+         * (the call passed layer_idx=0u) and ran them against the nextn layer's
+         * routing -> garbage drafts -> 0% MTP acceptance on the paged build
+         * (resident was 51%). Excluding is_nextn here forces the nextn MoE down
+         * the resident l->ffn_*_exps path, matching resident-mode MTP exactly.
+         * Trunk layers (is_nextn=false) still page; the logit gate is prefill-
+         * only (gen 0), so it never exercised this and stays bit-identical. */
         /* Item P2 (paged-mm): prefill-sized batches (T>8) route the used-expert
          * union through the SAME tiled GEMM the resident prefill uses, staging
          * each used expert once per layer -- bit-identical to resident, and far
@@ -59481,7 +59492,7 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
     if (ok) ok = qwen4_graph_attention(g, m, l, il, idx, T);
     if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, E, hc) != 0;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
-    if (ok) ok = qwen4_graph_moe(g, m, l, T, 0u);
+    if (ok) ok = qwen4_graph_moe(g, m, l, T, DS4_N_LAYER - 1u); /* nextn layer: resident experts (see guard in qwen4_graph_moe) */
     ds4_gpu_tensor *last = NULL;
     const char *argmax_env = getenv("DS4_QWEN4_MTP_GPU_ARGMAX");
     const bool gpu_argmax = want_logits && draft_out && !logits_out &&
@@ -59571,7 +59582,7 @@ static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *
     if (ok) ok = qwen4_graph_attention(g, m, l, il, idx, 1);
     if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, 1, E, hc) != 0;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, 1);
-    if (ok) ok = qwen4_graph_moe(g, m, l, 1, 0u);
+    if (ok) ok = qwen4_graph_moe(g, m, l, 1, DS4_N_LAYER - 1u); /* nextn chain-step: resident experts (see guard in qwen4_graph_moe) */
     /* the chained draft only needs its argmax; DS4_QWEN4_MTP_DRAFT_ROWS can
      * score the frequent-token prefix exactly like the first draft's head */
     const uint32_t chain_head_rows = qwen4_mtp_draft_rows();
@@ -60622,6 +60633,17 @@ struct ds4_session {
     float *qwen4_verify_logits;
     uint64_t qwen4_spec_cycles;
     uint64_t qwen4_spec_accepted;
+    /* Item P2 MTP (DS4_QWEN4_MTP_STATS=1, runtime): root-cause the draft
+     * acceptance rate. Per verify cycle we rank the first draft token d within
+     * the trunk's row-0 distribution (number of vocab logits strictly greater
+     * than rows[d]); rank 1 == the draft is the trunk argmax == accepted. The
+     * histogram turns a bare "0% accepted" into a diagnosis: rank 1 misses mean
+     * a verify/accept bug; a tight rank 2-5 mass means near-miss (margin/quant)
+     * while a rank 501+ mass means the nextn head output is garbage. */
+    uint64_t qwen4_mtp_rank_hist[5]; /* [rank1, 2-5, 6-50, 51-500, 501+] */
+    uint64_t qwen4_mtp_rank_better_sum; /* sum of (#logits > rows[d]) for the mean */
+    uint64_t qwen4_mtp_rank_n;       /* verify cycles measured */
+    uint64_t qwen4_mtp_draft_eq_input; /* draft == first_token (degenerate echo) */
 #endif
     uint32_t glm_dense_cache_len;
     /* GLM MTP speculative state.  parent is the token that conditioned the
@@ -73929,13 +73951,21 @@ void ds4_session_free(ds4_session *s) {
                         s->qwen4_spec_cycles, s->qwen4_spec_accepted,
                         100.0 * (double)s->qwen4_spec_accepted / (double)s->qwen4_spec_cycles);
             }
-#ifdef DS4_QWEN4_MTP_STATS
-            if (s->qwen4_spec_cycles > 0) {
-                fprintf(stderr, "ds4: Qwen3.8 MTP stats (DS4_QWEN4_MTP_STATS=1): cycles=%" PRIu64 " accepted=%" PRIu64 " rate=%.1f%%\n",
-                        s->qwen4_spec_cycles, s->qwen4_spec_accepted,
-                        100.0 * (double)s->qwen4_spec_accepted / (double)s->qwen4_spec_cycles);
+            if (qwen4_mtp_stats_enabled() && s->qwen4_mtp_rank_n > 0) {
+                const uint64_t n = s->qwen4_mtp_rank_n;
+                const double mean_better = (double)s->qwen4_mtp_rank_better_sum / (double)n;
+                fprintf(stderr,
+                    "ds4: Qwen3.8 MTP stats (DS4_QWEN4_MTP_STATS): verify_cycles=%" PRIu64
+                    " accepted=%" PRIu64 " (%.1f%%) | draft-rank in trunk row: "
+                    "rank1=%" PRIu64 " (%.1f%%) 2-5=%" PRIu64 " 6-50=%" PRIu64
+                    " 51-500=%" PRIu64 " 501+=%" PRIu64 " | mean#better=%.1f draft==input=%" PRIu64 "\n",
+                    s->qwen4_spec_cycles, s->qwen4_spec_accepted,
+                    100.0 * (double)s->qwen4_spec_accepted / (double)s->qwen4_spec_cycles,
+                    s->qwen4_mtp_rank_hist[0], 100.0 * (double)s->qwen4_mtp_rank_hist[0] / (double)n,
+                    s->qwen4_mtp_rank_hist[1], s->qwen4_mtp_rank_hist[2],
+                    s->qwen4_mtp_rank_hist[3], s->qwen4_mtp_rank_hist[4],
+                    mean_better, s->qwen4_mtp_draft_eq_input);
             }
-#endif
             free(s->qwen4_verify_logits);
             if (s->qwen4_graph.pager) {
                 ds4_expert_pager_close(s->qwen4_graph.pager);
@@ -74699,6 +74729,34 @@ static int qwen4_spec_depth(ds4_session *s) {
     return s->qwen4_depth3_engaged ? 3 : 2;
 }
 
+/* Item P2 MTP: runtime toggle for the draft-rank diagnostic (allowed env
+ * DS4_QWEN4_MTP_STATS per ground rule 7). Cached; default path unaffected. */
+static bool qwen4_mtp_stats_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_QWEN4_MTP_STATS");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+/* Rank of draft token d within the trunk row-0 distribution row[0..V): the
+ * number of vocab logits strictly greater than row[d] (0 == d is the argmax ==
+ * would be accepted). O(V), only called when the diagnostic is enabled. */
+static void qwen4_mtp_stats_record(ds4_session *s, const float *row, uint32_t V,
+                                   int d, int first_token) {
+    if (d < 0 || (uint32_t)d >= V) return;
+    const float dv = row[d];
+    uint64_t better = 0;
+    for (uint32_t i = 0; i < V; i++) better += (row[i] > dv) ? 1u : 0u;
+    const uint64_t rank = better + 1u; /* 1-based */
+    uint32_t b = rank == 1u ? 0u : rank <= 5u ? 1u : rank <= 50u ? 2u : rank <= 500u ? 3u : 4u;
+    s->qwen4_mtp_rank_hist[b]++;
+    s->qwen4_mtp_rank_better_sum += better;
+    s->qwen4_mtp_rank_n++;
+    if (d == first_token) s->qwen4_mtp_draft_eq_input++;
+}
+
 static void qwen4_spec_note_first_draft(ds4_session *s, bool accepted_first) {
     s->qwen4_depth_window = (s->qwen4_depth_window << 1u) | (accepted_first ? 1u : 0u);
     s->qwen4_depth_cycles++;
@@ -74803,6 +74861,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
     bool accept = sample_argmax(rows, V) == d || qwen4_spec_force_accept();
+    if (qwen4_mtp_stats_enabled()) qwen4_mtp_stats_record(s, rows, V, d, first_token);
     bool accept2 = false;
     if (deep) {
         accept2 = accept && (sample_argmax(rows + V, V) == d2 || qwen4_spec_force_accept());
