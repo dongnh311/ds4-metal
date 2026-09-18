@@ -24,7 +24,16 @@ echo "== resident (KV_PAGED unset), ctx=$CTX ==" >&2
 
 echo "== paged (DS4_QWEN4_KV_PAGED=1), ctx=$CTX ==" >&2
 DS4_QWEN4_KV_PAGED=1 ./ds4-bench -m "$MODEL" --prompt-file "$PROMPT" --ctx-start "$CTX" --ctx-max "$CTX" \
-    --gen-tokens 0 $([ "$CHUNK" -gt 0 ] && echo "--prefill-chunk $CHUNK") --dump-frontier-logits-dir "$PAGED_DIR" --csv "$OUTDIR/paged.csv" >&2
+    --gen-tokens 0 $([ "$CHUNK" -gt 0 ] && echo "--prefill-chunk $CHUNK") --dump-frontier-logits-dir "$PAGED_DIR" --csv "$OUTDIR/paged.csv" 2> "$OUTDIR/paged.stderr"
+cat "$OUTDIR/paged.stderr" >&2
+# HARD ASSERT: the paged path must actually execute, else the "bit-identical"
+# result is a false positive (resident vs resident). Requires the one-time
+# "paged KV path ACTIVE" log emitted by qwen4_paged_kv_roundtrip.
+if ! grep -q "paged KV path ACTIVE" "$OUTDIR/paged.stderr"; then
+    echo "GATE FAIL: paged KV path did NOT activate (qwen4_paged_kv_active()==false) -- inert path, result meaningless" >&2
+    exit 3
+fi
+echo "paged path CONFIRMED ACTIVE (page log present)" >&2
 
 RES_FILE=$(ls "$RESIDENT_DIR"/frontier_*.logits.json | head -1)
 PAGED_FILE=$(ls "$PAGED_DIR"/frontier_*.logits.json | head -1)

@@ -71,9 +71,27 @@ bool ds4_kv_cache_init(ds4_kv_cache *cache,
     cache->n_heads = n_heads;
     cache->head_dim = head_dim;
 
-    /* Allocate page table with enough entries for all (layer, head) pairs. */
+    /* Allocate page table with enough entries for all (layer, head) pairs.
+     * pages_per_ring MUST cover the full context: get_page() indexes the ring
+     * with (token_pos/page_size) % pages_per_ring, so a ring shorter than
+     * ceil(max_tokens/page_size) WRAPS and aliases earlier tokens, silently
+     * corrupting long contexts. The prior hard-coded "*4" capped every ring at
+     * 4*page_size (=2048 tokens @512) -- fine only for tiny gate runs. */
     uint32_t total_pairs = n_layers * n_heads;
-    uint32_t initial_pages = total_pairs * 4; /* 4 pages per ring initially */
+    uint32_t ring_pages = 4u;
+    if (max_tokens > 0) {
+        ring_pages = (max_tokens + page_size_tokens - 1u) / page_size_tokens + 1u;
+        if (ring_pages < 4u) ring_pages = 4u;
+    }
+    if ((uint64_t)total_pairs * ring_pages > DS4_KV_CACHE_MAX_PAGES) {
+        uint32_t capped = DS4_KV_CACHE_MAX_PAGES / total_pairs;
+        if (capped < 4u) capped = 4u;
+        fprintf(stderr, "ds4_kv_cache: WARNING max_tokens=%u wants %u pages/ring but total cap is %u; "
+                "clamping to %u pages/ring (~%u tokens/head max)\n",
+                max_tokens, ring_pages, DS4_KV_CACHE_MAX_PAGES, capped, capped * page_size_tokens);
+        ring_pages = capped;
+    }
+    uint32_t initial_pages = total_pairs * ring_pages;
     cache->page_table = calloc(initial_pages, sizeof(ds4_kv_page_entry));
     if (!cache->page_table) {
         fprintf(stderr, "ds4_kv_cache: failed to alloc page table (%u pages)\n", initial_pages);
@@ -102,13 +120,15 @@ bool ds4_kv_cache_init(ds4_kv_cache *cache,
         return false;
     }
 
-    /* Pre-allocate first batch of pages (one per ring to start). */
+    /* Pre-allocate the first page of each ring (ring start = p*pages_per_ring). */
     uint32_t bytes_per_page = kv_cache_page_bytes(cache);
     uint32_t pages_per_ring = kv_cache_pages_per_ring(cache);
-    for (uint32_t i = 0; i < total_pairs && i < initial_pages; i++) {
+    for (uint32_t p = 0; p < total_pairs; p++) {
+        uint32_t slot = p * pages_per_ring;
+        if (slot >= initial_pages) break;
         void *buf = malloc(bytes_per_page);
         if (buf) {
-            cache->page_buffers[i] = buf;
+            cache->page_buffers[slot] = buf;
             cache->n_pages++;
             cache->page_allocs++;
             cache->total_bytes += bytes_per_page;
@@ -116,9 +136,9 @@ bool ds4_kv_cache_init(ds4_kv_cache *cache,
     }
 
     fprintf(stderr, "ds4_kv_cache: initialized %u layers × %u heads × %u dim, "
-            "page=%u tokens/ring, pre-alloc %u/%u pages\n",
-            n_layers, n_heads, head_dim, page_size_tokens,
-            cache->n_pages, initial_pages);
+            "page=%u tokens, %u pages/ring (covers ~%u tokens/head), pre-alloc %u/%u pages\n",
+            n_layers, n_heads, head_dim, page_size_tokens, ring_pages,
+            ring_pages * page_size_tokens, cache->n_pages, initial_pages);
 
     return true;
 }

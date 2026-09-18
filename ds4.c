@@ -57868,8 +57868,14 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
      * opened and reported, then never read, and every "paged expert" number
      * was really a resident-model number. */
     ds4_expert_pager *pager = g->pager;
+    /* paged_kv_cache is initialized by the caller BEFORE this call (session
+     * create) so the staging buffers below can be allocated; it must survive the
+     * reset like the pager does. Other callers pass a fresh xcalloc'd graph, so
+     * this preserves an all-zero cache (a no-op) for them. */
+    ds4_kv_cache saved_paged_kv = g->paged_kv_cache;
     memset(g, 0, sizeof(*g));
     g->pager = pager;
+    g->paged_kv_cache = saved_paged_kv;
     if (!qwen4_graph_weights_supported(w)) return false;
     mtp = mtp && DS4_N_NEXTN_PREDICT != 0;
     const uint64_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc, T = cap_tokens;
@@ -58370,7 +58376,17 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
  * (end_commands) before the CPU reads it here -- the same ordering the SSD pager
  * fix required (a plain contents() read does not wait for the GPU). */
 static bool qwen4_paged_kv_active(const ds4_qwen4_gpu_graph *g) {
-    return g->paged_kv_cache.n_layers > 0 && g->paged_k_staging_full[0] != NULL;
+    if (g->paged_kv_cache.n_layers == 0) return false;
+    /* Staging is allocated ONLY for full-attention (non-linear) layers. Layer 0
+     * is linear in Qwen4 ((0+1)%FULL_ATTN_INTERVAL != 0), so paged_k_staging_full[0]
+     * is legitimately NULL -- checking it made the whole paged path inert. Probe
+     * the first layer that actually has a K/V cache instead. */
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        if (g->layer_k_cache[il] != NULL) {
+            return g->paged_k_staging_full[il] != NULL;
+        }
+    }
+    return false;
 }
 static ds4_gpu_tensor *qwen4_kcache(ds4_qwen4_gpu_graph *g, uint32_t il) {
     return qwen4_paged_kv_active(g) ? g->paged_k_staging_full[il] : g->layer_k_cache[il];
@@ -58381,6 +58397,12 @@ static ds4_gpu_tensor *qwen4_vcache(ds4_qwen4_gpu_graph *g, uint32_t il) {
 static bool qwen4_paged_kv_roundtrip(ds4_qwen4_gpu_graph *g, uint32_t il,
                                      uint32_t pos0, uint32_t T) {
     if (!qwen4_paged_kv_active(g)) return true;
+    static int paged_kv_logged = 0;
+    if (!paged_kv_logged) {
+        paged_kv_logged = 1;
+        fprintf(stderr, "ds4: paged KV path ACTIVE (Design A materialize, page=%u tokens)\n",
+                g->paged_kv_cache.page_size_tokens);
+    }
     ds4_kv_cache *c = &g->paged_kv_cache;
     const uint32_t Hkv = DS4_N_HEAD_KV;
     const uint32_t D = DS4_N_HEAD_DIM;
@@ -73115,13 +73137,13 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 }
             }
         }
-        if (!qwen4_graph_alloc(&s->qwen4_graph, &e->weights, (uint32_t)ctx_size, cap_tokens, e->glm_mtp)) {
-            free(s);
-            return 1;
-        }
-        qwen4_graph_reset(&s->qwen4_graph);
-
-        /* Task 1 Step 2: Initialize paged KV cache if enabled via env var */
+        /* Task 1 Step 2 (spec §25 Phase 2.1 FIX): initialize the paged KV cache
+         * BEFORE qwen4_graph_alloc. The graph's paged_*_staging_full buffers are
+         * allocated inside graph_alloc, gated on paged_kv_cache.n_layers>0, and
+         * graph_alloc preserves paged_kv_cache across its memset. Initializing
+         * AFTER graph_alloc (the prior bug) left staging NULL, so
+         * qwen4_paged_kv_active() was always false: the paged path was inert and
+         * the "bit-identical" gate silently compared resident vs resident. */
         if (getenv("DS4_QWEN4_KV_PAGED") != NULL) {
             const char *page_env = getenv("DS4_QWEN4_KV_PAGE_TOKENS");
             uint32_t page_size = page_env ? atoi(page_env) : DS4_KV_CACHE_DEFAULT_PAGE_TOKENS;
@@ -73143,6 +73165,13 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                         DS4_N_LAYER, 2u * DS4_N_HEAD_KV, DS4_N_HEAD_DIM);
             }
         }
+
+        if (!qwen4_graph_alloc(&s->qwen4_graph, &e->weights, (uint32_t)ctx_size, cap_tokens, e->glm_mtp)) {
+            ds4_kv_cache_free(&s->qwen4_graph.paged_kv_cache);
+            free(s);
+            return 1;
+        }
+        qwen4_graph_reset(&s->qwen4_graph);
 
         if (!qwen4_graph_load_steering(&s->qwen4_graph,
                                        e->directional_steering_file,
