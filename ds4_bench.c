@@ -80,6 +80,7 @@ typedef struct {
     bool show_output;
     bool teacher_forced_decode;
     bool dspark;
+    bool glm_mtp;
     bool dspark_confidence_threshold_set;
     float dspark_confidence_threshold;
 } bench_config;
@@ -364,6 +365,8 @@ static bench_config parse_options(int argc, char **argv) {
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp")) {
+            c.glm_mtp = true;
         } else if (!strcmp(arg, "--mtp-model")) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dspark")) {
@@ -760,6 +763,8 @@ int main(int argc, char **argv) {
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .glm_mtp = cfg.glm_mtp,
+        .glm_mtp_timing = cfg.glm_mtp,
         .dspark = cfg.dspark,
         .dspark_confidence_threshold = cfg.dspark_confidence_threshold,
         .dspark_confidence_threshold_set = cfg.dspark_confidence_threshold_set,
@@ -891,7 +896,7 @@ int main(int argc, char **argv) {
     const bool distributed =
         cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR ||
         cfg.tp.role == DS4_TP_LEADER;
-    const bool speculative = cfg.dspark && ds4_engine_mtp_draft_tokens(engine) > 1;
+    const bool speculative = (cfg.dspark || cfg.glm_mtp) && ds4_engine_mtp_draft_tokens(engine) > 1;
     if (cfg.dspark && !speculative) {
         fprintf(stderr, "ds4-bench: DSpark support model did not enable speculative decoding\n");
         if (out != stdout) fclose(out);
@@ -900,9 +905,14 @@ int main(int argc, char **argv) {
         close_engine(engine, tp_leader);
         return 1;
     }
+    if (cfg.glm_mtp && !speculative) {
+        fprintf(stderr,
+                "ds4-bench: --mtp requested but MTP speculative decode not enabled (draft width %d); decoding without MTP\n",
+                ds4_engine_mtp_draft_tokens(engine));
+    }
     if (speculative) {
         fprintf(stderr,
-                "ds4-bench: DSpark enabled with draft width %d; frontier restoration uses session snapshots\n",
+                "ds4-bench: speculative/MTP decode enabled with draft width %d; frontier restoration uses session snapshots\n",
                 ds4_engine_mtp_draft_tokens(engine));
     }
     ds4_session_snapshot snap = {0};

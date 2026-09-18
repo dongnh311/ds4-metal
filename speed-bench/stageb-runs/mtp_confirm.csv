@@ -1,0 +1,2 @@
+ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,snapshot_payload_bytes,kv_cache_bytes,pager_hits,pager_misses,pager_hit_rate,pager_pread_bytes,pager_latency_ms,ssd_read_bytes,ses_read_gb_per_token,rss_peak_bytes,swap_peak_bytes,swap_growth_bytes
+4096,4096,32.66,16,2.43,949.068,15,2.67,0,452759040,5866744,75176,0.9873,37335482880,14903.473,37335482880,0.008456,6117436408,2523594752,0

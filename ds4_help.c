@@ -183,6 +183,9 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
         if (tool == DS4_HELP_EVAL || tool == DS4_HELP_BENCH) {
             opt(fp, c, "--mtp-model FILE", "External MTP or DSpark support GGUF.");
         }
+        if (tool == DS4_HELP_BENCH) {
+            opt(fp, c, "--mtp", "Enable model-embedded MTP speculation (greedy; prints acceptance counters).");
+        }
         if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
             opt(fp, c, "--mtp", "Enable model-embedded MTP speculation.");
             opt(fp, c, "--mtp-model FILE", "External MTP or DSpark support GGUF.");
