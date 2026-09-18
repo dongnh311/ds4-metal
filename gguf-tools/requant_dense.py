@@ -24,9 +24,16 @@ from qwen4_pack import GGMLQuantizer
 Q8_0 = 8
 Q4_K = 12                      # ggml block_q4_K: 144 B / 256 elems
 KEEP_Q8 = {"output.weight"}
-# Special forward paths (validated by qwen4_graph_dense_ok / nextn / ple gates that
-# don't accept Q4_K, and not routed through qwen4_gemv_rows) -> keep Q8_0.
-SKIP_SUBSTR = ("nextn", "output", "ple_", "token_embd", "hc_")
+# Two exclusion classes kept at Q8_0:
+#  (a) special forward paths the Q4_K dense gates reject / that don't route through
+#      qwen4_gemv_rows: nextn, output, ple_, token_embd, hc_.
+#  (b) SELECTIVE-mode quality guard: the full-attention q/k/v/output projections
+#      (dotted patterns so the fused attn_qkv stays Q4_K). These are the most
+#      quality-sensitive dense tensors and a small share of per-token dense bytes,
+#      so keeping them Q8_0 recovers quality (cosine 0.915->0.930) at ~no decode
+#      cost. Drop the four ".attn_*." entries to reproduce the full variant.
+SKIP_SUBSTR = ("nextn", "output", "ple_", "token_embd", "hc_",
+                ".attn_q.", ".attn_k.", ".attn_v.", ".attn_output.")
 LIBRARY = "/Users/dongnh/orca/workspaces/ds4-metal/scallop/gguf-tools/libds4quants.dylib"
 
 def dequant_q8_0(raw, n_elem):

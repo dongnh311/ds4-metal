@@ -1,0 +1,15 @@
+We need to respond to user: "Write a Python function fibonacci(n) with a docstring and iterative body." Need produce final answer likely code only? Need include function with docstring and iterative body. Need maybe concise. Ensure final includes Python code. Could include example. Need satisfy: function fibonacci(n), docstring, iterative body. Maybe handle n negative? Could raise ValueError. Use iterative loop. Return nth Fibonacci? Need define indexing: F(0)=0, F(1)=1. Docstring. Iterative body. Let's craft.
+
+
+```python
+def fibonacci(n):
+    """
+    Return the nth Fibonacci number using an iterative approach.
+
+    The sequence starts with:
+        F(0) = 0
+        F(1) = 1
+
+    Args:
+        n (int): A non-negative integer representing the position in the Fibonacci sequence.
+ds4: prefill: 102.33 t/s, generation: 35.99 t/s

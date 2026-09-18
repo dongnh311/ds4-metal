@@ -1,0 +1,6 @@
+vocab=248320  changed_logits=248320
+logit max_abs_diff=3.83179  rms_diff=0.681093  cosine=0.92960250
+argmax_Q8=16 argmax_SEL=16  top1_match=True
+top5_Q8=[16, 17, 20, 23, 21]
+top5_SEL=[16, 17, 20, 23, 19]
+top5_overlap=4/5
