@@ -1,0 +1,17 @@
+turn 1: ['list_directory'] wall=3.04s ctx=579 cached=0 fixed=False
+turn 2: ['read_file'] wall=1.41s ctx=684 cached=637 fixed=False
+turn 3: ['read_file'] wall=1.97s ctx=908 cached=729 fixed=False
+turn 4: ['read_file'] wall=4.40s ctx=1134 cached=955 fixed=False
+turn 5: ['read_file'] wall=1.50s ctx=1298 cached=1279 fixed=False
+turn 6: ['read_file'] wall=1.21s ctx=1370 cached=1351 fixed=False
+turn 7: ['read_file'] wall=2.97s ctx=1428 cached=1409 fixed=False
+turn 8: ['run_tests'] wall=1.81s ctx=1558 cached=1539 fixed=False
+turn 9: ['read_file'] wall=6.20s ctx=1685 cached=1619 fixed=False
+turn 10: FINAL wall=31.31s tokens=1200 fixed=False
+FINAL MESSAGE: 
+
+=== TRACE SUMMARY ===
+converged=True (fix_applied=False) turns=10 total_wall=55.8s completion=1982
+tok/s(wall): mean=32.1 max=38.3
+final ctx=2087 cached=1908 swap_growth=0.0MiB
+TRACEDONE
