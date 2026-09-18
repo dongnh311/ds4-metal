@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
-"""Re-quantize the per-layer DENSE Q8_0 projections of a qwen4exp GGUF to Q4_0.
+"""Re-quantize the per-layer DENSE Q8_0 projections of a qwen4exp GGUF to Q4_K.
 
-Motivation (measured): decode is DRAM-bandwidth-bound; the per-layer dense Q8_0
-projections are read in full every token and dominate decode GPU time (~53% at
-ctx 32K), while the sparse experts (~10/512 routed) and the KV cache (~4%) do
-not. Q8_0 -> Q4_0 roughly halves those dense reads (8.5 -> 4.5 bit), so this is
-the lever that can raise decode throughput -- at a quality cost (dense is the
-backbone), hence a measured experiment, not a default.
+Motivation (measured): decode is per-token-weight-bandwidth-bound; the per-layer
+dense Q8_0 projections dominate decode GPU time (~53% at ctx 32K). Q8_0->Q4_K
+roughly halves those dense reads (8.5 -> 4.5 bit) AND, unlike Q4_0, DS4 ships a
+decode-grade dense Q4_K GEMV (kernel_mul_mv_q4_K_dense_f32, ~530-650 GB/s) once
+the Qwen dense path is wired to it (ds4.c tensor_type_is_qwen4_dense + qwen4_gemv_
+rows). Q4_K also keeps much better quality than Q4_0 (proper K-quant super-blocks).
 
-The DS4 runtime accepts only {Q8_0, Q4_0, F16, BF16, F32} for dense projections
-(ds4.c:5257); the shipped quantizer can't emit Q4_0, so this packs standard ggml
-block_q4_0 in numpy. Pipeline per target: read Q8_0 -> dequant to f32 -> pack
-Q4_0 -> write kind=2. Every other tensor is byte-copied. output.weight (final
-logits) and any tensor whose row width is not a multiple of 32 stay Q8_0.
-Self-verifies the output.
+Pipeline per target: read Q8_0 -> dequant to f32 -> encode Q4_K via libds4quants ->
+write kind=12. Every other tensor is byte-copied. output.weight (final logits) and
+any tensor whose row width is not a multiple of 256 (Q4_K super-block) stay Q8_0 --
+notably ffn_down_shexp (ne0=640). Self-verifies the output.
 """
 import argparse, hashlib, json, os, shutil, struct, sys
 from pathlib import Path
@@ -21,10 +19,15 @@ import numpy as np
 
 from qwen4_pack_to_qwen4exp import Reader, kv_bytes, w_str
 from qwen4_native_ngrams import size_of, copy_hash
+from qwen4_pack import GGMLQuantizer
 
 Q8_0 = 8
-Q4_0 = 2                       # ggml block_q4_0: fp16 d + 16 bytes qs = 18 B / 32 elems
-KEEP_Q8 = {"output.weight"}    # final logit projection: quality-critical, cheap
+Q4_K = 12                      # ggml block_q4_K: 144 B / 256 elems
+KEEP_Q8 = {"output.weight"}
+# Special forward paths (validated by qwen4_graph_dense_ok / nextn / ple gates that
+# don't accept Q4_K, and not routed through qwen4_gemv_rows) -> keep Q8_0.
+SKIP_SUBSTR = ("nextn", "output", "ple_", "token_embd", "hc_")
+LIBRARY = "/Users/dongnh/orca/workspaces/ds4-metal/scallop/gguf-tools/libds4quants.dylib"
 
 def dequant_q8_0(raw, n_elem):
     nb = n_elem // 32
@@ -33,23 +36,8 @@ def dequant_q8_0(raw, n_elem):
     qs = a[:, 2:].view(np.int8).astype(np.float32)
     return (scales * qs).reshape(-1)[:n_elem]
 
-def q4_0_pack(rows):
-    """rows: (nrows, ncols) f32, ncols % 32 == 0 -> ggml block_q4_0 bytes."""
-    nrows, ncols = rows.shape
-    nb = ncols // 32
-    x = np.ascontiguousarray(rows, dtype=np.float32).reshape(nrows, nb, 32)
-    ax = np.abs(x)
-    idx = np.argmax(ax, axis=2)                                   # index of max-magnitude
-    maxv = np.take_along_axis(x, idx[..., None], axis=2)[..., 0]  # signed value there
-    d = maxv / -8.0
-    inv = np.where(d != 0.0, 1.0 / d, 0.0)[..., None]
-    q = np.clip((x * inv + 8.5).astype(np.int32), 0, 15).astype(np.uint8)   # (nrows,nb,32)
-    qs = (q[:, :, :16] | (q[:, :, 16:] << 4)).astype(np.uint8)              # (nrows,nb,16)
-    dh = d.astype("<f2").view(np.uint8).reshape(nrows, nb, 2)               # fp16 scale
-    return np.concatenate([dh, qs], axis=2).reshape(-1).tobytes()          # (nrows,nb,18)
-
-def q4_0_row_bytes(ncols):
-    return (ncols // 32) * 18
+def q4k_row_bytes(ncols):
+    return (ncols // 256) * 144
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
@@ -58,28 +46,34 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
+    quant = GGMLQuantizer(LIBRARY)
+    quant.lib.ds4q_quantize_init(Q4_K)
     m = Reader(str(args.model))
     if m.kv.get("general.architecture") != "qwen4exp":
         sys.exit("expected qwen4exp GGUF")
 
     targets = [n for n, (k, sh, o) in m.tensors.items()
-               if k == Q8_0 and n not in KEEP_Q8 and sh[0] % 32 == 0]
+               if k == Q8_0 and n not in KEEP_Q8 and sh[0] % 256 == 0
+               and not any(sub in n for sub in SKIP_SUBSTR)]
     nel = lambda sh: int(np.prod(sh))
     old = sum(size_of(Q8_0, m.tensors[n][1]) for n in targets)
-    new = sum(q4_0_row_bytes(m.tensors[n][1][0]) * (nel(m.tensors[n][1]) // m.tensors[n][1][0]) for n in targets)
-    print(f"targets(Q8_0->Q4_0)={len(targets)}  dense {old/(1<<30):.2f} -> {new/(1<<30):.2f} GiB "
-          f"(save {(old-new)/(1<<30):.2f} GiB)", flush=True)
+    new = sum(q4k_row_bytes(m.tensors[n][1][0]) * (nel(m.tensors[n][1]) // m.tensors[n][1][0]) for n in targets)
+    kept8 = [n for n, (k, sh, o) in m.tensors.items() if k == Q8_0 and n not in targets]
+    print(f"targets(Q8_0->Q4_K)={len(targets)}  kept Q8_0={len(kept8)}  "
+          f"dense {old/(1<<30):.2f} -> {new/(1<<30):.2f} GiB (save {(old-new)/(1<<30):.2f} GiB)", flush=True)
     if args.dry_run:
+        for n in kept8[:8]:
+            print(f"  kept Q8_0: {n} ne0={m.tensors[n][1][0]}")
         for n in targets[:3]:
             sh = m.tensors[n][1]; raw = _read(m, m.tensors[n][2], size_of(Q8_0, sh))
-            f = dequant_q8_0(raw, nel(sh)).reshape(-1, sh[0]); b = q4_0_pack(f)
-            print(f"  {n}: shape={sh} q8={len(raw)}B q4_0={len(b)}B ratio={len(raw)/len(b):.2f}x", flush=True)
+            f = dequant_q8_0(raw, nel(sh)).reshape(-1, sh[0]); b = quant.encode(f, "Q4_K")
+            print(f"  {n}: shape={sh} q8={len(raw)}B q4k={len(b)}B ratio={len(raw)/len(b):.2f}x", flush=True)
         m.f.close(); return
 
     pending = Path(str(args.output) + ".incomplete")
     if args.output.exists() or pending.exists(): sys.exit("output exists")
     metadata = {k: (m.kv_types[k], v) for k, v in m.kv.items()}
-    metadata["ds4.dense.requant"] = (8, "Q8_0->Q4_0 per-layer dense (decode-bandwidth experiment)")
+    metadata["ds4.dense.requant"] = (8, "Q8_0->Q4_K per-layer dense (decode-bandwidth experiment)")
     alignment = m.kv.get("general.alignment", 32)
     align = lambda n, a=alignment: (n + a - 1) // a * a
 
@@ -87,12 +81,12 @@ def main():
     for i, n in enumerate(targets):
         sh = m.tensors[n][1]; raw = _read(m, m.tensors[n][2], size_of(Q8_0, sh))
         f = dequant_q8_0(raw, nel(sh)).reshape(-1, sh[0])
-        newpayload[n] = q4_0_pack(f)
+        newpayload[n] = quant.encode(f, "Q4_K")
         if (i + 1) % 50 == 0: print(f"  requantized {i+1}/{len(targets)}", flush=True)
 
     plan, off = [], 0
     for n in m.tensors:
-        kind = Q4_0 if n in newpayload else m.tensors[n][0]
+        kind = Q4_K if n in newpayload else m.tensors[n][0]
         sh = m.tensors[n][1]
         size = len(newpayload[n]) if n in newpayload else size_of(m.tensors[n][0], sh)
         plan.append((n, kind, sh, off, size)); off = align(off + size)
@@ -123,15 +117,15 @@ def main():
         for n, pos, size, dig in records:
             c.seek(pos)
             if copy_hash(c, None, size) != dig: sys.exit("verify fail " + n)
-    rr = Reader(str(pending)); nq4 = sum(1 for _n,(k,_s,_o) in rr.tensors.items() if k == Q4_0); rr.f.close()
+    rr = Reader(str(pending)); nq4 = sum(1 for _n,(k,_s,_o) in rr.tensors.items() if k == Q4_K); rr.f.close()
     h = hashlib.sha256()
     with pending.open("rb") as fp:
         for ch in iter(lambda: fp.read(8 << 20), b""): h.update(ch)
     Path(str(args.output)+".json").write_text(json.dumps(
         dict(source=str(args.model), bytes=total, sha256=h.hexdigest(),
-             requantized=len(targets), q4_0_total=nq4), indent=2) + "\n")
+             requantized=len(targets), q4_k_total=nq4), indent=2) + "\n")
     pending.rename(args.output)
-    print(f"DONE -> {args.output} {total} ({total/(1<<30):.2f} GiB) q4_0_tensors={nq4}", flush=True)
+    print(f"DONE -> {args.output} {total} ({total/(1<<30):.2f} GiB) q4_k_tensors={nq4}", flush=True)
     m.f.close()
 
 def _read(m, off, size):

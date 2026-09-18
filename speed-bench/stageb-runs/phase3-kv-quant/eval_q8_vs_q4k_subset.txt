@@ -1,0 +1,33 @@
+===== Q8 (6 cases, cap 1024) =====
+
+Triangle sides: CD=14, CG=40, DG=30. Semiperimeter s=(14+40+30)/2=42. Area via Heron: sqrt(42*28*2*12)=sqrt(42*28*24). 42*28=1176; *24=28224. sqrt? 28224 =? 168^2? 168^2=28224 yes. Area =168. Height to base CD = 2*area/CD =336/14=24. So h=24. Then area BGE = 1/2*39*24=468. Integer 468.
+
+Need ensure no ambiguity: G not on line, distances CG=40, DG=30. Triangle inequality: 40+30>14, 40+14>30, 30+14>40? 44>40 yes. Height positive. Could be two positions symmetric, area same.
+
+Need final exactly Answer: 468. But let's double-check all distances. Points in order A B C D E F. AC=26, BD=22, CE=31, DF=33, AF=73. We solved. Let's verify: AB=18, BC=8, CD=14, DE=17, EF=16. AC=26, BD=8+14=22, CE=14+17=31, DF=17+16=33, AF
+FAIL got 14 expected 468 (34.7s, 1024 tokens)
+ds4-eval: 3/6 passed, 1 failed, 2 incomplete, runtime 00h:02m
+#   state        prompt      gen    total given                correct              test
+  1 INCOMPLETE      265     1024     1289 ?                    B                    GPQA Diamond/recNu3MXkvWUzHZr9
+  2 PASSED          201      374      575 C                    C                    SuperGPQA/001b51d76b4d422988f2c11f104a2c6c
+  3 PASSED          134      694      828 70                   70                   AIME2025/aime2025-01
+  4 PASSED          386      700     1086 C                    C                    GPQA Diamond/recoiTJPGUmzAkief
+  5 INCOMPLETE      327     1024     1351 ?                    J                    SuperGPQA/b7e20eac98764fb0bf30e8366d951daa
+  6 FAILED          205     1024     1229 14                   468                  AIME2025/aime2025-16
+===== Q4K (6 cases, cap 1024) =====
+BE=39.
+G distances: C=40, D=30. CD=14. Triangle CDG sides 40,30,14. Height to CD? Use Heron? Let's verify height to line CD (same line) =? Semiperimeter 42, area sqrt(42*2*12*28)=sqrt(42*672)=sqrt(28224)=? 168? 168^2=28224 yes. Area =1/2*14*h=7h => h=24. Yes.
+
+Area BGE = 1/2*39*24=468.
+
+Potential issue: G not on line but distances CG=40, DG=30
+INCOMPLETE got ? expected 468 (31.0s, 1024 tokens)
+ds4-eval: 3/6 passed, 3 incomplete, runtime 00h:02m
+#   state        prompt      gen    total given                correct              test
+  1 INCOMPLETE      265     1024     1289 ?                    B                    GPQA Diamond/recNu3MXkvWUzHZr9
+  2 PASSED          201      968     1169 C                    C                    SuperGPQA/001b51d76b4d422988f2c11f104a2c6c
+  3 PASSED          134      780      914 70                   70                   AIME2025/aime2025-01
+  4 PASSED          386      655     1041 C                    C                    GPQA Diamond/recoiTJPGUmzAkief
+  5 INCOMPLETE      327     1024     1351 ?                    J                    SuperGPQA/b7e20eac98764fb0bf30e8366d951daa
+  6 INCOMPLETE      205     1024     1229 ?                    468                  AIME2025/aime2025-16
+EVALFASTDONE

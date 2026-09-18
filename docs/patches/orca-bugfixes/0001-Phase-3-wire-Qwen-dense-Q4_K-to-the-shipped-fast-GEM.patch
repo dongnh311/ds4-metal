@@ -1,0 +1,67 @@
+From 432e610e1ac712dbe708389db5c5bc661d76d939 Mon Sep 17 00:00:00 2001
+From: dongnh311 <40257252+dongnh311@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 21:55:39 +0700
+Subject: [PATCH] Phase 3: wire Qwen dense Q4_K to the shipped fast GEMV
+ (decode +13%)
+
+Decode is per-token dense-weight-bandwidth-bound; the Qwen dense projections
+were Q8_0-only. DS4 already ships a decode-grade dense Q4_K matvec
+(kernel_mul_mv_q4_K_dense_f32, used by the GLM DenseQ4 path) but the Qwen path
+never wired into it. Three edits route Qwen dense Q4_K tensors to it:
+- tensor_type_is_qwen4_dense: accept DS4_TENSOR_Q4_K (loader).
+- qwen4_gemv_rows: add case DS4_TENSOR_Q4_K -> ds4_gpu_matmul_quant_tensor (same
+  call as Q4_0; reaches the fast classic Q4_K kernel for n_tok<=8, in_dim%256==0).
+- qwen4_graph_dense_ok: accept Q4_K (graph gate for per-layer dense).
+Special forward paths (token_embd, output, nextn, ple, hc, ffn_down_shexp@640)
+stay Q8_0 -- they are validated/handled separately and/or not 256-aligned.
+
+Measured on the light Orca model with a Q8_0->Q4_K dense requant (271 tensors,
+gguf-tools/requant_dense.py): decode 32.2 -> 36.5 t/s MTP-off (+13.3%), ~40 ->
+42.6 with --mtp; coherent; uncensoring preserved; quality cosine 0.915 (argmax
+preserved, vs Q4_0's 0.882 flipped); ds4-eval subset matches Q8 on all completed
+cases. First quant change that actually raises decode (Q4_0 was -4% via the
+generic ext kernel at half the bandwidth efficiency). No new user flag.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CNUVtqAjCzPC17P5jQaV2s
+---
+ ds4.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/ds4.c b/ds4.c
+index 30d51c0..11bcd4b 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -5254,10 +5254,10 @@ static bool weights_qwen4_layer_has_required(const ds4_layer_weights *l, uint32_
+     return true;
+ }
+ 
+-/* Dense Qwen projections: Q8_0, F16 or F32, plus BF16 and Q4_0 from the upstream GGUF. */
++/* Dense Qwen projections: Q8_0, F16 or F32, plus BF16, Q4_0 and Q4_K from the upstream GGUF. */
+ static bool tensor_type_is_qwen4_dense(uint32_t type) {
+     return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_F16 || type == DS4_TENSOR_F32 ||
+-           type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q4_0;
++           type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q4_0 || type == DS4_TENSOR_Q4_K;
+ }
+ 
+ static void tensor_expect_qwen4_dense_layout(
+@@ -54956,7 +54956,7 @@ static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
+ 
+ static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
+     return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_F32 ||
+-                 t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q4_0);
++                 t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q4_0 || t->type == DS4_TENSOR_Q4_K);
+ }
+ 
+ /* expert types the tiled prefill GEMM stages (kernel_qwen4_moe_mm_*) */
+@@ -55234,6 +55234,7 @@ static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
+     case DS4_TENSOR_F16:  rc = ds4_gpu_matmul_f16_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok); break;
+     case DS4_TENSOR_F32:  rc = ds4_gpu_matmul_f32_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok); break;
+     case DS4_TENSOR_Q4_0: rc = ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim, x, n_tok); break;
++    case DS4_TENSOR_Q4_K: rc = ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim, x, n_tok); break;
+     case DS4_TENSOR_BF16: {
+         ds4_gpu_tensor *outs[1] = { out };
+         const uint64_t offs[1] = { w->abs_offset };
+-- 
+2.54.0 (Apple Git-157)
+
