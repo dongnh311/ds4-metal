@@ -36,6 +36,7 @@
 #if defined(__APPLE__)
 #include <dispatch/dispatch.h>
 #include <sys/sysctl.h>
+#include <mach/mach.h>
 #endif
 #include <stdarg.h>
 #include <time.h>
@@ -45064,6 +45065,44 @@ static uint64_t glm_graph_host_memory_bytes(void) {
 #endif
 }
 
+/* Item P2 (1): RAM the OS can hand out right now without swapping — free plus the
+ * reclaimable buckets (inactive, speculative, purgeable). Deliberately EXCLUDES
+ * external_page_count: on macOS file-backed pages are already counted inside
+ * inactive/active, so adding them double-counts (an earlier attempt reported
+ * 84 GiB > physical). Capped at physical for safety. Used to size the expert
+ * cache from what is ACTUALLY free (this is a busy shared box; other sessions
+ * hold much of the 64 GiB), rather than from total RAM. Returns 0 if
+ * unavailable. Measurement (FINDINGS-item-P2-rss-residency): the routed-expert
+ * GGUF pages are NOT resident (6.3 GiB of a 41.7 GiB mapping), so the model's
+ * real cost is the non-routed weights and the rest of RAM — minus what other
+ * processes hold — is what the GPU/unified expert cache may use. */
+static uint64_t ds4_host_available_ram_bytes(void) {
+#if defined(__APPLE__)
+    mach_port_t host = mach_host_self();
+    vm_size_t page_size = 0;
+    if (host_page_size(host, &page_size) != KERN_SUCCESS || page_size == 0) return 0;
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&vm, &count) != KERN_SUCCESS) {
+        return 0;
+    }
+    /* free + speculative + purgeable ONLY. Deliberately EXCLUDES inactive: on this
+     * shared dev box the huge inactive bucket (~40 GiB) is mostly OTHER sessions'
+     * reclaimable working set, so counting it reported ~50 GiB "free" when only
+     * ~8 GiB was actually grabbable (a 34 GiB grant swapped 18 GiB). free+
+     * speculative+purgeable ~= what the OS can hand out without evicting anyone's
+     * live pages; it matches the measured swap-safe ceiling here and scales up on
+     * a dedicated box where most of RAM is genuinely free. */
+    uint64_t avail = ((uint64_t)vm.free_count + vm.speculative_count +
+                      vm.purgeable_count) * (uint64_t)page_size;
+    const uint64_t phys = glm_graph_host_memory_bytes();
+    if (phys > 0 && avail > phys) avail = phys;
+    return avail;
+#else
+    return 0;
+#endif
+}
+
 
 #ifndef DS4_NO_GPU
 typedef struct ds4_glm_gpu_graph {
@@ -73474,22 +73513,22 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                     const uint64_t ram = glm_graph_host_memory_bytes();
                     if (ram > 0 && ds4_memory_manager_init(&mgr, ram)) {
                         /* Resident model bytes for the budget: under --ssd-streaming
-                         * the routed experts are PAGED (budgeted separately as the
-                         * expert cache), so the resident model is the non-routed
-                         * weights, not the full span. */
-                        /* Item P2 (fix over-allocation): charge the FULL model span,
-                         * not the optimistic non-routed subset. The engine's own
-                         * memory plan treats the whole GGUF span (~41.72 GiB) as
-                         * committed and is proven swap-free at the default cache; the
-                         * earlier non-routed override (6.32 GiB) made the manager
-                         * think ~35 GiB more was free than actually is, so it granted
-                         * a 43 GiB cache that forced ~18-20 GiB of swap on a busy
-                         * 64 GiB machine (zero-swap DoD violation, measured). Using
-                         * the span keeps the grant inside the engine's safe envelope;
-                         * the shared routed-expert pages counted here are the same
-                         * bytes the pager caches, so this is conservative, not
-                         * double-counted against the DoD. */
+                         * the routed experts are PAGED, so the model's real resident
+                         * cost is the NON-ROUTED weights, not the full GGUF span.
+                         * Measured (FINDINGS-item-P2-rss-residency, vmmap): the
+                         * 41.7 GiB model mapping holds only 6.3 GiB resident — the
+                         * routed-expert region (~35 GiB) is never faulted (it is read
+                         * from the bundle) — and 6.3 GiB == the non-routed weights.
+                         * So charge non-routed; swap-safety comes from the
+                         * available-RAM cap below, NOT from over-charging the model
+                         * (the earlier span charge left the cache smaller than the
+                         * machine could actually hold). */
                         uint64_t model_bytes = e->startup_model_span_bytes;
+                        uint64_t nr = 0;
+                        if (e->ssd_streaming &&
+                            weights_streaming_non_routed_bytes(&e->weights, &nr) && nr > 0) {
+                            model_bytes = nr;
+                        }
                         ds4_memory_manager_set_model_bytes(&mgr, model_bytes);
                         /* Use the env directly: s->qwen4_graph.kv_fp8 is set just
                          * below (before graph_alloc), after this planning block. */
@@ -73503,27 +73542,41 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                         uint64_t plan_kv = 0, plan_exp = 0, plan_ws = 0, plan_hr = 0;
                         ds4_memory_manager_get_plan(&mgr, &plan_kv, &plan_exp, &plan_ws, &plan_hr);
                         const double gib = 1024.0 * 1024.0 * 1024.0;
-                        /* Item P2 (fix memmgr over-allocation): compute_plan sizes
-                         * the cache from TOTAL RAM with a flat 20% headroom, which
-                         * on a busy 64 GiB Mac granted a 43 GiB cache that did not
-                         * fit and forced ~18-20 GiB of swap (zero-swap DoD
-                         * violation, measured). Cap the grant against (a) the whole
-                         * bundle — caching more than exists is pure waste — and (b)
-                         * RAM the OS can actually hand out right now, reserving KV,
-                         * the graph buffers allocated just below, model pages not
-                         * yet faulted, and a safety slack. This keeps the cache as
-                         * large as fits WITHOUT swapping. */
-                        /* Never cache more than the whole bundle holds — caching
-                         * beyond the data is pure waste. (Swap-safety comes from
-                         * charging the full model span above.) */
+                        /* Item P2 (1): cap the grant against what is ACTUALLY free.
+                         * compute_plan sizes the cache from TOTAL RAM with a flat 20%
+                         * headroom; on a busy shared 64 GiB Mac that granted a 43 GiB
+                         * GPU/unified expert cache that did not fit and forced
+                         * ~18-20 GiB of swap (zero-swap DoD violation, measured). The
+                         * cache is unified memory, so it competes with every other
+                         * process. Cap it against (a) available RAM right now
+                         * (ds4_host_available_ram_bytes), reserving KV + the graph
+                         * buffers allocated just below + a safety slack, and (b) the
+                         * whole bundle — caching beyond the data is waste. Adaptive:
+                         * a free box grants a large cache, a busy box a small safe
+                         * one. */
                         {
                             const uint64_t bundle_total =
                                 s->qwen4_graph.pager ? s->qwen4_graph.pager->bundle_size : 0;
+                            const uint64_t avail = ds4_host_available_ram_bytes();
+                            if (avail > 0) {
+                                /* Hold back KV, the graph buffers allocated just below
+                                 * (~4 GiB GPU, not yet counted in `avail`), and a
+                                 * safety slack for pager file-cache churn. `avail` is
+                                 * already the conservative free+speculative+purgeable
+                                 * figure (excludes others' reclaimable), so a fixed
+                                 * reserve suffices — no fractional slack needed. */
+                                const uint64_t reserve = kv_est + (4ull << 30) + (2ull << 30);
+                                const uint64_t avail_cap = avail > reserve ? avail - reserve : 0;
+                                if (plan_exp > avail_cap) plan_exp = avail_cap;
+                                fprintf(stderr,
+                                        "ds4: memory manager: grabbable %.2f GiB, swap-safe "
+                                        "cap %.2f GiB (reserve %.2f)\n",
+                                        avail / gib, avail_cap / gib, reserve / gib);
+                            }
                             if (bundle_total > 0 && plan_exp > bundle_total) {
                                 fprintf(stderr,
                                         "ds4: memory manager: capping expert cache at bundle "
-                                        "size %.2f GiB (plan %.2f GiB)\n",
-                                        bundle_total / gib, plan_exp / gib);
+                                        "size %.2f GiB\n", bundle_total / gib);
                                 plan_exp = bundle_total;
                             }
                         }

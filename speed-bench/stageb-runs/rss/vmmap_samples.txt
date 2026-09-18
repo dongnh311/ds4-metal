@@ -1,0 +1,25 @@
+===== SAMPLE t~25s =====
+ps: rss=9.48 GiB vsz=462.89 GiB
+    phys_footprint: 6163 MB
+Physical footprint:         6.0G
+mapped file                7000000000-7a6eaf0000   [ 41.7G   6.3G     0K     0K] r--/r-x SM=SHM          /Users/dongnh/orca/workspaces/ds4-metal/scallop/gguf/Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q2KDownPad768-MTP-NNgram.gguf
+IOAccelerator (graphics)           5.4G     4.7G     4.7G    70.7M       0K     4.7G       0K      559 
+===== SAMPLE t~45s =====
+ps: rss=9.34 GiB vsz=462.89 GiB
+    phys_footprint: 6175 MB
+Physical footprint:         6.0G
+mapped file                7000000000-7a6eaf0000   [ 41.7G   6.3G     0K     0K] r--/r-x SM=SHM          /Users/dongnh/orca/workspaces/ds4-metal/scallop/gguf/Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q2KDownPad768-MTP-NNgram.gguf
+IOAccelerator (graphics)           5.4G     4.7G     4.4G   302.8M       0K     4.7G     240K      559 
+===== SAMPLE t~70s =====
+ps: rss=9.32 GiB vsz=462.89 GiB
+    phys_footprint: 6175 MB
+Physical footprint:         6.0G
+mapped file                7000000000-7a6eaf0000   [ 41.7G   6.3G     0K     0K] r--/r-x SM=SHM          /Users/dongnh/orca/workspaces/ds4-metal/scallop/gguf/Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q2KDownPad768-MTP-NNgram.gguf
+IOAccelerator (graphics)           5.4G     4.7G     4.4G   345.1M       0K     4.7G       0K      559 
+===== SAMPLE t~100s =====
+ps: rss=9.18 GiB vsz=462.89 GiB
+    phys_footprint: 6175 MB
+Physical footprint:         6.0G
+mapped file                7000000000-7a6eaf0000   [ 41.7G   6.3G     0K     0K] r--/r-x SM=SHM          /Users/dongnh/orca/workspaces/ds4-metal/scallop/gguf/Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q2KDownPad768-MTP-NNgram.gguf
+IOAccelerator (graphics)           5.4G     4.7G     4.2G   502.0M       0K     4.7G       0K      559 
+===== MEASURE_DONE =====
