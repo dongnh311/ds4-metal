@@ -543,12 +543,22 @@ bool ds4_expert_pager_enable_cache(ds4_expert_pager *pager, uint64_t bytes) {
         pager->cache_policy = DS4_EXPERT_EVICT_SCORED;
     }
 
-    /* Largest bundle decides how many slots the budget can ever hold; slots
-     * are containers, not reservations, so the budget is enforced on live
-     * bytes in pager_reserve_slot. */
-    uint64_t max_bundle = 0;
+    /* Slots are containers, not reservations — the budget is enforced on live
+     * bytes in pager_reserve_slot. Item 1.4 fix (1.7 finding): size the slot
+     * ARRAY by the SMALLEST bundle, not the largest. Sizing by max_bundle
+     * (the down tensor, 645120 B) undercounts slots because 2/3 of bundles are
+     * the smaller gate/up tensors (422400 B): the slot COUNT then binds before
+     * the byte budget, leaving ~20-25% of the granted RAM unusable (measured).
+     * Sizing by min_bundle gives enough slot containers that the byte budget is
+     * the sole cap, so the full grant is used -> more experts cached -> higher
+     * hit rate for the same RAM. Extra metadata is ~40 B/slot (negligible), and
+     * the cache math is unchanged (bit-identical). max_bundle is still the
+     * "budget too small to hold even one bundle" floor. */
+    uint64_t max_bundle = 0, min_bundle = 0;
     for (uint64_t i = 0; i < pager->bundles_count; i++) {
-        if (pager->bundles[i].size > max_bundle) max_bundle = pager->bundles[i].size;
+        const uint64_t sz = pager->bundles[i].size;
+        if (sz > max_bundle) max_bundle = sz;
+        if (sz > 0 && (min_bundle == 0 || sz < min_bundle)) min_bundle = sz;
     }
     if (max_bundle == 0 || bytes < max_bundle) {
         fprintf(stderr, "ds4_expert_pager: cache budget %llu B too small for a "
@@ -557,7 +567,7 @@ bool ds4_expert_pager_enable_cache(ds4_expert_pager *pager, uint64_t bytes) {
         return false;
     }
 
-    uint64_t slots = bytes / max_bundle;
+    uint64_t slots = bytes / min_bundle;
     if (slots > pager->bundles_count) slots = pager->bundles_count;
     if (slots > UINT32_MAX) slots = UINT32_MAX;
 
@@ -585,10 +595,10 @@ bool ds4_expert_pager_enable_cache(ds4_expert_pager *pager, uint64_t bytes) {
     pager->cache_capacity = (uint32_t)slots;
     pager->cache_budget_bytes = bytes;
     fprintf(stderr,
-            "ds4_expert_pager: resident cache %.2f GiB, %u slots of %llu B max, "
-            "policy=%s\n",
+            "ds4_expert_pager: resident cache %.2f GiB, %u slots (sized by %llu B min "
+            "bundle; byte budget is the cap), policy=%s\n",
             (double)bytes / 1073741824.0, pager->cache_capacity,
-            (unsigned long long)max_bundle,
+            (unsigned long long)min_bundle,
             pager->cache_policy == DS4_EXPERT_EVICT_LRU ? "E1-lru" : "E2-scored");
     /* A single MoE step asks for one expert across three tensors, so a cache
      * below that cannot hold even the step in flight: every access misses and
