@@ -45,3 +45,5 @@ __pycache__/
 /speed-bench/stageb-runs/*.stderr
 /speed-bench/stageb-runs/*.decoded.txt
 /speed-bench/kv-gate/*/frontier_*.json
+/speed-bench/kv-gate/*.stderr
+/speed-bench/kv-gate/*/frontier_*.json
