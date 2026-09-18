@@ -1,0 +1,138 @@
+{
+  "rows": [
+    {
+      "turn": 1,
+      "finish": "tool_calls",
+      "wall": 2.82,
+      "prompt": 541,
+      "completion": 36,
+      "cached": 0,
+      "pf_tps": null,
+      "dec_tps": null,
+      "swapM": 0.0
+    },
+    {
+      "turn": 2,
+      "finish": "tool_calls",
+      "wall": 1.47,
+      "prompt": 615,
+      "completion": 44,
+      "cached": 577,
+      "pf_tps": null,
+      "dec_tps": null,
+      "swapM": 0.0
+    },
+    {
+      "turn": 3,
+      "finish": "tool_calls",
+      "wall": 2.27,
+      "prompt": 697,
+      "completion": 76,
+      "cached": 659,
+      "pf_tps": null,
+      "dec_tps": null,
+      "swapM": -16.0
+    },
+    {
+      "turn": 4,
+      "finish": "tool_calls",
+      "wall": 2.39,
+      "prompt": 840,
+      "completion": 71,
+      "cached": 773,
+      "pf_tps": null,
+      "dec_tps": null,
+      "swapM": -16.0
+    },
+    {
+      "turn": 5,
+      "finish": "tool_calls",
+      "wall": 2.73,
+      "prompt": 978,
+      "completion": 79,
+      "cached": 911,
+      "pf_tps": null,
+      "dec_tps": null,
+      "swapM": -16.0
+    },
+    {
+      "turn": 6,
+      "finish": "tool_calls",
+      "wall": 1.73,
+      "prompt": 1074,
+      "completion": 57,
+      "cached": 1057,
+      "pf_tps": null,
+      "dec_tps": null,
+      "swapM": -16.0
+    },
+    {
+      "turn": 7,
+      "finish": "tool_calls",
+      "wall": 1.78,
+      "prompt": 1148,
+      "completion": 60,
+      "cached": 1131,
+      "pf_tps": null,
+      "dec_tps": null,
+      "swapM": -16.0
+    },
+    {
+      "turn": 8,
+      "finish": "tool_calls",
+      "wall": 3.31,
+      "prompt": 1523,
+      "completion": 78,
+      "cached": 1208,
+      "pf_tps": null,
+      "dec_tps": null,
+      "swapM": -16.0
+    },
+    {
+      "turn": 9,
+      "finish": "tool_calls",
+      "wall": 4.32,
+      "prompt": 1916,
+      "completion": 120,
+      "cached": 1601,
+      "pf_tps": null,
+      "dec_tps": null,
+      "swapM": -16.0
+    },
+    {
+      "turn": 10,
+      "finish": "tool_calls",
+      "wall": 1.61,
+      "prompt": 2057,
+      "completion": 50,
+      "cached": 2036,
+      "pf_tps": null,
+      "dec_tps": null,
+      "swapM": -16.0
+    },
+    {
+      "turn": 11,
+      "finish": "tool_calls",
+      "wall": 6.63,
+      "prompt": 2128,
+      "completion": 249,
+      "cached": 2107,
+      "pf_tps": null,
+      "dec_tps": null,
+      "swapM": -56.1
+    },
+    {
+      "turn": 12,
+      "finish": "tool_calls",
+      "wall": 5.71,
+      "prompt": 2398,
+      "completion": 204,
+      "cached": 2377,
+      "pf_tps": null,
+      "dec_tps": null,
+      "swapM": -80.1
+    }
+  ],
+  "total_wall": 36.835485219955444,
+  "total_completion": 1124
+}
