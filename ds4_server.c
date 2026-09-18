@@ -9856,7 +9856,11 @@ static bool server_encode_image(server *s, const server_image_input *input,
                                          input->encoded_len, out, err, errlen))
         return false;
     server_image_cache_put(&s->image_cache, input, out,
-                            4096, /* Both supported vision encoders emit 4096-wide rows. */
+                            /* Row width must match the encoder's allocation: the mmproj
+                             * projection dim is validated to equal the model's n_embd at
+                             * load (Qwen3.8 is 2560-wide, not 4096; a wrong width
+                             * over-reads the source embedding in put -> SIGSEGV). */
+                            (uint32_t)ds4_engine_embd_dim(s->engine),
                             SERVER_IMAGE_CACHE_BYTES);
     server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding encoded; cache=%zu bytes",
                s->image_cache.bytes);
