@@ -46,10 +46,67 @@ def dequant_q8_0(raw, n_elem):
 def q4k_row_bytes(ncols):
     return (ncols // 256) * 144
 
+def load_gguf_imatrix(path):
+    """Parse a llama.cpp GGUF imatrix (general.type=imatrix). Returns
+    {tensor_name -> per-column importance f32[ncols]} for the DENSE tensors,
+    computed as in_sum2 / max(count, 1) (llama.cpp mean-activation-square). Only
+    <name>.in_sum2 (+ optional <name>.counts) entries are read; expert-packed
+    2-D in_sum2 are skipped (dense requant needs 1-D per-column vectors)."""
+    with open(path, "rb") as f:
+        if f.read(4) != b"GGUF": sys.exit(f"{path}: not a GGUF imatrix")
+        struct.unpack("<I", f.read(4))  # version
+        nt, = struct.unpack("<Q", f.read(8)); nk, = struct.unpack("<Q", f.read(8))
+        def rstr():
+            n, = struct.unpack("<Q", f.read(8)); return f.read(n).decode("utf-8", "replace")
+        def skipv(t):
+            if t in (0, 1, 7): f.read(1)
+            elif t in (2, 3): f.read(2)
+            elif t in (4, 5, 6): f.read(4)
+            elif t in (10, 11, 12): f.read(8)
+            elif t == 8: rstr()
+            elif t == 9:
+                et, = struct.unpack("<I", f.read(4)); c, = struct.unpack("<Q", f.read(8))
+                for _ in range(c): skipv(et)
+            else: sys.exit(f"imatrix kv type {t}")
+        align = 32
+        for _ in range(nk):
+            k = rstr(); t, = struct.unpack("<I", f.read(4))
+            if k == "general.alignment" and t in (4, 5):
+                align, = struct.unpack("<I", f.read(4))
+            else:
+                skipv(t)
+        infos = []
+        for _ in range(nt):
+            name = rstr(); nd, = struct.unpack("<I", f.read(4))
+            shape = struct.unpack("<%dQ" % nd, f.read(8 * nd))
+            qt, = struct.unpack("<I", f.read(4)); off, = struct.unpack("<Q", f.read(8))
+            infos.append((name, shape, qt, off))
+        data_start = (f.tell() + align - 1) // align * align
+        raw = {}
+        for name, shape, qt, off in infos:
+            if qt != 0:  # only F32 imatrix stats
+                continue
+            f.seek(data_start + off)
+            raw[name] = (shape, np.frombuffer(f.read(int(np.prod(shape)) * 4), dtype="<f4"))
+    imp = {}
+    for name, (shape, vals) in raw.items():
+        if not name.endswith(".in_sum2") or len(shape) != 1:
+            continue  # skip counts and expert-packed 2-D in_sum2
+        base = name[: -len(".in_sum2")]
+        cnt = raw.get(base + ".counts")
+        c = float(cnt[1][0]) if cnt is not None and cnt[1].size else 1.0
+        imp[base] = (vals / (c if c > 0 else 1.0)).astype("<f4")
+    return imp
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", type=Path, required=True)
     ap.add_argument("--output", type=Path, required=True)
+    ap.add_argument("--imatrix", type=Path, default=None,
+                    help="GGUF imatrix; per-column importance weights the Q4_K "
+                         "quantization of each matched dense tensor (else plain Q4_K)")
+    ap.add_argument("--imatrix-strict", action="store_true",
+                    help="fail if any Q4_K target has no matching imatrix entry")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -62,6 +119,20 @@ def main():
     targets = [n for n, (k, sh, o) in m.tensors.items()
                if k == Q8_0 and n not in KEEP_Q8 and sh[0] % 256 == 0
                and not any(sub in n for sub in SKIP_SUBSTR)]
+
+    imp = load_gguf_imatrix(str(args.imatrix)) if args.imatrix else {}
+    def imatrix_for(n, ncols):
+        v = imp.get(n)
+        if v is None or v.size != ncols or not np.all(np.isfinite(v)) or v.max() <= 0:
+            return None
+        return v
+    if args.imatrix:
+        cov = sum(1 for n in targets if imatrix_for(n, m.tensors[n][1][0]) is not None)
+        miss = [n for n in targets if imatrix_for(n, m.tensors[n][1][0]) is None]
+        print(f"imatrix: {cov}/{len(targets)} targets weighted, {len(miss)} plain-Q4_K fallback", flush=True)
+        if miss[:6]: print("  fallback e.g.:", ", ".join(miss[:6]), flush=True)
+        if args.imatrix_strict and miss:
+            sys.exit(f"--imatrix-strict: {len(miss)} targets lack imatrix coverage")
     nel = lambda sh: int(np.prod(sh))
     old = sum(size_of(Q8_0, m.tensors[n][1]) for n in targets)
     new = sum(q4k_row_bytes(m.tensors[n][1][0]) * (nel(m.tensors[n][1]) // m.tensors[n][1][0]) for n in targets)
@@ -73,14 +144,19 @@ def main():
             print(f"  kept Q8_0: {n} ne0={m.tensors[n][1][0]}")
         for n in targets[:3]:
             sh = m.tensors[n][1]; raw = _read(m, m.tensors[n][2], size_of(Q8_0, sh))
-            f = dequant_q8_0(raw, nel(sh)).reshape(-1, sh[0]); b = quant.encode(f, "Q4_K")
-            print(f"  {n}: shape={sh} q8={len(raw)}B q4k={len(b)}B ratio={len(raw)/len(b):.2f}x", flush=True)
+            iv = imatrix_for(n, sh[0])
+            f = dequant_q8_0(raw, nel(sh)).reshape(-1, sh[0]); b = quant.encode(f, "Q4_K", imatrix=iv)
+            print(f"  {n}: shape={sh} q8={len(raw)}B q4k={len(b)}B ratio={len(raw)/len(b):.2f}x "
+                  f"imatrix={'yes' if iv is not None else 'no'}", flush=True)
         m.f.close(); return
 
     pending = Path(str(args.output) + ".incomplete")
     if args.output.exists() or pending.exists(): sys.exit("output exists")
     metadata = {k: (m.kv_types[k], v) for k, v in m.kv.items()}
-    metadata["ds4.dense.requant"] = (8, "Q8_0->Q4_K per-layer dense (decode-bandwidth experiment)")
+    tag = "Q8_0->Q4_K per-layer dense (decode-bandwidth experiment)"
+    if args.imatrix:
+        tag += f"; imatrix-weighted ({Path(args.imatrix).name})"
+    metadata["ds4.dense.requant"] = (8, tag)
     alignment = m.kv.get("general.alignment", 32)
     align = lambda n, a=alignment: (n + a - 1) // a * a
 
@@ -88,7 +164,7 @@ def main():
     for i, n in enumerate(targets):
         sh = m.tensors[n][1]; raw = _read(m, m.tensors[n][2], size_of(Q8_0, sh))
         f = dequant_q8_0(raw, nel(sh)).reshape(-1, sh[0])
-        newpayload[n] = quant.encode(f, "Q4_K")
+        newpayload[n] = quant.encode(f, "Q4_K", imatrix=imatrix_for(n, sh[0]))
         if (i + 1) % 50 == 0: print(f"  requantized {i+1}/{len(targets)}", flush=True)
 
     plan, off = [], 0

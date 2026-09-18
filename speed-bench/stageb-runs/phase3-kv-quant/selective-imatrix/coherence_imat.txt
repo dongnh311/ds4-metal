@@ -1,0 +1,15 @@
+We need to respond to user: "Write a Python function fibonacci(n) with a docstring and iterative body." Need produce final answer likely code. Need ensure function has docstring and iterative body. Could include type hints, edge cases. Need maybe only code? User asks write function. We can provide concise code block. Need final.
+
+
+```python
+def fibonacci(n: int) -> int:
+    """
+    Return the nth Fibonacci number using an iterative approach.
+
+    The sequence starts with:
+        F(0) = 0
+        F(1) = 1
+        F(n) = F(n - 1) + F(n - 2) for n >= 2
+
+    Args:
+ds4: prefill: 103.87 t/s, generation: 44.70 t/s
