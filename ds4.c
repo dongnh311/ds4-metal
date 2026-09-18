@@ -57707,6 +57707,14 @@ typedef struct {
     ds4_gpu_tensor *expert_gate_buf[DS4_MAX_LAYER];
     ds4_gpu_tensor *expert_up_buf[DS4_MAX_LAYER];
     ds4_gpu_tensor *expert_down_buf[DS4_MAX_LAYER];
+    /* Item P2 paged-mm: GLOBAL-id (n_expert-slot) staging buffers reused across
+     * all layers for the batched prefill GEMM. The used-expert union of each
+     * layer's routing is staged here at slot e = e*expert_bytes, then the mm
+     * GEMM reads them exactly like the resident m->map. Lazy-allocated on first
+     * paged-mm prefill; one set for the whole graph. */
+    ds4_gpu_tensor *paged_mm_gate;
+    ds4_gpu_tensor *paged_mm_up;
+    ds4_gpu_tensor *paged_mm_down;
 /* Pager state: opened when --ssd-streaming is set and bundle files exist.
      * NULL means pager not available (resident path). */
     ds4_expert_pager *pager;
@@ -57862,6 +57870,10 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         g->paged_k_staging_full[il] = NULL;
         g->paged_v_staging_full[il] = NULL;
     }
+    ds4_gpu_tensor_free(g->paged_mm_gate);
+    ds4_gpu_tensor_free(g->paged_mm_up);
+    ds4_gpu_tensor_free(g->paged_mm_down);
+    g->paged_mm_gate = g->paged_mm_up = g->paged_mm_down = NULL;
     ds4_kv_cache_free(&g->paged_kv_cache);
     free(g->host_row);
     free(g->host_logits);
@@ -58766,6 +58778,90 @@ static bool qwen4_moe_profile_boundary(bool enabled, double *last, double *elaps
     return glm_graph_begin_commands_if_needed();
 }
 
+/* Item P2 (paged-mm prefill): batched MoE for the SSD-paged path at T>8.
+ * Instead of staging+dispatching per token, build_lists once, stage the
+ * used-expert UNION (counts[e]>0) into the global-id staging buffers, and run
+ * the SAME tiled GEMM the resident prefill uses (bit-identical), with the
+ * shared expert as a dense gemv from the model map. Each used expert is staged
+ * once per layer (not once per token). Caller guarantees router+topk are queued
+ * and g->pager is set. Returns false on error. */
+static bool qwen4_graph_moe_paged_mm(ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                                     const ds4_layer_weights *l, uint32_t T, uint32_t layer_idx) {
+    /* build the per-expert token lists + counts, then flush so the CPU can read
+     * the counts (router/topk/build_lists are all still queued here). */
+    if (!ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T,
+                                              DS4_N_EXPERT_USED, DS4_N_EXPERT, g->cap_tokens)) {
+        return false;
+    }
+    ds4_gpu_end_commands();
+    static int32_t counts[DS4_MAX_EXPERT];
+    if (!ds4_gpu_tensor_read(g->moe_counts, 0, counts, (uint64_t)DS4_N_EXPERT * sizeof(int32_t))) {
+        return false;
+    }
+    /* used-expert union across all T tokens */
+    static uint32_t used_ids[DS4_MAX_EXPERT];
+    uint32_t n_used = 0;
+    for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+        if (counts[e] > 0) used_ids[n_used++] = e;
+    }
+
+    /* lazy-alloc the global-id staging buffers (one set, reused across layers) */
+    const uint64_t gate_bsize = ds4_expert_pager_bundle_size(g->pager, 0);
+    const uint64_t up_bsize   = ds4_expert_pager_bundle_size(g->pager, 1);
+    const uint64_t down_bsize = ds4_expert_pager_bundle_size(g->pager, 2);
+    if (!g->paged_mm_gate) g->paged_mm_gate = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * gate_bsize);
+    if (!g->paged_mm_up)   g->paged_mm_up   = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * up_bsize);
+    if (!g->paged_mm_down) g->paged_mm_down = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * down_bsize);
+    if (!g->paged_mm_gate || !g->paged_mm_up || !g->paged_mm_down) return false;
+
+    /* stage each used expert ONCE into its global-id slot, per tensor */
+    static void *ptrs[DS4_MAX_EXPERT];
+    bool ok = true;
+    for (uint32_t tid = 0; tid < 3 && ok; tid++) {
+        ds4_gpu_tensor *staging = (tid == 0) ? g->paged_mm_gate :
+                                  (tid == 1) ? g->paged_mm_up : g->paged_mm_down;
+        const uint64_t bsize = (tid == 0) ? gate_bsize : (tid == 1) ? up_bsize : down_bsize;
+        memset(ptrs, 0, (size_t)n_used * sizeof(ptrs[0]));
+        int misses = ds4_expert_pager_ensure(g->pager, layer_idx, used_ids, n_used, tid, ptrs);
+        if (misses > 0) {
+            fprintf(stderr, "ds4: paged-mm pager miss=%d tid=%u layer=%u (FATAL)\n", misses, tid, layer_idx);
+            ok = false;
+            break;
+        }
+        for (uint32_t i = 0; i < n_used && ok; i++) {
+            if (ptrs[i] && !ds4_gpu_tensor_write(staging, (uint64_t)used_ids[i] * bsize, ptrs[i], bsize)) {
+                ok = false;
+            }
+        }
+        ds4_expert_pager_release_pointers(g->pager, ptrs, n_used);
+    }
+    if (!ok) return false;
+
+    ds4_gpu_begin_commands();
+    /* routed experts via the tiled GEMM reading the staging buffers; shared
+     * expert as a dense gemv from the model map (same as the resident mm path) */
+    ok = ds4_gpu_qwen4_moe_mm_mid_tensor_with_bufs(g->mid, g->mixed, g->moe_lists, g->moe_counts,
+                                                   (void**)&g->paged_mm_gate, (uint64_t[1]){0},
+                                                   (void**)&g->paged_mm_up, (uint64_t[1]){0},
+                                                   l->ffn_gate_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED,
+                                                   DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP, g->cap_tokens) != 0 &&
+         qwen4_gemv(g->sh_gate, m, l->ffn_gate_shexp, g->mixed, T) &&
+         qwen4_gemv(g->sh_up, m, l->ffn_up_shexp, g->mixed, T) &&
+         ds4_gpu_swiglu_tensor(g->sh_mid, g->sh_gate, g->sh_up, T * DS4_N_FF_EXP, 0.0f, 1.0f);
+    if (ok) {
+        ok = ds4_gpu_qwen4_moe_mm_down_tensor_with_bufs(g->part, g->mid, g->moe_lists, g->moe_counts,
+                                                        (void**)&g->paged_mm_down, (uint64_t[1]){0},
+                                                        l->ffn_down_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED,
+                                                        DS4_N_EXPERT_USED, DS4_N_FF_EXP, DS4_N_EMBD, g->cap_tokens) != 0 &&
+             qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->sh_mid, T);
+    }
+    if (ok) {
+        ok = ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, g->sh_gate_logit, g->sh_out, g->R, g->inj,
+                                             T, DS4_N_EXPERT_USED, DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_HC) != 0;
+    }
+    return ok;
+}
+
 static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t T, uint32_t layer_idx) {
     const bool profile = T > 8u && getenv("DS4_QWEN4_MOE_PROFILE") != NULL;
     double elapsed[7] = {0}, last = 0;
@@ -58777,6 +58873,21 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
               qwen4_moe_profile_boundary(profile, &last, &elapsed[0]);
 
     if (ok && g->pager) {
+        /* Item P2 (paged-mm): prefill-sized batches (T>8) route the used-expert
+         * union through the SAME tiled GEMM the resident prefill uses, staging
+         * each used expert once per layer -- bit-identical to resident, and far
+         * fewer staging copies than the per-token loop below. Same mm
+         * eligibility as the resident path. Decode (T<=8) keeps the per-token
+         * path (the GEMM needs many tokens to amortize the global-id staging). */
+        const bool paged_mm = T > 8u && (DS4_N_EMBD % 64u) == 0 && (DS4_N_FF_EXP % 64u) == 0 &&
+            qwen4_expert_type_has_mm(l->ffn_gate_exps->type) &&
+            l->ffn_up_exps->type == l->ffn_gate_exps->type &&
+            qwen4_expert_type_has_mm(l->ffn_down_exps->type) &&
+            qwen4_graph_dense_ok(l->ffn_gate_shexp) && qwen4_graph_dense_ok(l->ffn_up_shexp) &&
+            qwen4_graph_dense_ok(l->ffn_down_shexp);
+        if (paged_mm) {
+            return qwen4_graph_moe_paged_mm(g, m, l, T, layer_idx);
+        }
         /* SSD-paged experts: the pager's per-layer staging buffer
          * (expert_{gate,up,down}_buf[layer_idx]) is sized for exactly one
          * token's routed set (DS4_N_EXPERT_USED slots), and the "_with_bufs"
