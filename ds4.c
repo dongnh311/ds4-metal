@@ -54928,6 +54928,16 @@ typedef struct {
     uint32_t *host_pos3;
     int32_t mrope_delta;
     int32_t snap_mrope_delta;
+    /* B2/B3: pre-verify snapshot (state at block_start) so --mtp-exact-sampling
+     * can rewind to the block start in O(1) instead of resetting + full replay.
+     * Lazily allocated; only saved when exact sampling is active -> inert off. */
+    ds4_gpu_tensor *snap0_lin_state[DS4_MAX_LAYER];
+    ds4_gpu_tensor *snap0_lin_hist[DS4_MAX_LAYER];
+    ds4_gpu_tensor *snap0_ple_hist;
+    int snap0_ple_prev[DS4_MAX_PLE_NGRAM];
+    uint32_t snap0_pos;
+    int32_t snap0_mrope_delta;
+    bool snap0_valid;
     const ds4_vision_span *vis_spans;
     size_t vis_span_count;
     float *host_row;
@@ -55040,7 +55050,7 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         &g->score, &g->tile_max, &g->sel_blocks, &g->sel_tokens, &g->n_sel, &g->attn_part,
         &g->router, &g->selected, &g->weights, &g->mid, &g->part, &g->sh_gate_logit, &g->logits,
         &g->moe_lists, &g->moe_counts, &g->sh_gate, &g->sh_up, &g->sh_mid, &g->sh_out, &g->hc_u, &g->hc_lo_act,
-        &g->inj_alt, &g->mtp_e, &g->mtp_cat, &g->mtp_proj, &g->mtp_R, &g->mtp_argmax, &g->mtp_argmax_tmp, &g->snap_ple_hist, &g->pos3,
+        &g->inj_alt, &g->mtp_e, &g->mtp_cat, &g->mtp_proj, &g->mtp_R, &g->mtp_argmax, &g->mtp_argmax_tmp, &g->snap_ple_hist, &g->snap0_ple_hist, &g->pos3,
         &g->draft_head,
     };
     free(g->host_pos3);
@@ -55060,6 +55070,8 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->layer_block_key[il]);
         ds4_gpu_tensor_free(g->snap_lin_state[il]);
         ds4_gpu_tensor_free(g->snap_lin_hist[il]);
+        ds4_gpu_tensor_free(g->snap0_lin_state[il]);
+        ds4_gpu_tensor_free(g->snap0_lin_hist[il]);
     }
     free(g->host_row);
     free(g->host_logits);
@@ -55200,6 +55212,7 @@ static void qwen4_graph_reset(ds4_qwen4_gpu_graph *g) {
     g->pos = 0;
     g->mtp_pos = 0;
     g->mrope_delta = 0;
+    g->snap0_valid = false;
 }
 
 /* rows > 0 limits the product to the leading rows of w (a contiguous prefix
@@ -55782,6 +55795,67 @@ static bool qwen4_graph_state_copy(ds4_qwen4_gpu_graph *g, bool save) {
         memcpy(g->ple_prev, g->snap_ple_prev, sizeof(g->ple_prev));
         g->pos = g->snap_pos;
         g->mrope_delta = g->snap_mrope_delta;
+    }
+    return ok;
+}
+
+/* B2/B3: lazily allocate the pre-verify snapshot buffers (block_start state),
+ * mirroring the snap_* allocation. Only reached when exact sampling is on. */
+static bool qwen4_graph_ensure_snap0(ds4_qwen4_gpu_graph *g) {
+    if (!g->snap_ple_hist) return false;   /* MTP buffers absent -> no snapshotting */
+    if (g->snap0_ple_hist) return true;    /* already allocated */
+    const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
+    const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
+    bool ok = (g->snap0_ple_hist = qwen4_graph_alloc_f32(
+                   (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * DS4_N_EMBD * DS4_N_HC)) != NULL;
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        if (!ds4_qwen4_layer_is_linear(il)) continue;
+        g->snap0_lin_state[il] = qwen4_graph_alloc_f32(v_dim * DS4_N_LIN_HEAD_DIM);
+        g->snap0_lin_hist[il] = qwen4_graph_alloc_f32((uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim);
+        ok = g->snap0_lin_state[il] && g->snap0_lin_hist[il];
+    }
+    if (!ok) {
+        ds4_gpu_tensor_free(g->snap0_ple_hist);
+        g->snap0_ple_hist = NULL;
+        for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+            ds4_gpu_tensor_free(g->snap0_lin_state[il]); g->snap0_lin_state[il] = NULL;
+            ds4_gpu_tensor_free(g->snap0_lin_hist[il]);  g->snap0_lin_hist[il] = NULL;
+        }
+    }
+    return ok;
+}
+
+/* Save (block_start state -> snap0) or restore (snap0 -> live). Mirrors
+ * qwen4_graph_state_copy but over the snap0_* buffers. */
+static bool qwen4_graph_state_copy0(ds4_qwen4_gpu_graph *g, bool save) {
+    if (!g->snap0_ple_hist) return false;
+    const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
+    const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
+    const uint64_t state_bytes = v_dim * DS4_N_LIN_HEAD_DIM * sizeof(float);
+    const uint64_t hist_bytes = (uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim * sizeof(float);
+    const uint64_t ple_bytes = (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * DS4_N_EMBD * DS4_N_HC * sizeof(float);
+    if (!glm_graph_begin_commands_if_needed()) return false;
+    bool ok = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        if (!g->snap0_lin_state[il]) continue;
+        ds4_gpu_tensor *st = g->layer_lin_state[il], *ss = g->snap0_lin_state[il];
+        ds4_gpu_tensor *ht = g->layer_lin_hist[il], *hs = g->snap0_lin_hist[il];
+        ok = ds4_gpu_tensor_copy(save ? ss : st, 0, save ? st : ss, 0, state_bytes) != 0 &&
+             ds4_gpu_tensor_copy(save ? hs : ht, 0, save ? ht : hs, 0, hist_bytes) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_copy(save ? g->snap0_ple_hist : g->ple_hist, 0,
+                                 save ? g->ple_hist : g->snap0_ple_hist, 0, ple_bytes) != 0;
+    }
+    if (!ds4_gpu_end_commands()) ok = false;
+    if (save) {
+        memcpy(g->snap0_ple_prev, g->ple_prev, sizeof(g->ple_prev));
+        g->snap0_pos = g->pos;
+        g->snap0_mrope_delta = g->mrope_delta;
+    } else {
+        memcpy(g->ple_prev, g->snap0_ple_prev, sizeof(g->ple_prev));
+        g->pos = g->snap0_pos;
+        g->mrope_delta = g->snap0_mrope_delta;
     }
     return ok;
 }
@@ -70133,6 +70207,11 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
      * draft only needs the snapshot restored, not a replay of first_token */
     g->snap_after_first = g->snap_ple_hist != NULL;
     g->snap_valid = false;
+    /* B2/B3: under exact sampling the server may rewind to block_start to
+     * resample the boundary token; snapshot that state now (g->pos == pos ==
+     * block_start) so the rewind restores in O(1) instead of full replay. */
+    g->snap0_valid = exact_sampling && qwen4_graph_ensure_snap0(g) &&
+                     qwen4_graph_state_copy0(g, true);
     if (!qwen4_graph_forward_tokens(g, m, w, toks, 2, rows, true)) {
         g->snap_after_first = false;
         if (errlen) snprintf(err, errlen, "Qwen3.8 mtp: verify failed");
@@ -79694,6 +79773,12 @@ void ds4_session_rewind(ds4_session *s, int pos) {
          * the recurrent state and the kept tokens are replayed on the next eval */
         ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
         if (g->snap_valid && g->snap_pos == (uint32_t)pos && qwen4_graph_state_copy(g, false)) {
+            g->snap_valid = false;
+            if (g->mtp_pos > (uint32_t)pos) g->mtp_pos = (uint32_t)pos;
+        } else if (g->snap0_valid && g->snap0_pos == (uint32_t)pos &&
+                   qwen4_graph_state_copy0(g, false)) {
+            /* B2/B3: exact-sampling rewind to block_start restored from snap0 */
+            g->snap0_valid = false;
             g->snap_valid = false;
             if (g->mtp_pos > (uint32_t)pos) g->mtp_pos = (uint32_t)pos;
         } else {
