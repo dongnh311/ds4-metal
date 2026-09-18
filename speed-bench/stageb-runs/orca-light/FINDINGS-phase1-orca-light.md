@@ -56,9 +56,9 @@ two `ds4.qwen4.ngram.*` KV keys. Phase 1 inverts exactly that:
   boundary decision); broad uncensoring is unaffected. If maximal parity with
   the heavy build is wanted, build an Orca-specific Q4_1 sidecar from the 147 GB
   file's embedded BF16 n-gram (fallback; not needed for functional uncensoring).
-- Model artifacts → HuggingFace (dongnhdev), never git. HF upload pending user
-  confirmation of the target repo (existing repo is the heavy "NNgram" variant;
-  this is the light variant — likely a new repo or a light/ revision).
+- Model artifacts → HuggingFace (dongnhdev), never git. **UPLOADED** to new repo
+  `dongnhdev/Qwen3.8-Flash-Next-OrcaUncensored-IQ2-Light` (light main 41.73 GiB +
+  PLE Q4_1 sidecar 29.80 GiB + README); self-contained at Ivan parity.
 
 ## Receipts
 scratchpad: strip.out (Stripped -> … e078c60a…), orca_light_coherence.out,
