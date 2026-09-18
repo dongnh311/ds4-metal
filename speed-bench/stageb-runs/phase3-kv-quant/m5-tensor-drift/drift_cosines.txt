@@ -1,0 +1,35 @@
+# M5 tensor-route (Metal4 matmul2d TensorOps) drift A/B — M5 Pro 64GiB, light Orca
+# tensor route: ON = default (g_metal4_tensor_api auto-on on M5), OFF = --quality (g_quality_mode gates it off; also changes other kernels)
+
+## [runtime drift] same model, tensor ON vs OFF
+### Q8 @512:
+vocab=248320  changed_logits=248320
+logit max_abs_diff=1.04557  rms_diff=0.210731  cosine=0.99360976
+argmax_Q8on=16 argmax_Q8off=16  top1_match=True
+top5_Q8on=[16, 17, 20, 23, 21]
+top5_Q8off=[16, 17, 20, 23, 21]
+top5_overlap=5/5
+### Q8 @4096:
+vocab=248320  changed_logits=248320
+logit max_abs_diff=1.45166  rms_diff=0.252817  cosine=0.98847411
+argmax_Q8on=76 argmax_Q8off=76  top1_match=True
+top5_Q8on=[76, 23402, 980, 25050, 977]
+top5_Q8off=[76, 23402, 980, 25050, 977]
+top5_overlap=5/5
+### imat @512:
+vocab=248320  changed_logits=248320
+logit max_abs_diff=1.28609  rms_diff=0.195205  cosine=0.99306844
+argmax_IMATon=16 argmax_IMAToff=17  top1_match=False
+top5_IMATon=[16, 17, 20, 23, 19]
+top5_IMAToff=[17, 16, 20, 23, 19]
+top5_overlap=5/5
+
+## [true quant quality, isolating drift: both on legacy/OFF path]
+### Q8-off vs imat-off @512:
+vocab=248320  changed_logits=248320
+logit max_abs_diff=3.39094  rms_diff=0.547068  cosine=0.95363201
+argmax_Q8off=16 argmax_IMAToff=17  top1_match=False
+top5_Q8off=[16, 17, 20, 23, 21]
+top5_IMAToff=[17, 16, 20, 23, 19]
+top5_overlap=4/5
+### (for reference) Q8-on vs imat-on @512 (drift on both): cosine 0.94937258
