@@ -5254,10 +5254,10 @@ static bool weights_qwen4_layer_has_required(const ds4_layer_weights *l, uint32_
     return true;
 }
 
-/* Dense Qwen projections: Q8_0, F16 or F32, plus BF16 and Q4_0 from the upstream GGUF. */
+/* Dense Qwen projections: Q8_0, F16 or F32, plus BF16, Q4_0 and Q4_K from the upstream GGUF. */
 static bool tensor_type_is_qwen4_dense(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_F16 || type == DS4_TENSOR_F32 ||
-           type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q4_0;
+           type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q4_0 || type == DS4_TENSOR_Q4_K;
 }
 
 static void tensor_expect_qwen4_dense_layout(
@@ -54956,7 +54956,7 @@ static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
 
 static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
     return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_F32 ||
-                 t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q4_0);
+                 t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q4_0 || t->type == DS4_TENSOR_Q4_K);
 }
 
 /* expert types the tiled prefill GEMM stages (kernel_qwen4_moe_mm_*) */
@@ -55234,6 +55234,7 @@ static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
     case DS4_TENSOR_F16:  rc = ds4_gpu_matmul_f16_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok); break;
     case DS4_TENSOR_F32:  rc = ds4_gpu_matmul_f32_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok); break;
     case DS4_TENSOR_Q4_0: rc = ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim, x, n_tok); break;
+    case DS4_TENSOR_Q4_K: rc = ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim, x, n_tok); break;
     case DS4_TENSOR_BF16: {
         ds4_gpu_tensor *outs[1] = { out };
         const uint64_t offs[1] = { w->abs_offset };
