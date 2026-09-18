@@ -45064,6 +45064,7 @@ static uint64_t glm_graph_host_memory_bytes(void) {
 #endif
 }
 
+
 #ifndef DS4_NO_GPU
 typedef struct ds4_glm_gpu_graph {
     const ds4_weights *weights;
@@ -73476,12 +73477,19 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                          * the routed experts are PAGED (budgeted separately as the
                          * expert cache), so the resident model is the non-routed
                          * weights, not the full span. */
+                        /* Item P2 (fix over-allocation): charge the FULL model span,
+                         * not the optimistic non-routed subset. The engine's own
+                         * memory plan treats the whole GGUF span (~41.72 GiB) as
+                         * committed and is proven swap-free at the default cache; the
+                         * earlier non-routed override (6.32 GiB) made the manager
+                         * think ~35 GiB more was free than actually is, so it granted
+                         * a 43 GiB cache that forced ~18-20 GiB of swap on a busy
+                         * 64 GiB machine (zero-swap DoD violation, measured). Using
+                         * the span keeps the grant inside the engine's safe envelope;
+                         * the shared routed-expert pages counted here are the same
+                         * bytes the pager caches, so this is conservative, not
+                         * double-counted against the DoD. */
                         uint64_t model_bytes = e->startup_model_span_bytes;
-                        uint64_t nr = 0;
-                        if (e->ssd_streaming &&
-                            weights_streaming_non_routed_bytes(&e->weights, &nr) && nr > 0) {
-                            model_bytes = nr;
-                        }
                         ds4_memory_manager_set_model_bytes(&mgr, model_bytes);
                         /* Use the env directly: s->qwen4_graph.kv_fp8 is set just
                          * below (before graph_alloc), after this planning block. */
@@ -73495,6 +73503,30 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                         uint64_t plan_kv = 0, plan_exp = 0, plan_ws = 0, plan_hr = 0;
                         ds4_memory_manager_get_plan(&mgr, &plan_kv, &plan_exp, &plan_ws, &plan_hr);
                         const double gib = 1024.0 * 1024.0 * 1024.0;
+                        /* Item P2 (fix memmgr over-allocation): compute_plan sizes
+                         * the cache from TOTAL RAM with a flat 20% headroom, which
+                         * on a busy 64 GiB Mac granted a 43 GiB cache that did not
+                         * fit and forced ~18-20 GiB of swap (zero-swap DoD
+                         * violation, measured). Cap the grant against (a) the whole
+                         * bundle — caching more than exists is pure waste — and (b)
+                         * RAM the OS can actually hand out right now, reserving KV,
+                         * the graph buffers allocated just below, model pages not
+                         * yet faulted, and a safety slack. This keeps the cache as
+                         * large as fits WITHOUT swapping. */
+                        /* Never cache more than the whole bundle holds — caching
+                         * beyond the data is pure waste. (Swap-safety comes from
+                         * charging the full model span above.) */
+                        {
+                            const uint64_t bundle_total =
+                                s->qwen4_graph.pager ? s->qwen4_graph.pager->bundle_size : 0;
+                            if (bundle_total > 0 && plan_exp > bundle_total) {
+                                fprintf(stderr,
+                                        "ds4: memory manager: capping expert cache at bundle "
+                                        "size %.2f GiB (plan %.2f GiB)\n",
+                                        bundle_total / gib, plan_exp / gib);
+                                plan_exp = bundle_total;
+                            }
+                        }
                         if (plan_exp > cache_budget) {
                             fprintf(stderr,
                                     "ds4: memory manager: expert cache budget "
