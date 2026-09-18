@@ -58394,6 +58394,63 @@ static ds4_gpu_tensor *qwen4_kcache(ds4_qwen4_gpu_graph *g, uint32_t il) {
 static ds4_gpu_tensor *qwen4_vcache(ds4_qwen4_gpu_graph *g, uint32_t il) {
     return qwen4_paged_kv_active(g) ? g->paged_v_staging_full[il] : g->layer_v_cache[il];
 }
+/* K/V dynamic-range measurement (spec §25 Phase 3 item 1 "K/V dynamic range").
+ * Accumulated over the paged-KV path (DS4_QWEN4_KV_PAGED) as a PURE READ of the
+ * f16 K/V attn_prep wrote -- it does not change output, so gate #KV stays
+ * bit-identical. Printed once at qwen4 session teardown. Informs the FP8 format
+ * choice: E4M3 represents +/-448, E5M2 +/-57344; per-token scaling is warranted
+ * when global absmax >> the mean per-(token,head) absmax. */
+static double   g_kvr_k_absmax = 0.0, g_kvr_v_absmax = 0.0;
+static double   g_kvr_k_sumsq = 0.0,  g_kvr_v_sumsq = 0.0;
+static double   g_kvr_k_amax_sum = 0.0, g_kvr_v_amax_sum = 0.0; /* sum of per-(tok,head) absmax */
+static uint64_t g_kvr_k_amax_n = 0,   g_kvr_v_amax_n = 0;       /* # of (tok,head) vectors */
+static uint64_t g_kvr_k_count = 0,    g_kvr_v_count = 0;        /* # of elements */
+static float    g_kvr_k_min =  3.4e38f, g_kvr_k_max = -3.4e38f;
+static float    g_kvr_v_min =  3.4e38f, g_kvr_v_max = -3.4e38f;
+
+static void qwen4_kvr_accum(const uint8_t *p, uint32_t nelem, bool is_v) {
+    const uint16_t *h = (const uint16_t *)p;
+    double amax = 0.0, sq = 0.0;
+    float vmin = 3.4e38f, vmax = -3.4e38f;
+    for (uint32_t i = 0; i < nelem; i++) {
+        float v = f16_to_f32(h[i]);
+        float a = v < 0.0f ? -v : v;
+        if (a > amax) amax = a;
+        sq += (double)v * (double)v;
+        if (v < vmin) vmin = v;
+        if (v > vmax) vmax = v;
+    }
+    if (is_v) {
+        if (amax > g_kvr_v_absmax) g_kvr_v_absmax = amax;
+        g_kvr_v_amax_sum += amax; g_kvr_v_amax_n++;
+        g_kvr_v_sumsq += sq; g_kvr_v_count += nelem;
+        if (vmin < g_kvr_v_min) g_kvr_v_min = vmin;
+        if (vmax > g_kvr_v_max) g_kvr_v_max = vmax;
+    } else {
+        if (amax > g_kvr_k_absmax) g_kvr_k_absmax = amax;
+        g_kvr_k_amax_sum += amax; g_kvr_k_amax_n++;
+        g_kvr_k_sumsq += sq; g_kvr_k_count += nelem;
+        if (vmin < g_kvr_k_min) g_kvr_k_min = vmin;
+        if (vmax > g_kvr_k_max) g_kvr_k_max = vmax;
+    }
+}
+
+static void qwen4_kvr_report(void) {
+    if (g_kvr_k_count == 0) return;
+    double k_rms = g_kvr_k_count ? sqrt(g_kvr_k_sumsq / (double)g_kvr_k_count) : 0.0;
+    double v_rms = g_kvr_v_count ? sqrt(g_kvr_v_sumsq / (double)g_kvr_v_count) : 0.0;
+    double k_meantok = g_kvr_k_amax_n ? g_kvr_k_amax_sum / (double)g_kvr_k_amax_n : 0.0;
+    double v_meantok = g_kvr_v_amax_n ? g_kvr_v_amax_sum / (double)g_kvr_v_amax_n : 0.0;
+    fprintf(stderr,
+        "ds4: K/V dynamic range (paged KV, K=%llu V=%llu elems):\n"
+        "  K: absmax=%.4f mean|tok|=%.4f rms=%.4f range=[%.4f, %.4f]\n"
+        "  V: absmax=%.4f mean|tok|=%.4f rms=%.4f range=[%.4f, %.4f]\n"
+        "  FP8 fit: E4M3 max=+/-448, E5M2 max=+/-57344; per-token scale warranted if absmax>>mean|tok|.\n",
+        (unsigned long long)g_kvr_k_count, (unsigned long long)g_kvr_v_count,
+        g_kvr_k_absmax, k_meantok, k_rms, g_kvr_k_min, g_kvr_k_max,
+        g_kvr_v_absmax, v_meantok, v_rms, g_kvr_v_min, g_kvr_v_max);
+}
+
 static bool qwen4_paged_kv_roundtrip(ds4_qwen4_gpu_graph *g, uint32_t il,
                                      uint32_t pos0, uint32_t T) {
     if (!qwen4_paged_kv_active(g)) return true;
@@ -58423,6 +58480,8 @@ static bool qwen4_paged_kv_roundtrip(ds4_qwen4_gpu_graph *g, uint32_t il,
             const uint64_t foff = (uint64_t)pos * tok_bytes + (uint64_t)h * head_bytes;
             ok = ds4_kv_cache_commit(c, il, h,       pos, kflat + foff, head_bytes) &&
                  ds4_kv_cache_commit(c, il, Hkv + h, pos, vflat + foff, head_bytes);
+            qwen4_kvr_accum(kflat + foff, D, false);  /* K dynamic-range stats */
+            qwen4_kvr_accum(vflat + foff, D, true);   /* V dynamic-range stats */
         }
     }
     /* materialize the whole [0, pos0+T) range paged -> staging, interleaved */
@@ -73538,6 +73597,7 @@ void ds4_session_free(ds4_session *s) {
 #endif
 #ifdef DS4_HAS_QWEN4_METAL
         if (ds4_session_is_qwen4(s)) {
+            qwen4_kvr_report();  /* K/V dynamic range (Phase 3 item 1); no-op if paged KV unused */
             if (s->engine && s->engine->glm_mtp_timing && s->qwen4_spec_cycles) {
                 fprintf(stderr, "ds4: Qwen3.8 mtp: %" PRIu64 " verify cycles, %" PRIu64 " drafts accepted (%.1f%%)\n",
                         s->qwen4_spec_cycles, s->qwen4_spec_accepted,
