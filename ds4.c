@@ -139,6 +139,7 @@ static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
 #include "ds4_gpu.h"
 #include "ds4_expert_pager.h"
 #include "ds4_kv_cache.h"
+#include "ds4_memory_manager.h"
 #endif
 
 /* Non-CUDA builds (Mac/Metal, CPU-only) never link ds4_cuda.cu. Provide
@@ -57873,6 +57874,23 @@ static ds4_gpu_tensor *qwen4_graph_alloc_f32(uint64_t n) {
     return t;
 }
 
+/* Approximate KV-cache bytes for the 4-way budget planner (item c). Full-
+ * attention layers only; FP8-aware — the E4M3 byte cache + per-64-block fp16
+ * scale (item b) roughly halve K/V vs BF16. Indexer-K stays f32; block-key
+ * (small) is omitted. This is a budget estimate, not an allocation. */
+static uint64_t qwen4_kv_bytes_estimate(uint32_t ctx, bool fp8) {
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t kv = fp8 ? (kv_dim * 2u + (kv_dim / 64u) * 4u)   /* K+V bytes + K+V fp16 scales */
+                            : (kv_dim * 2u * 2u);                    /* K+V half */
+    const uint64_t ik = (uint64_t)DS4_N_INDEXER_HEAD_DIM * 4u;      /* indexer K, f32 (not FP8'd) */
+    const uint64_t per_full = (uint64_t)ctx * (kv + ik);
+    uint32_t n_full = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!ds4_qwen4_layer_is_linear(il)) n_full++;
+    }
+    return per_full * n_full;
+}
+
 static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint32_t ctx_cap, uint32_t cap_tokens,
                               bool mtp) {
     /* The pager is opened by the caller before this call and is not part of
@@ -73309,8 +73327,56 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                  * means the resident cache cannot over-commit: it is the
                  * remainder of the working set after the model span, KV and
                  * buffers, not a second independent claim on RAM. */
-                const uint64_t cache_budget =
+                uint64_t cache_budget =
                     ds4_engine_dynamic_expert_cache_bytes(e);
+                /* Plan 4 Task 3 (item c): unified 4-way memory manager. Opt-in
+                 * via DS4_QWEN4_MEMMGR so the default path is byte-for-byte
+                 * unchanged. It computes model + KV(FP8-aware) + expert-cache +
+                 * workspace against total RAM; because FP8 KV (item b) roughly
+                 * halves the KV term, the planner can grant the expert cache the
+                 * freed budget -- the lever for the 220K read-GB/hit-rate wall. */
+                if (getenv("DS4_QWEN4_MEMMGR") != NULL) {
+                    ds4_memory_manager mgr;
+                    const uint64_t ram = glm_graph_host_memory_bytes();
+                    if (ram > 0 && ds4_memory_manager_init(&mgr, ram)) {
+                        /* Resident model bytes for the budget: under --ssd-streaming
+                         * the routed experts are PAGED (budgeted separately as the
+                         * expert cache), so the resident model is the non-routed
+                         * weights, not the full span. */
+                        uint64_t model_bytes = e->startup_model_span_bytes;
+                        uint64_t nr = 0;
+                        if (e->ssd_streaming &&
+                            weights_streaming_non_routed_bytes(&e->weights, &nr) && nr > 0) {
+                            model_bytes = nr;
+                        }
+                        ds4_memory_manager_set_model_bytes(&mgr, model_bytes);
+                        /* Use the env directly: s->qwen4_graph.kv_fp8 is set just
+                         * below (before graph_alloc), after this planning block. */
+                        const bool want_fp8 = getenv("DS4_QWEN4_KV_FP8") != NULL;
+                        const uint64_t kv_est =
+                            qwen4_kv_bytes_estimate((uint32_t)ctx_size, want_fp8);
+                        ds4_memory_manager_compute_plan(&mgr, (uint32_t)ctx_size, kv_est,
+                                                        cache_budget,
+                                                        e->ssd_streaming_prefill_headroom_bytes);
+                        ds4_memory_manager_report(&mgr);
+                        uint64_t plan_kv = 0, plan_exp = 0, plan_ws = 0, plan_hr = 0;
+                        ds4_memory_manager_get_plan(&mgr, &plan_kv, &plan_exp, &plan_ws, &plan_hr);
+                        const double gib = 1024.0 * 1024.0 * 1024.0;
+                        if (plan_exp > cache_budget) {
+                            fprintf(stderr,
+                                    "ds4: memory manager: expert cache budget "
+                                    "%.2f -> %.2f GiB (model %.2f + KV %.2f GiB %s of %.2f GiB RAM)\n",
+                                    cache_budget / gib, plan_exp / gib, model_bytes / gib,
+                                    kv_est / gib, want_fp8 ? "FP8" : "BF16", ram / gib);
+                            cache_budget = plan_exp;
+                        } else {
+                            fprintf(stderr,
+                                    "ds4: memory manager: keeping engine expert budget "
+                                    "%.2f GiB (plan would give %.2f GiB)\n",
+                                    cache_budget / gib, plan_exp / gib);
+                        }
+                    }
+                }
                 if (cache_budget == 0) {
                     fprintf(stderr,
                             "ds4: Warning: no expert cache budget; pager stays "

@@ -79,23 +79,25 @@ bool ds4_memory_manager_compute_plan(ds4_memory_manager *mgr,
     mgr->expert_cache_bytes = expert_bytes;
     mgr->workspace_bytes = workspace_bytes;
     
-    /* Available budget after model and headroom */
-    uint64_t available = mgr->total_ram_bytes - mgr->model_bytes - mgr->headroom_bytes;
-    
-    /* Split available between KV and expert cache (60/40 default) */
-    uint64_t kv_budget = (uint64_t)((double)available * 0.6);
-    uint64_t expert_budget = available - kv_budget;
-    
-    /* Cap at requested sizes */
-    if (kv_bytes > kv_budget) {
-        kv_budget = kv_bytes;  /* Need more than planned - reduce other allocations */
-        expert_budget = available - kv_budget;
-    }
-    
+    /* Available budget after model weights and OS headroom (underflow-safe). */
+    uint64_t committed = mgr->model_bytes + mgr->headroom_bytes;
+    uint64_t available = committed < mgr->total_ram_bytes ?
+                         mgr->total_ram_bytes - committed : 0;
+
+    /* KV gets exactly what it needs (capped at available); the expert cache
+     * gets the remainder after KV and workspace. This is the DoD lever: FP8 KV
+     * shrinks kv_bytes, so the expert cache — the SSD read-GB / hit-rate wall at
+     * long context — gets the freed budget. (The old 60/40 split gave KV 60%
+     * even when it needed far less, starving the expert cache.) */
+    uint64_t kv_budget = kv_bytes <= available ? kv_bytes : available;
+    uint64_t after_kv = available - kv_budget;
+    uint64_t ws_budget = workspace_bytes <= after_kv ? workspace_bytes : after_kv;
+    uint64_t expert_budget = after_kv - ws_budget;
+
     mgr->kv_budget_bytes = kv_budget;
     mgr->expert_budget_bytes = expert_budget;
-    mgr->workspace_budget_bytes = workspace_bytes;
-    mgr->os_headroom_bytes = mgr->total_ram_bytes - mgr->model_bytes - kv_budget - expert_budget - workspace_bytes;
+    mgr->workspace_budget_bytes = ws_budget;
+    mgr->os_headroom_bytes = mgr->total_ram_bytes - mgr->model_bytes - kv_budget - expert_budget - ws_budget;
     mgr->plan_computed = true;
     
     fprintf(stderr, "ds4_memory_manager: plan computed for %u ctx tokens\n", ctx_tokens);

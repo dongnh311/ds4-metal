@@ -1,0 +1,16 @@
+== BF16 KV ==
+  KV budget:      7321633280 bytes (6.82 GiB)
+  Expert budget:  40863998157 bytes (38.06 GiB)
+Model weights:    6789949952 bytes (6.32 GiB)
+Context:          220001 tokens
+KV budget:        7321633280 bytes (6.82 GiB)
+Expert budget:    40863998157 bytes (38.06 GiB)
+ds4: memory manager: expert cache budget 0.00 -> 38.06 GiB (model 6.32 + KV 6.82 GiB BF16 of 64.00 GiB RAM)
+== FP8 KV ==
+  KV budget:      4484500384 bytes (4.18 GiB)
+  Expert budget:  43701131053 bytes (40.70 GiB)
+Model weights:    6789949952 bytes (6.32 GiB)
+Context:          220001 tokens
+KV budget:        4484500384 bytes (4.18 GiB)
+Expert budget:    43701131053 bytes (40.70 GiB)
+ds4: memory manager: expert cache budget 0.00 -> 40.70 GiB (model 6.32 + KV 4.18 GiB FP8 of 64.00 GiB RAM)
