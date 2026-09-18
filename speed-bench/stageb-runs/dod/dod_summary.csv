@@ -1,0 +1,6 @@
+config,ctx,cache_target,cache_effective_GiB,hit_rate,gen_steady_tps,swap_growth_GiB,diskwrites,note
+resident-Task1,4096,full-resident(no-SSD),n/a,n/a,29.01,0,0,compute ceiling (DRAM-BW-bound; nsg-invariant)
+adaptive-memmgr,32768,swap-safe,1.36,0.325,4.11,0.21,0,zero-swap; SSD-read-bound (small cache)
+forced-16GB,32768,16GB,14.58,0.393,1.66,12.98,0,SWAP THRASH
+forced-34GB,32768,36GB,34.10,0.842,1.37,29.95,0,SWAP THRASH (whole bundle)
+adaptive-memmgr,220000,swap-safe,0.00,n/a,<1(I/O-bound crawl),~0,0,zero-swap cap=0GiB: KV7+buf17.7+model eat budget -> re-read every access

@@ -1,0 +1,20 @@
+ds4: Qwen BF16 n-grams: 95.37 GiB, disk reads only
+ds4: Metal device Apple M5 Pro, 64.00 GiB RAM
+ds4: Metal 4 tensor API enabled for Tensor kernels
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=on
+ds4: Metal SSD streaming mode enabled; full model residency and warmup are skipped
+ds4: metal SSD streaming cache target 36.00 GiB; effective 35.52 GiB = 1.42 GiB prefill headroom + 34.10 GiB dynamic cache (24576 experts, 1.42 MiB each)
+ds4: Metal SSD static weights remain pageable to preserve runtime headroom
+ds4: SSD streaming mixed-precision model: 1/49 routed layers off the slab size class will bypass the expert cache and read experts via mapped model views
+ds4: SSD streaming initial metal model map (1 spans, 41.72 GiB tensor span)
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 1.05 GiB (raw 0.82 + compressed 0.23) + buffers 7.42 GiB + resident model 41.72 GiB + expert cache 34.10 GiB + prefill expert reserve 1.42 GiB = 85.70 GiB planned
+ds4: memory detail: ctx=32897 prefill_cap=8192 raw_kv_rows=32897 compressed_kv_rows=8225 backend=metal
+ds4-bench: context buffers 8664.76 MiB (ctx=32897, backend=metal, prefill_chunk=8192, raw_kv_rows=32897, compressed_kv_rows=8225)
+ds4_expert_pager: opened 73728 bundles from qwen38-experts.index.json
+ds4_expert_pager: index says 48 layers x 512 experts = 24576 experts, 1489920 B/expert (1.4209 MiB), 36616273920 B total (34.10 GiB); bin=36842766336 B (34.31 GiB); gguf_sha256=ed238d8d50c6fb4b504c2796c3bc82b2a9f6c21566ad29bdbfdbadfe01e28d7a
+ds4: Expert pager opened, SSD streaming enabled
+ds4_expert_pager: resident cache 34.10 GiB, 73728 slots (sized by 422400 B min bundle; byte budget is the cap), policy=E2-scored
+DS4_PAGER_STATS requests=431013 hits=362841 misses=68172 hit_rate=84.1833 pread_bytes=33856942080 pread_MB=32288.50 latency_ms=29159.389 bundle_bytes=36842766336 n_experts=24576 per_expert_bytes=1489920
+ds4: expert pager stats requests=431013 hits=362841 misses=68172 hit_rate=84.18% read=32288.50 MB latency=29159.4 ms (bundle 34.31 GiB, 24576 experts)
+ds4-bench: peak footprint 41.03 GiB, swap 32.57 GiB (start 2.62 GiB, +29.95 GiB)

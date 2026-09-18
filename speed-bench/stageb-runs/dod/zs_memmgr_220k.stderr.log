@@ -1,0 +1,49 @@
+ds4: Qwen BF16 n-grams: 95.37 GiB, disk reads only
+ds4: Metal device Apple M5 Pro, 64.00 GiB RAM
+ds4: Metal 4 tensor API enabled for Tensor kernels
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=on
+ds4: Metal SSD streaming mode enabled; full model residency and warmup are skipped
+ds4: WARNING: SSD streaming expert cache stays at 1 experts: the floor of 980 experts (1.36 GiB cache + 1.42 GiB prefill reserve) plus the 41.72 GiB resident model and 17.27 GiB context does not fit the 56.00 GiB working set; expect a re-read per access
+ds4: SSD streaming auto cache budget
+ds4:   metal recommends 56.00 GiB working set
+ds4:   using 55% total for model + cached experts: 31.00 GiB
+ds4:   non-routed weights: 6.32 GiB (resident model span charged: 41.72 GiB)
+ds4:   routed expert size: 1.42 MiB
+ds4:   expert budget before prefill reserve: 1 (0.00 GiB)
+ds4: SSD streaming prefill reserve reduced from 1.42 to 0.00 GiB to honor the 0.00 GiB cache target
+ds4: metal SSD streaming cache target 0.00 GiB; effective 0.00 GiB = 0.00 GiB prefill headroom + 0.00 GiB dynamic cache (1 experts, 1.42 MiB each)
+ds4: Metal SSD static weights locked 6.32 GiB; pageable 0.00 GiB
+ds4: SSD streaming mixed-precision model: 1/49 routed layers off the slab size class will bypass the expert cache and read experts via mapped model views
+ds4: WARNING: SSD streaming expert cache (1 experts) is under twice the per-token routed working set (48 layers x 10 experts = 480); expect heavy thrashing below 1.33 GiB
+ds4: SSD streaming initial metal model map (1 spans, 41.72 GiB tensor span)
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 7.00 GiB (raw 5.46 + compressed 1.54) + buffers 10.27 GiB + resident model 41.72 GiB + expert cache 0.00 GiB = 58.99 GiB planned
+ds4: memory detail: ctx=220129 prefill_cap=8192 raw_kv_rows=220129 compressed_kv_rows=55033 backend=metal
+ds4-bench: context buffers 17684.10 MiB (ctx=220129, backend=metal, prefill_chunk=8192, raw_kv_rows=220129, compressed_kv_rows=55033)
+ds4_expert_pager: opened 73728 bundles from qwen38-experts.index.json
+ds4_expert_pager: index says 48 layers x 512 experts = 24576 experts, 1489920 B/expert (1.4209 MiB), 36616273920 B total (34.10 GiB); bin=36842766336 B (34.31 GiB); gguf_sha256=ed238d8d50c6fb4b504c2796c3bc82b2a9f6c21566ad29bdbfdbadfe01e28d7a
+ds4: Expert pager opened, SSD streaming enabled
+ds4_memory_manager: initialized with 68719476736 bytes RAM (64.00 GiB)
+ds4_memory_manager: plan computed for 220129 ctx tokens
+  Model:          6789949952 bytes
+  KV budget:      7325893120 bytes (6.82 GiB)
+  Expert budget:  40859738317 bytes (38.05 GiB)
+  Workspace:      0 bytes
+  OS headroom:    13743895347 bytes
+
+=== Memory Manager Report ===
+Total RAM:        68719476736 bytes (64.00 GiB)
+Model weights:    6789949952 bytes (6.32 GiB)
+Context:          220129 tokens
+
+--- Computed Budget ---
+KV budget:        7325893120 bytes (6.82 GiB)
+Expert budget:    40859738317 bytes (38.05 GiB)
+Workspace:        0 bytes
+OS headroom:      13743895347 bytes (12.80 GiB)
+===========================
+
+ds4: memory manager: grabbable 9.91 GiB, swap-safe cap 0.00 GiB (reserve 12.82)
+ds4: memory manager: keeping engine expert budget 0.00 GiB (plan would give 0.00 GiB)
+ds4_expert_pager: resident cache 0.00 GiB, 3 slots (sized by 422400 B min bundle; byte budget is the cap), policy=E2-scored
+ds4_expert_pager: WARNING: 3 slots cannot hold one step's expert set; this run will re-read on every access (read volume grows with tokens, not with distinct experts)

@@ -1,0 +1,12 @@
+ds4: WARNING: SSD streaming expert cache stays at 1 experts: the floor of 980 experts (1.36 GiB cache + 1.42 GiB prefill reserve) plus the 41.72 GiB resident model and 17.27 GiB context does not fit the 56.00 GiB working set; expect a re-read per access
+ds4:   expert budget before prefill reserve: 1 (0.00 GiB)
+ds4: SSD streaming prefill reserve reduced from 1.42 to 0.00 GiB to honor the 0.00 GiB cache target
+ds4: metal SSD streaming cache target 0.00 GiB; effective 0.00 GiB = 0.00 GiB prefill headroom + 0.00 GiB dynamic cache (1 experts, 1.42 MiB each)
+ds4: WARNING: SSD streaming expert cache (1 experts) is under twice the per-token routed working set (48 layers x 10 experts = 480); expect heavy thrashing below 1.33 GiB
+ds4: memory: KV 7.00 GiB (raw 5.46 + compressed 1.54) + buffers 10.27 GiB + resident model 41.72 GiB + expert cache 0.00 GiB = 58.99 GiB planned
+ds4-bench: context buffers 17684.10 MiB (ctx=220129, backend=metal, prefill_chunk=8192, raw_kv_rows=220129, compressed_kv_rows=55033)
+  Expert budget:  40859738317 bytes (38.05 GiB)
+Expert budget:    40859738317 bytes (38.05 GiB)
+ds4: memory manager: grabbable 9.91 GiB, swap-safe cap 0.00 GiB (reserve 12.82)
+ds4: memory manager: keeping engine expert budget 0.00 GiB (plan would give 0.00 GiB)
+ds4_expert_pager: WARNING: 3 slots cannot hold one step's expert set; this run will re-read on every access (read volume grows with tokens, not with distinct experts)

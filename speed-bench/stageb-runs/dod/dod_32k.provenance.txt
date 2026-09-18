@@ -1,0 +1,7 @@
+ds4: metal SSD streaming cache target 36.00 GiB; effective 35.52 GiB = 1.42 GiB prefill headroom + 34.10 GiB dynamic cache (24576 experts, 1.42 MiB each)
+ds4: memory: KV 1.05 GiB (raw 0.82 + compressed 0.23) + buffers 7.42 GiB + resident model 41.72 GiB + expert cache 34.10 GiB + prefill expert reserve 1.42 GiB = 85.70 GiB planned
+ds4-bench: context buffers 8664.76 MiB (ctx=32897, backend=metal, prefill_chunk=8192, raw_kv_rows=32897, compressed_kv_rows=8225)
+ds4_expert_pager: index says 48 layers x 512 experts = 24576 experts, 1489920 B/expert (1.4209 MiB), 36616273920 B total (34.10 GiB); bin=36842766336 B (34.31 GiB); gguf_sha256=ed238d8d50c6fb4b504c2796c3bc82b2a9f6c21566ad29bdbfdbadfe01e28d7a
+DS4_PAGER_STATS requests=431013 hits=362841 misses=68172 hit_rate=84.1833 pread_bytes=33856942080 pread_MB=32288.50 latency_ms=29159.389 bundle_bytes=36842766336 n_experts=24576 per_expert_bytes=1489920
+ds4: expert pager stats requests=431013 hits=362841 misses=68172 hit_rate=84.18% read=32288.50 MB latency=29159.4 ms (bundle 34.31 GiB, 24576 experts)
+ds4-bench: peak footprint 41.03 GiB, swap 32.57 GiB (start 2.62 GiB, +29.95 GiB)
