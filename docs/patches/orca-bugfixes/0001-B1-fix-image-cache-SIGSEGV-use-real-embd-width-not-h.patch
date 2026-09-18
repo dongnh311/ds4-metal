@@ -1,0 +1,43 @@
+From 73c08a62e25b9ab52b67c1bbc9a052be6a6af1d3 Mon Sep 17 00:00:00 2001
+From: dongnh311 <40257252+dongnh311@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 19:08:59 +0700
+Subject: [PATCH 1/3] =?UTF-8?q?B1:=20fix=20image-cache=20SIGSEGV=20?=
+ =?UTF-8?q?=E2=80=94=20use=20real=20embd=20width,=20not=20hardcoded=204096?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+server_encode_image told server_image_cache_put every vision row was 4096
+floats wide, but the Qwen3.8 vision encoder allocates DS4_N_EMBD (2560) wide
+rows (mmproj projection_dim validated == n_embd at load). The 4096 literal made
+the cache memcpy over-read (4096-2560)*token_count*4 bytes past the source
+embedding -> heap over-read -> SIGSEGV on larger images. Use
+ds4_engine_embd_dim(s->engine) (existing accessor). Matches the dongnh311/scallop
+fix. One call site; self-contained.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CNUVtqAjCzPC17P5jQaV2s
+---
+ ds4_server.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/ds4_server.c b/ds4_server.c
+index ed853c6..2e281d7 100644
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -9856,7 +9856,11 @@ static bool server_encode_image(server *s, const server_image_input *input,
+                                          input->encoded_len, out, err, errlen))
+         return false;
+     server_image_cache_put(&s->image_cache, input, out,
+-                            4096, /* Both supported vision encoders emit 4096-wide rows. */
++                            /* Row width must match the encoder's allocation: the mmproj
++                             * projection dim is validated to equal the model's n_embd at
++                             * load (Qwen3.8 is 2560-wide, not 4096; a wrong width
++                             * over-reads the source embedding in put -> SIGSEGV). */
++                            (uint32_t)ds4_engine_embd_dim(s->engine),
+                             SERVER_IMAGE_CACHE_BYTES);
+     server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding encoded; cache=%zu bytes",
+                s->image_cache.bytes);
+-- 
+2.54.0 (Apple Git-157)
+

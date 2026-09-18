@@ -1,0 +1,94 @@
+From 3c635533eb625ad6131ee793f0413ce772916376 Mon Sep 17 00:00:00 2001
+From: dongnh311 <40257252+dongnh311@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 19:08:59 +0700
+Subject: [PATCH 2/3] B4: load Metal kernels exe-relative first, not
+ CWD-relative (garbage guard)
+
+ds4_gpu_full_source resolved every metal/*.metal only against the process CWD,
+so running the binary from a directory with a stale/mismatched ./metal silently
+compiled the wrong kernels into the Metal library -> garbage output. Resolve the
+kernel dir relative to the executable (_NSGetExecutablePath + realpath + dirname)
+FIRST, add a DS4_METAL_DIR diagnostic env override, keep CWD as fallback, and log
+the chosen source dir once. Validated: PROD ds4 run from the scallop worktree
+(divergent ./metal) now loads exe-relative kernels and stays coherent (was
+garbage before). Self-contained to ds4_metal.m; no new user flag.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CNUVtqAjCzPC17P5jQaV2s
+---
+ ds4_metal.m | 38 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+
+diff --git a/ds4_metal.m b/ds4_metal.m
+index 2cadc4b..eeedf6d 100644
+--- a/ds4_metal.m
++++ b/ds4_metal.m
+@@ -13,6 +13,7 @@
+ #include <float.h>
+ #include <fcntl.h>
+ #include <limits.h>
++#include <libgen.h>
+ #include <time.h>
+ #include <pthread.h>
+ #include <unistd.h>
+@@ -4751,6 +4752,27 @@ static int ds4_gpu_model_map_log_enabled(void) {
+ "\n"
+ "\n";
+ 
++/* Directory containing this executable, resolved once. Metal kernel sources are
++ * loaded relative to it FIRST so a binary run from any working directory compiles
++ * the kernels from the build that produced it -- not a stale ./metal next to the
++ * CWD, which silently compiles mismatched kernels into garbage output (bug B4). */
++static NSString *ds4_gpu_exe_dir(void) {
++    static NSString *cached = nil;
++    static dispatch_once_t once;
++    dispatch_once(&once, ^{
++        char buf[PATH_MAX];
++        uint32_t size = (uint32_t)sizeof(buf);
++        if (_NSGetExecutablePath(buf, &size) != 0) return; /* path too long: fall back to CWD */
++        char resolved[PATH_MAX];
++        const char *full = realpath(buf, resolved) ? resolved : buf;
++        char tmp[PATH_MAX];
++        strncpy(tmp, full, sizeof(tmp) - 1);
++        tmp[sizeof(tmp) - 1] = '\0';
++        cached = [NSString stringWithUTF8String:dirname(tmp)];
++    });
++    return cached;
++}
++
+ static NSString *ds4_gpu_full_source(void) {
+     NSString *base = [NSString stringWithUTF8String:ds4_gpu_source];
+     NSFileManager *fm = [NSFileManager defaultManager];
+@@ -4787,6 +4809,15 @@ static int ds4_gpu_model_map_log_enabled(void) {
+         @[@"DS4_METAL_QWEN4_VISION_SOURCE", @"metal/qwen4_vision.metal"],
+     ];
+ 
++    NSString *exe_dir = ds4_gpu_exe_dir();
++    const char *dir_override = getenv("DS4_METAL_DIR");
++    static dispatch_once_t log_once;
++    dispatch_once(&log_once, ^{
++        fprintf(stderr, "ds4: Metal kernel source dir: %s%s\n",
++                (dir_override && dir_override[0]) ? dir_override
++                    : (exe_dir ? [exe_dir UTF8String] : "(CWD; exe path unresolved)"),
++                (dir_override && dir_override[0]) ? " (DS4_METAL_DIR)" : " (exe-relative)");
++    });
+     NSMutableString *source = [NSMutableString stringWithString:base];
+     for (NSArray<NSString *> *spec in required_sources) {
+         const char *override_path = getenv([spec[0] UTF8String]);
+@@ -4794,6 +4825,13 @@ static int ds4_gpu_model_map_log_enabled(void) {
+         if (override_path && override_path[0]) {
+             [paths addObject:[NSString stringWithUTF8String:override_path]];
+         }
++        if (dir_override && dir_override[0]) {
++            [paths addObject:[[NSString stringWithUTF8String:dir_override]
++                                 stringByAppendingPathComponent:spec[1]]];
++        }
++        if (exe_dir) {
++            [paths addObject:[exe_dir stringByAppendingPathComponent:spec[1]]];
++        }
+         [paths addObject:spec[1]];
+         [paths addObject:[@"./" stringByAppendingString:spec[1]]];
+ 
+-- 
+2.54.0 (Apple Git-157)
+
