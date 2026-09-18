@@ -1,0 +1,15 @@
+PASSED got B expected B (175.0s, 4732 tokens)
+PASSED got C expected C (19.9s, 532 tokens)
+PASSED got 70 expected 70 (34.7s, 911 tokens)
+PASSED got C expected C (204.2s, 5499 tokens)
+PASSED got J expected J (151.0s, 4274 tokens)
+PASSED got 468 expected 468 (69.1s, 2039 tokens)
+PASSED got B expected B (46.5s, 1379 tokens)
+PASSED got E expected E (162.3s, 4708 tokens)
+\triangle AFMds4-eval: retrying incomplete case AIME2025/aime2025-02 with 32000 tokens
+INCOMPLETE got ? expected 588 (564.9s, 16000 tokens)
+PASSED got 588 expected 588 (613.6s, 16914 tokens)
+PASSED got B expected B (45.0s, 1328 tokens)
+PASSED got A expected A (46.6s, 1374 tokens)
+PASSED got 16 expected 16 (45.8s, 1353 tokens)
+ds4-eval: 12/12 passed, runtime 00h:36m

@@ -1,0 +1,13 @@
+ds4-eval: 12/12 passed, runtime 00h:48m
+  1 PASSED          265     3010     3275 B                    B                    GPQA Diamond/recNu3MXkvWUzHZr9
+  2 PASSED          201      409      610 C                    C                    SuperGPQA/001b51d76b4d422988f2c11f104a2c6c
+  3 PASSED          134      890     1024 70                   70                   AIME2025/aime2025-01
+  4 PASSED          386     5608     5994 C                    C                    GPQA Diamond/recoiTJPGUmzAkief
+  5 PASSED          327     2873     3200 J                    J                    SuperGPQA/b7e20eac98764fb0bf30e8366d951daa
+  6 PASSED          205     2168     2373 468                  468                  AIME2025/aime2025-16
+  7 PASSED          236     1056     1292 B                    B                    GPQA Diamond/rec4UqStf9WUVif1f
+  8 PASSED          177     1349     1526 E                    E                    SuperGPQA/4a1d1780a93f4093b6fb7d3c314cbea8
+  9 PASSED          733    26015    26748 588                  588                  AIME2025/aime2025-02
+ 10 PASSED          254     1282     1536 B                    B                    GPQA Diamond/recgI6tUQ7RLJRWGx
+ 11 PASSED          188      691      879 A                    A                    SuperGPQA/6082513c8dba4ec68aa68f1bf5854d09
+ 12 PASSED          217     1114     1331 16                   16                   AIME2025/aime2025-03

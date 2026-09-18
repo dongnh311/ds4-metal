@@ -57633,6 +57633,15 @@ typedef struct {
     ds4_gpu_tensor *layer_v_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_ik_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_block_key[DS4_MAX_LAYER];
+    /* In-kernel FP8 KV (DS4_QWEN4_KV_FP8): E4M3 byte cache + per-64-block scale.
+     * When kv_fp8 is set these REPLACE the half layer_k/v_cache (the memory win);
+     * layer_k/v_cache stay NULL for full-attn layers. Mutually exclusive with the
+     * paged path. */
+    bool kv_fp8;
+    ds4_gpu_tensor *layer_k_cache_fp8[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_v_cache_fp8[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_k_scale[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_v_scale[DS4_MAX_LAYER];
     /* A separate injection buffer keeps combined normalization race-free. */
     ds4_gpu_tensor *inj_alt;
     /* MTP: staged predictor input, its residual, and the recurrent-state
@@ -57822,6 +57831,10 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->layer_lin_hist[il]);
         ds4_gpu_tensor_free(g->layer_k_cache[il]);
         ds4_gpu_tensor_free(g->layer_v_cache[il]);
+        ds4_gpu_tensor_free(g->layer_k_cache_fp8[il]);
+        ds4_gpu_tensor_free(g->layer_v_cache_fp8[il]);
+        ds4_gpu_tensor_free(g->layer_k_scale[il]);
+        ds4_gpu_tensor_free(g->layer_v_scale[il]);
         ds4_gpu_tensor_free(g->layer_ik_cache[il]);
         ds4_gpu_tensor_free(g->layer_block_key[il]);
         ds4_gpu_tensor_free(g->snap_lin_state[il]);
@@ -57873,9 +57886,11 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
      * reset like the pager does. Other callers pass a fresh xcalloc'd graph, so
      * this preserves an all-zero cache (a no-op) for them. */
     ds4_kv_cache saved_paged_kv = g->paged_kv_cache;
+    const bool saved_kv_fp8 = g->kv_fp8;   /* set by the caller before this call */
     memset(g, 0, sizeof(*g));
     g->pager = pager;
     g->paged_kv_cache = saved_paged_kv;
+    g->kv_fp8 = saved_kv_fp8;
     if (!qwen4_graph_weights_supported(w)) return false;
     mtp = mtp && DS4_N_NEXTN_PREDICT != 0;
     const uint64_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc, T = cap_tokens;
@@ -57968,8 +57983,19 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
                 ok = g->snap_lin_state[il] && g->snap_lin_hist[il];
             }
         } else {
-            g->layer_k_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 2u);
-            g->layer_v_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 2u);
+            if (g->kv_fp8) {
+                /* In-kernel FP8: E4M3 byte cache (1 byte/elem, half the bytes) +
+                 * per-64-block fp16 scale. The half k/v cache is NOT allocated --
+                 * this is the KV memory win. attn_prep encodes; attn_mm/decode
+                 * decode. Mutually exclusive with the paged path. */
+                g->layer_k_cache_fp8[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 1u);
+                g->layer_v_cache_fp8[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 1u);
+                g->layer_k_scale[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * (kv_dim / 64u) * 2u);
+                g->layer_v_scale[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * (kv_dim / 64u) * 2u);
+            } else {
+                g->layer_k_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 2u);
+                g->layer_v_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 2u);
+            }
             g->layer_ik_cache[il] = qwen4_graph_alloc_f32((uint64_t)ctx_cap * DS4_N_INDEXER_HEAD_DIM);
             g->layer_block_key[il] = ds4_gpu_tensor_alloc((uint64_t)g->n_block_cap * DS4_N_INDEXER_HEAD_DIM * 2u);
             /* Paged KV staging:
@@ -57983,7 +58009,14 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
                 g->paged_k_staging_full[il] = ds4_gpu_tensor_alloc(full_bytes);
                 g->paged_v_staging_full[il] = ds4_gpu_tensor_alloc(full_bytes);
             }
-            ok = ok && g->layer_k_cache[il] && g->layer_v_cache[il] && g->layer_ik_cache[il] && g->layer_block_key[il];
+            if (g->kv_fp8) {
+                ok = ok && g->layer_k_cache_fp8[il] && g->layer_v_cache_fp8[il] &&
+                     g->layer_k_scale[il] && g->layer_v_scale[il] &&
+                     g->layer_ik_cache[il] && g->layer_block_key[il];
+            } else {
+                ok = ok && g->layer_k_cache[il] && g->layer_v_cache[il] &&
+                     g->layer_ik_cache[il] && g->layer_block_key[il];
+            }
             if (ok && g->paged_kv_cache.n_layers > 0) {
                 ok = ok && g->paged_k_staging[il] && g->paged_v_staging[il] &&
                      g->paged_k_staging_full[il] && g->paged_v_staging_full[il];
@@ -58388,10 +58421,21 @@ static bool qwen4_paged_kv_active(const ds4_qwen4_gpu_graph *g) {
     }
     return false;
 }
+/* In-kernel FP8 KV active: env-selected AND buffers allocated (a full-attn
+ * layer has an fp8 K cache). Mutually exclusive with the paged path. */
+static bool qwen4_kv_fp8_active(const ds4_qwen4_gpu_graph *g) {
+    if (!g->kv_fp8) return false;
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        if (g->layer_k_cache_fp8[il] != NULL) return true;
+    }
+    return false;
+}
 static ds4_gpu_tensor *qwen4_kcache(ds4_qwen4_gpu_graph *g, uint32_t il) {
+    if (qwen4_kv_fp8_active(g)) return g->layer_k_cache_fp8[il];
     return qwen4_paged_kv_active(g) ? g->paged_k_staging_full[il] : g->layer_k_cache[il];
 }
 static ds4_gpu_tensor *qwen4_vcache(ds4_qwen4_gpu_graph *g, uint32_t il) {
+    if (qwen4_kv_fp8_active(g)) return g->layer_v_cache_fp8[il];
     return qwen4_paged_kv_active(g) ? g->paged_v_staging_full[il] : g->layer_v_cache[il];
 }
 /* K/V dynamic-range measurement (spec §25 Phase 3 item 1 "K/V dynamic range").
@@ -58451,6 +58495,43 @@ static void qwen4_kvr_report(void) {
         g_kvr_v_absmax, v_meantok, v_rms, g_kvr_v_min, g_kvr_v_max);
 }
 
+/* FP8-KV QUALITY SIMULATION (spec §25 Phase 3 item 3.2 quality matrix).
+ * When DS4_QWEN4_KV_FP8SIM is set, the paged commit stores each K/V head-vector
+ * through an E4M3 round trip (per-64-element block, power-of-2 scale) BEFORE it
+ * reaches the staging buffers the kernels read -- reusing the codebase's proven
+ * dsv4_e4m3fn_dequant_cpu. This makes the forward pass compute attention on
+ * FP8-degraded K/V, so the resulting logit divergence vs BF16 is the EXACT
+ * quality the eventual in-kernel FP8 would produce (the round trip is numerically
+ * identical whether done here on the CPU or in-kernel). It does NOT save memory
+ * (staging is still BF16) -- it is a QUALITY probe only, and it is LOSSY, so it
+ * is gated behind its own env and is OFF by default (ground rule 6: FP8 uses the
+ * quality matrix, not the bit-identical gate). */
+static int qwen4_fp8sim_enabled(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4_KV_FP8SIM") != NULL ? 1 : 0;
+    return v;
+}
+static void qwen4_fp8sim_vec(const uint8_t *src, uint8_t *dst, uint32_t n) {
+    const uint16_t *sp = (const uint16_t *)src;
+    uint16_t *dp = (uint16_t *)dst;
+    for (uint32_t off = 0; off < n; off += 64u) {
+        uint32_t blk = (n - off) < 64u ? (n - off) : 64u;
+        float amax = 0.0f;
+        for (uint32_t i = 0; i < blk; i++) {
+            float a = fabsf(f16_to_f32(sp[off + i]));
+            if (a > amax) amax = a;
+        }
+        if (amax < 1.0e-4f) amax = 1.0e-4f;
+        float scale = ldexpf(1.0f, (int)ceilf(log2f(amax / 448.0f)));
+        for (uint32_t i = 0; i < blk; i++) {
+            float v = f16_to_f32(sp[off + i]) / scale;
+            if (v > 448.0f) v = 448.0f;
+            if (v < -448.0f) v = -448.0f;
+            dp[off + i] = f32_to_f16(dsv4_e4m3fn_dequant_cpu(v) * scale);
+        }
+    }
+}
+
 static bool qwen4_paged_kv_roundtrip(ds4_qwen4_gpu_graph *g, uint32_t il,
                                      uint32_t pos0, uint32_t T) {
     if (!qwen4_paged_kv_active(g)) return true;
@@ -58478,10 +58559,18 @@ static bool qwen4_paged_kv_roundtrip(ds4_qwen4_gpu_graph *g, uint32_t il,
         const uint32_t pos = pos0 + t;
         for (uint32_t h = 0; h < Hkv && ok; h++) {
             const uint64_t foff = (uint64_t)pos * tok_bytes + (uint64_t)h * head_bytes;
-            ok = ds4_kv_cache_commit(c, il, h,       pos, kflat + foff, head_bytes) &&
-                 ds4_kv_cache_commit(c, il, Hkv + h, pos, vflat + foff, head_bytes);
-            qwen4_kvr_accum(kflat + foff, D, false);  /* K dynamic-range stats */
-            qwen4_kvr_accum(vflat + foff, D, true);   /* V dynamic-range stats */
+            qwen4_kvr_accum(kflat + foff, D, false);  /* K dynamic-range stats (pre-FP8) */
+            qwen4_kvr_accum(vflat + foff, D, true);   /* V dynamic-range stats (pre-FP8) */
+            if (qwen4_fp8sim_enabled()) {
+                uint16_t ktmp[DS4_N_HEAD_DIM], vtmp[DS4_N_HEAD_DIM];
+                qwen4_fp8sim_vec(kflat + foff, (uint8_t *)ktmp, D);
+                qwen4_fp8sim_vec(vflat + foff, (uint8_t *)vtmp, D);
+                ok = ds4_kv_cache_commit(c, il, h,       pos, ktmp, head_bytes) &&
+                     ds4_kv_cache_commit(c, il, Hkv + h, pos, vtmp, head_bytes);
+            } else {
+                ok = ds4_kv_cache_commit(c, il, h,       pos, kflat + foff, head_bytes) &&
+                     ds4_kv_cache_commit(c, il, Hkv + h, pos, vflat + foff, head_bytes);
+            }
         }
     }
     /* materialize the whole [0, pos0+T) range paged -> staging, interleaved */
@@ -58519,7 +58608,10 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
         !ds4_gpu_qwen4_attn_decode_tensor(o_rows, q_rows, gate_rows, qwen4_kcache(g, il), qwen4_vcache(g, il),
                                           g->sel_tokens, g->n_sel, cT <= 2u ? g->attn_part : NULL, n_dense,
                                           DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, cpos0, false, g->sel_stride,
-                                          scale)) {
+                                          scale,
+                                          g->layer_k_cache_fp8[il], g->layer_v_cache_fp8[il],
+                                          g->layer_k_scale[il], g->layer_v_scale[il],
+                                          qwen4_kv_fp8_active(g) ? 1u : 0u)) {
         return false;
     }
     if (n_dense >= cT) return true;
@@ -58545,7 +58637,10 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
         ds4_gpu_qwen4_attn_decode_tensor(o, q, gate, qwen4_kcache(g, il), qwen4_vcache(g, il),
                                          g->sel_tokens, g->n_sel, cT <= 2u ? g->attn_part : NULL, n_sparse,
                                          DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, sp0, true, g->sel_stride,
-                                         scale);
+                                         scale,
+                                         g->layer_k_cache_fp8[il], g->layer_v_cache_fp8[il],
+                                         g->layer_k_scale[il], g->layer_v_scale[il],
+                                         qwen4_kv_fp8_active(g) ? 1u : 0u);
     ds4_gpu_tensor_free(iqn);
     ds4_gpu_tensor_free(o);
     ds4_gpu_tensor_free(gate);
@@ -58576,12 +58671,19 @@ static bool qwen4_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
         }
         if (!ok) return false;
     }
-    if (!(ds4_gpu_qwen4_attn_prep_tensor(g->q, g->gate, g->layer_k_cache[il], g->layer_v_cache[il], g->iqn,
+    const uint32_t kv_fp8 = qwen4_kv_fp8_active(g) ? 1u : 0u;
+    /* FP8 writes the E4M3 byte cache; paged/BF16 keep writing the flat half cache
+     * (paged then round-trips it flat -> paged -> staging in qwen4_paged_kv_roundtrip). */
+    ds4_gpu_tensor *prep_k = kv_fp8 ? g->layer_k_cache_fp8[il] : g->layer_k_cache[il];
+    ds4_gpu_tensor *prep_v = kv_fp8 ? g->layer_v_cache_fp8[il] : g->layer_v_cache[il];
+    if (!(ds4_gpu_qwen4_attn_prep_tensor(g->q, g->gate, prep_k, prep_v, g->iqn,
                                          g->layer_ik_cache[il], g->qg, g->kp, g->vp, g->iq, g->ik, g->pos3,
                                          m->map, m->size, l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
                                          l->indexer_q_norm->abs_offset, T, DS4_N_HEAD, DS4_N_HEAD_KV,
                                          DS4_N_HEAD_DIM, DS4_N_ROT, DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
-                                         pos0, g->ctx_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS))) {
+                                         pos0, g->ctx_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS,
+                                         g->layer_k_cache_fp8[il], g->layer_v_cache_fp8[il],
+                                         g->layer_k_scale[il], g->layer_v_scale[il], kv_fp8))) {
         return false;
     }
     /* blocks whose last token falls in this chunk get their pooled keys */
@@ -62618,7 +62720,7 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
 }
 #endif
 #ifdef DS4_HAS_QWEN4_METAL
-static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows);
+static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows, bool fp8);
 #endif
 
 uint64_t ds4_session_kv_cache_bytes(ds4_session *s) {
@@ -62633,6 +62735,11 @@ uint64_t ds4_session_kv_cache_bytes(ds4_session *s) {
         for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
             bytes += ds4_gpu_tensor_bytes(g->layer_k_cache[il]);
             bytes += ds4_gpu_tensor_bytes(g->layer_v_cache[il]);
+            /* FP8 mode: the byte cache + per-64-block scale replace the half cache */
+            bytes += ds4_gpu_tensor_bytes(g->layer_k_cache_fp8[il]);
+            bytes += ds4_gpu_tensor_bytes(g->layer_v_cache_fp8[il]);
+            bytes += ds4_gpu_tensor_bytes(g->layer_k_scale[il]);
+            bytes += ds4_gpu_tensor_bytes(g->layer_v_scale[il]);
             bytes += ds4_gpu_tensor_bytes(g->layer_ik_cache[il]);
         }
         /* The paged store duplicates the resident K/V; report both so the
@@ -62675,7 +62782,7 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
         bytes += (uint64_t)DS4_N_VOCAB * sizeof(float);
         const uint32_t rows = (uint32_t)s->checkpoint.len;
         const uint32_t mtp_rows = s->qwen4_graph.mtp_pos < rows ? s->qwen4_graph.mtp_pos : rows;
-        bytes += qwen4_payload_tensor_bytes(rows, mtp_rows);
+        bytes += qwen4_payload_tensor_bytes(rows, mtp_rows, s->qwen4_graph.kv_fp8);
         return bytes;
 #endif
     }
@@ -62831,6 +62938,14 @@ static uint64_t qwen4_payload_lin_hist_bytes(void) {
 static uint64_t qwen4_payload_kv_bytes(uint32_t rows) {
     return (uint64_t)rows * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
 }
+/* FP8 KV snapshot (DS4_QWEN4_KV_FP8): one E4M3 byte per element + one fp16
+ * scale per 64-element block, for K (or V) of one layer. */
+static uint64_t qwen4_payload_kv_fp8_bytes(uint32_t rows) {
+    return (uint64_t)rows * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 1u;
+}
+static uint64_t qwen4_payload_kv_scale_bytes(uint32_t rows) {
+    return (uint64_t)rows * (DS4_N_HEAD_KV * DS4_N_HEAD_DIM / 64u) * 2u;
+}
 static uint64_t qwen4_payload_ik_bytes(uint32_t rows) {
     return (uint64_t)rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
 }
@@ -62841,14 +62956,16 @@ static uint64_t qwen4_payload_ple_hist_bytes(void) {
     return (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * DS4_N_EMBD * DS4_N_HC * sizeof(float);
 }
 
-static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows) {
+static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows, bool fp8) {
     uint64_t bytes = sizeof(uint32_t);   /* mtp_rows */
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (ds4_qwen4_layer_is_linear(il)) {
             bytes += qwen4_payload_lin_state_bytes() + qwen4_payload_lin_hist_bytes();
         } else {
             const uint32_t n = ds4_qwen4_layer_is_nextn(il) ? mtp_rows : rows;
-            bytes += 2u * qwen4_payload_kv_bytes(n) + qwen4_payload_ik_bytes(n) + qwen4_payload_block_key_bytes(n);
+            const uint64_t kvb = fp8 ? 2u * (qwen4_payload_kv_fp8_bytes(n) + qwen4_payload_kv_scale_bytes(n))
+                                     : 2u * qwen4_payload_kv_bytes(n);
+            bytes += kvb + qwen4_payload_ik_bytes(n) + qwen4_payload_block_key_bytes(n);
         }
     }
     bytes += qwen4_payload_ple_hist_bytes();
@@ -62909,10 +63026,21 @@ static int qwen4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_
             }
         } else {
             const uint32_t n = ds4_qwen4_layer_is_nextn(il) ? mtp_rows : rows;
-            rc = payload_write_tensor_span(fp, g->layer_k_cache[il], 0, qwen4_payload_kv_bytes(n),
-                                           buf, DS4_SESSION_IO_CHUNK, err, errlen);
-            if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_v_cache[il], 0, qwen4_payload_kv_bytes(n),
-                                                        buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            if (g->kv_fp8) {
+                rc = payload_write_tensor_span(fp, g->layer_k_cache_fp8[il], 0, qwen4_payload_kv_fp8_bytes(n),
+                                               buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_k_scale[il], 0, qwen4_payload_kv_scale_bytes(n),
+                                                            buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_v_cache_fp8[il], 0, qwen4_payload_kv_fp8_bytes(n),
+                                                            buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_v_scale[il], 0, qwen4_payload_kv_scale_bytes(n),
+                                                            buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            } else {
+                rc = payload_write_tensor_span(fp, g->layer_k_cache[il], 0, qwen4_payload_kv_bytes(n),
+                                               buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_v_cache[il], 0, qwen4_payload_kv_bytes(n),
+                                                            buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            }
             if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_ik_cache[il], 0, qwen4_payload_ik_bytes(n),
                                                         buf, DS4_SESSION_IO_CHUNK, err, errlen);
             if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_block_key[il], 0, qwen4_payload_block_key_bytes(n),
@@ -62999,10 +63127,21 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
             }
         } else {
             const uint32_t n = ds4_qwen4_layer_is_nextn(il) ? mtp_rows : rows;
-            rc = payload_read_tensor_span(fp, g->layer_k_cache[il], 0, qwen4_payload_kv_bytes(n),
-                                          buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
-            if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_v_cache[il], 0, qwen4_payload_kv_bytes(n),
-                                                       buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+            if (g->kv_fp8) {
+                rc = payload_read_tensor_span(fp, g->layer_k_cache_fp8[il], 0, qwen4_payload_kv_fp8_bytes(n),
+                                              buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+                if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_k_scale[il], 0, qwen4_payload_kv_scale_bytes(n),
+                                                           buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+                if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_v_cache_fp8[il], 0, qwen4_payload_kv_fp8_bytes(n),
+                                                           buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+                if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_v_scale[il], 0, qwen4_payload_kv_scale_bytes(n),
+                                                           buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+            } else {
+                rc = payload_read_tensor_span(fp, g->layer_k_cache[il], 0, qwen4_payload_kv_bytes(n),
+                                              buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+                if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_v_cache[il], 0, qwen4_payload_kv_bytes(n),
+                                                           buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+            }
             if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_ik_cache[il], 0, qwen4_payload_ik_bytes(n),
                                                        buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
             if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_block_key[il], 0, qwen4_payload_block_key_bytes(n),
@@ -73203,7 +73342,17 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
          * AFTER graph_alloc (the prior bug) left staging NULL, so
          * qwen4_paged_kv_active() was always false: the paged path was inert and
          * the "bit-identical" gate silently compared resident vs resident. */
-        if (getenv("DS4_QWEN4_KV_PAGED") != NULL) {
+        /* In-kernel FP8 KV (DS4_QWEN4_KV_FP8): set the graph flag BEFORE
+         * qwen4_graph_alloc so the full-attention layers allocate E4M3 byte
+         * buffers + per-64-block scale INSTEAD of the half k/v cache (the KV
+         * memory win). qwen4_graph_alloc preserves kv_fp8 across its memset,
+         * like the pager and paged_kv_cache. Mutually exclusive with the paged
+         * path (the paged store is a separate BF16 dev/gate path). */
+        s->qwen4_graph.kv_fp8 = (getenv("DS4_QWEN4_KV_FP8") != NULL);
+        if (s->qwen4_graph.kv_fp8) {
+            fprintf(stderr, "ds4: in-kernel FP8 KV cache enabled (E4M3, per-64-block scale)\n");
+        }
+        if (getenv("DS4_QWEN4_KV_PAGED") != NULL && !s->qwen4_graph.kv_fp8) {
             const char *page_env = getenv("DS4_QWEN4_KV_PAGE_TOKENS");
             uint32_t page_size = page_env ? atoi(page_env) : DS4_KV_CACHE_DEFAULT_PAGE_TOKENS;
             if (page_size != 256 && page_size != 512 && page_size != 1024) {
