@@ -17,7 +17,13 @@ static inline float qwen4_sigmoid(float x) {
 static inline float qwen4_softplus(float x) {
     if (x > 20.0f) return x;
     if (x < -20.0f) return exp(x);
-    return log(1.0f + exp(x));
+    /* Accurate log(1+e) via the Kahan correction (this Metal target has no log1p
+     * builtin): recovers the precision that log(1.0f + e) loses to the +1 when e
+     * is small, matching the CPU reference qwen4_ref_softplus (log1pf) over the
+     * recurrent GDN decay gate to long context. */
+    const float e = exp(x);
+    const float u = 1.0f + e;
+    return u == 1.0f ? e : log(u) * (e / (u - 1.0f));
 }
 
 static inline float qwen4_silu(float x) {
@@ -2549,14 +2555,21 @@ kernel void kernel_qwen4_moe_reduce(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (d >= args.dim) return;
     float acc = 0.0f;
+    /* Guard each partial against NaN/Inf from a corrupted expert GEMV so one bad
+     * slot cannot poison the reduced output and the hyper-connection residual
+     * (cf antirez/ds4 #1025). Finite partials are added in the same order, so the
+     * healthy path is bit-identical. */
     for (uint s = 0; s < args.n_slots; s++) {
-        acc += weights[(uint64_t)tok * args.n_slots + s] *
+        const float p = weights[(uint64_t)tok * args.n_slots + s] *
                part[((uint64_t)tok * args.part_stride + s) * args.dim + d];
+        if (isfinite(p)) acc += p;
     }
     if (args.shared_src == 1) {
-        acc += qwen4_sigmoid(shared_gate[tok]) * part[((uint64_t)tok * args.part_stride + args.n_slots) * args.dim + d];
+        const float p = qwen4_sigmoid(shared_gate[tok]) * part[((uint64_t)tok * args.part_stride + args.n_slots) * args.dim + d];
+        if (isfinite(p)) acc += p;
     } else if (args.shared_src == 2) {
-        acc += qwen4_sigmoid(shared_gate[tok]) * shared[(uint64_t)tok * args.dim + d];
+        const float p = qwen4_sigmoid(shared_gate[tok]) * shared[(uint64_t)tok * args.dim + d];
+        if (isfinite(p)) acc += p;
     }
     out[(uint64_t)tok * args.dim + d] = acc;
     if (args.n_hc) {
