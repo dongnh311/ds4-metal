@@ -1,0 +1,23 @@
+ds4: PLE sidecar table: /Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-PLE-Q4_1.gguf (ple.weight [160, 320001536], CPU-only)
+ds4: PLE sidecar demand-paged (insufficient RAM headroom or DS4_QWEN4_PLE_PREFETCH_FULL=0)
+ds4: Metal device Apple M5 Pro, 64.00 GiB RAM
+ds4: Metal kernel source dir: /Users/dongnh/.local/share/ai-gateway/ds4-metal (exe-relative)
+ds4: Metal 4 tensor API enabled for Tensor kernels
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=on
+ds4: Metal model views created in 0.987 ms, residency requested in 278.515 ms, warmup 3.010 ms (mapped 41643.70 MiB from offset 10.51 MiB)
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 0.13 GiB (raw 0.10 + compressed 0.03) + buffers 3.49 GiB + resident model 40.67 GiB = 44.29 GiB planned
+ds4: memory detail: ctx=4096 prefill_cap=4096 raw_kv_rows=4096 compressed_kv_rows=1025 backend=metal
+ds4: memory: KV 0.13 GiB (raw 0.10 + compressed 0.03) + buffers 3.49 GiB = 3.62 GiB context
+ds4: memory detail: ctx=4096 prefill_cap=4096 raw_kv_rows=4096 compressed_kv_rows=1025 backend=metal
+ds4: using GPU graph generation with graph prefill
+processing 157 input tokens: 157/157 (100.0%)
+We need answer user's request: detailed technical explanation of speculative decoding accelerating autoregressive LLM inference. Cover draft model proposing candidate tokens, target verifying in parallel, accept/reject sampling criterion preserving target distribution, multi-token blocks, wall-clock speedup depends on acceptance rate and relative cost draft vs verify. Then explain how Multi-Token Prediction (MTP) heads differ from separate draft model. Need be thorough and precise.
+
+Need produce final answer. Need think through content.
+
+Speculative decoding basics: autoregressive generation bottleneck sequential decoding, one token per forward pass. Speculative decoding uses cheap draft model to generate K candidate tokens sequentially (or block), then target model verifies all K+1? Actually target model processes draft tokens in parallel (single forward pass over block) to compute probabilities for positions. Then acceptance algorithm samples from target distribution conditioned on prefix and draft tokens, accepting prefix until rejection, then sample correction token from residual distribution. This yields exact target distribution if verifier uses target probabilities and acceptance criterion.
+
+Need detail: Let target distribution p_t(x_t | x_<t). Draft distribution q_t(x_t | x_<t). Draft proposes x_{t+1},...,x_{t+K}. Target computes p_{t+1},...,p_{t+K+1}? For each draft token x_{t+i}, target probability p_i(x_{t+i}|prefix). Acceptance: for i=1..K, accept if x_{t+i} sampled from q_i? Actually algorithm: Given draft tokens x_1..x_K from q. For each i, accept with probability min(1, p_i(x_i)/q_i(x_i)). If accepted, continue. If rejected at i, sample correction token from residual distribution: (p_i(x) - q_i(x))_+ / sum_x (p_i(x)-q_i(x))_+? Need precise. If all accepted, sample next token from p_{K+1} (
+ds4: Qwen3.8 prefill: 189.91 t/s, generation: 35.92 t/s

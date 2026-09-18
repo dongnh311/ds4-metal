@@ -1,0 +1,6 @@
+vocab=248320
+logit max_abs_diff=2.24959  rms_diff=0.330827  cosine=0.99039733
+argmax_Q8=321 argmax_IMAT=321  top1_match=True
+top5_Q8=[321, 40799, 10603, 85831, 21049]
+top5_IMAT=[321, 40799, 10603, 85831, 44935]
+top5_overlap=4/5
