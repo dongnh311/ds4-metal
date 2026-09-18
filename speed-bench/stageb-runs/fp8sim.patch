@@ -1,0 +1,71 @@
+diff --git a/ds4.c b/ds4.c
+index 68a5d09..58ad387 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -58451,6 +58451,43 @@ static void qwen4_kvr_report(void) {
+         g_kvr_v_absmax, v_meantok, v_rms, g_kvr_v_min, g_kvr_v_max);
+ }
+ 
++/* FP8-KV QUALITY SIMULATION (spec §25 Phase 3 item 3.2 quality matrix).
++ * When DS4_QWEN4_KV_FP8SIM is set, the paged commit stores each K/V head-vector
++ * through an E4M3 round trip (per-64-element block, power-of-2 scale) BEFORE it
++ * reaches the staging buffers the kernels read -- reusing the codebase's proven
++ * dsv4_e4m3fn_dequant_cpu. This makes the forward pass compute attention on
++ * FP8-degraded K/V, so the resulting logit divergence vs BF16 is the EXACT
++ * quality the eventual in-kernel FP8 would produce (the round trip is numerically
++ * identical whether done here on the CPU or in-kernel). It does NOT save memory
++ * (staging is still BF16) -- it is a QUALITY probe only, and it is LOSSY, so it
++ * is gated behind its own env and is OFF by default (ground rule 6: FP8 uses the
++ * quality matrix, not the bit-identical gate). */
++static int qwen4_fp8sim_enabled(void) {
++    static int v = -1;
++    if (v < 0) v = getenv("DS4_QWEN4_KV_FP8SIM") != NULL ? 1 : 0;
++    return v;
++}
++static void qwen4_fp8sim_vec(const uint8_t *src, uint8_t *dst, uint32_t n) {
++    const uint16_t *sp = (const uint16_t *)src;
++    uint16_t *dp = (uint16_t *)dst;
++    for (uint32_t off = 0; off < n; off += 64u) {
++        uint32_t blk = (n - off) < 64u ? (n - off) : 64u;
++        float amax = 0.0f;
++        for (uint32_t i = 0; i < blk; i++) {
++            float a = fabsf(f16_to_f32(sp[off + i]));
++            if (a > amax) amax = a;
++        }
++        if (amax < 1.0e-4f) amax = 1.0e-4f;
++        float scale = ldexpf(1.0f, (int)ceilf(log2f(amax / 448.0f)));
++        for (uint32_t i = 0; i < blk; i++) {
++            float v = f16_to_f32(sp[off + i]) / scale;
++            if (v > 448.0f) v = 448.0f;
++            if (v < -448.0f) v = -448.0f;
++            dp[off + i] = f32_to_f16(dsv4_e4m3fn_dequant_cpu(v) * scale);
++        }
++    }
++}
++
+ static bool qwen4_paged_kv_roundtrip(ds4_qwen4_gpu_graph *g, uint32_t il,
+                                      uint32_t pos0, uint32_t T) {
+     if (!qwen4_paged_kv_active(g)) return true;
+@@ -58478,10 +58515,18 @@ static bool qwen4_paged_kv_roundtrip(ds4_qwen4_gpu_graph *g, uint32_t il,
+         const uint32_t pos = pos0 + t;
+         for (uint32_t h = 0; h < Hkv && ok; h++) {
+             const uint64_t foff = (uint64_t)pos * tok_bytes + (uint64_t)h * head_bytes;
+-            ok = ds4_kv_cache_commit(c, il, h,       pos, kflat + foff, head_bytes) &&
+-                 ds4_kv_cache_commit(c, il, Hkv + h, pos, vflat + foff, head_bytes);
+-            qwen4_kvr_accum(kflat + foff, D, false);  /* K dynamic-range stats */
+-            qwen4_kvr_accum(vflat + foff, D, true);   /* V dynamic-range stats */
++            qwen4_kvr_accum(kflat + foff, D, false);  /* K dynamic-range stats (pre-FP8) */
++            qwen4_kvr_accum(vflat + foff, D, true);   /* V dynamic-range stats (pre-FP8) */
++            if (qwen4_fp8sim_enabled()) {
++                uint16_t ktmp[DS4_N_HEAD_DIM], vtmp[DS4_N_HEAD_DIM];
++                qwen4_fp8sim_vec(kflat + foff, (uint8_t *)ktmp, D);
++                qwen4_fp8sim_vec(vflat + foff, (uint8_t *)vtmp, D);
++                ok = ds4_kv_cache_commit(c, il, h,       pos, ktmp, head_bytes) &&
++                     ds4_kv_cache_commit(c, il, Hkv + h, pos, vtmp, head_bytes);
++            } else {
++                ok = ds4_kv_cache_commit(c, il, h,       pos, kflat + foff, head_bytes) &&
++                     ds4_kv_cache_commit(c, il, Hkv + h, pos, vflat + foff, head_bytes);
++            }
+         }
+     }
+     /* materialize the whole [0, pos0+T) range paged -> staging, interleaved */
