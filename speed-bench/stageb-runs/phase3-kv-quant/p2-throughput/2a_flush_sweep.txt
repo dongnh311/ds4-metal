@@ -1,0 +1,9 @@
+=== 2a: DS4_QWEN4_FLUSH_LAYER sweep (baseline default=2 -> 42.8) ===
+FLUSH_LAYER=0   gen= 42.06 42.56  accept=(66.9%)
+FLUSH_LAYER=1   gen= 42.10 42.54  accept=(66.9%)
+FLUSH_LAYER=2   gen= 42.48 42.65  accept=(66.9%)
+FLUSH_LAYER=3   gen= 42.87 42.85  accept=(66.9%)
+FLUSH_LAYER=4   gen= 42.80 42.84  accept=(66.9%)
+FLUSH_LAYER=6   gen= 42.71 42.62  accept=(66.9%)
+FLUSH_LAYER=8   gen= 42.79 42.72  accept=(66.9%)
+FLUSH_LAYER=12  gen= 43.01 42.24  accept=(66.9%)

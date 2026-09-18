@@ -1,0 +1,31 @@
+ds4: PLE sidecar table: /Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-PLE-Q4_1.gguf (ple.weight [160, 320001536], CPU-only)
+ds4: PLE sidecar demand-paged (insufficient RAM headroom or DS4_QWEN4_PLE_PREFETCH_FULL=0)
+ds4: Metal device Apple M5 Pro, 64.00 GiB RAM
+ds4: Metal kernel source dir: /Users/dongnh/.local/share/ai-gateway/ds4-metal (exe-relative)
+ds4: Metal 4 tensor API enabled for Tensor kernels
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=on
+ds4: Metal model views created in 1.056 ms, residency requested in 303.091 ms, warmup 3.129 ms (mapped 41643.70 MiB from offset 10.51 MiB)
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 1.04 GiB (raw 0.81 + compressed 0.23) + buffers 7.41 GiB + resident model 40.67 GiB = 49.12 GiB planned
+ds4: memory detail: ctx=32768 prefill_cap=8192 raw_kv_rows=32768 compressed_kv_rows=8193 backend=metal
+0919 00:43:47 ds4-server: context buffers 8658.57 MiB (ctx=32768, backend=metal, prefill_chunk=8192, raw_kv_rows=32768, compressed_kv_rows=8193)
+0919 00:43:48 ds4-server: listening on http://127.0.0.1:8000
+0919 00:44:16 ds4-server: completion ctx=0..65:65 prompt start
+0919 00:44:17 ds4-server: completion ctx=0..65:65 prefill chunk 65/65 (100.0%) chunk=0.00 t/s avg=84.72 t/s 0.767s
+0919 00:44:17 ds4-server: completion ctx=0..65:65 prompt done 0.767s
+0919 00:44:18 ds4-server: completion ctx=65..93:28 gen=28 decoding chunk=40.10 t/s avg=40.10 t/s 0.698s
+0919 00:44:18 ds4-server: completion ctx=0..65:65 gen=28 finish=stop 1.466s
+0919 00:44:27 ds4-server: live kv cache miss live=93 prompt=65 common=65 vision=match reason=token-mismatch
+0919 00:44:27 ds4-server: completion ctx=0..65:65 prompt start
+0919 00:44:28 ds4-server: completion ctx=0..65:65 prefill chunk 65/65 (100.0%) chunk=0.00 t/s avg=111.35 t/s 0.584s
+0919 00:44:28 ds4-server: completion ctx=0..65:65 prompt done 0.584s
+0919 00:44:29 ds4-server: completion ctx=65..93:28 gen=28 decoding chunk=45.92 t/s avg=45.92 t/s 0.610s
+0919 00:44:29 ds4-server: completion ctx=0..65:65 gen=28 finish=stop 1.194s
+0919 00:46:10 ds4-server: live kv cache miss live=93 prompt=65 common=65 vision=match reason=token-mismatch
+0919 00:46:10 ds4-server: completion ctx=0..65:65 prompt start
+0919 00:46:10 ds4-server: completion ctx=0..65:65 prefill chunk 65/65 (100.0%) chunk=0.00 t/s avg=109.84 t/s 0.592s
+0919 00:46:10 ds4-server: completion ctx=0..65:65 prompt done 0.592s
+0919 00:46:11 ds4-server: completion ctx=65..93:28 gen=28 decoding chunk=45.79 t/s avg=45.79 t/s 0.611s
+0919 00:46:11 ds4-server: completion ctx=0..65:65 gen=28 finish=stop 1.204s
+0919 00:46:55 ds4-server: shutdown requested, draining requests
