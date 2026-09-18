@@ -13,6 +13,7 @@
 #include <float.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <libgen.h>
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -4868,6 +4869,27 @@ static const char *ds4_gpu_source =
 "\n"
 "\n";
 
+/* Directory containing this executable, resolved once. Metal kernel sources are
+ * loaded relative to it FIRST so a binary run from any working directory compiles
+ * the kernels from the build that produced it -- not a stale ./metal next to the
+ * CWD, which silently compiles mismatched kernels into garbage output (bug B4). */
+static NSString *ds4_gpu_exe_dir(void) {
+    static NSString *cached = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        char buf[PATH_MAX];
+        uint32_t size = (uint32_t)sizeof(buf);
+        if (_NSGetExecutablePath(buf, &size) != 0) return; /* path too long: fall back to CWD */
+        char resolved[PATH_MAX];
+        const char *full = realpath(buf, resolved) ? resolved : buf;
+        char tmp[PATH_MAX];
+        strncpy(tmp, full, sizeof(tmp) - 1);
+        tmp[sizeof(tmp) - 1] = '\0';
+        cached = [NSString stringWithUTF8String:dirname(tmp)];
+    });
+    return cached;
+}
+
 static NSString *ds4_gpu_full_source(void) {
     NSString *base = [NSString stringWithUTF8String:ds4_gpu_source];
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -4905,12 +4927,28 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_QWEN4_VISION_SOURCE", @"metal/qwen4_vision.metal"],
     ];
 
+    NSString *exe_dir = ds4_gpu_exe_dir();
+    const char *dir_override = getenv("DS4_METAL_DIR");
+    static dispatch_once_t log_once;
+    dispatch_once(&log_once, ^{
+        fprintf(stderr, "ds4: Metal kernel source dir: %s%s\n",
+                (dir_override && dir_override[0]) ? dir_override
+                    : (exe_dir ? [exe_dir UTF8String] : "(CWD; exe path unresolved)"),
+                (dir_override && dir_override[0]) ? " (DS4_METAL_DIR)" : " (exe-relative)");
+    });
     NSMutableString *source = [NSMutableString stringWithString:base];
     for (NSArray<NSString *> *spec in required_sources) {
         const char *override_path = getenv([spec[0] UTF8String]);
         NSMutableArray<NSString *> *paths = [NSMutableArray array];
         if (override_path && override_path[0]) {
             [paths addObject:[NSString stringWithUTF8String:override_path]];
+        }
+        if (dir_override && dir_override[0]) {
+            [paths addObject:[[NSString stringWithUTF8String:dir_override]
+                                 stringByAppendingPathComponent:spec[1]]];
+        }
+        if (exe_dir) {
+            [paths addObject:[exe_dir stringByAppendingPathComponent:spec[1]]];
         }
         [paths addObject:spec[1]];
         [paths addObject:[@"./" stringByAppendingString:spec[1]]];
