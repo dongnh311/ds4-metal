@@ -73604,19 +73604,19 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                             "ds4: Warning: pager resident cache unavailable; every "
                             "expert access will read the SSD\n");
                 }
-                /* Stage C: Start async prefetch worker and allocate double buffers */
-                if (ds4_expert_pager_async_start()) {
-                    uint64_t gate_bytes = ds4_expert_pager_bundle_size(s->qwen4_graph.pager, 0);
-                    uint64_t up_bytes = ds4_expert_pager_bundle_size(s->qwen4_graph.pager, 1);
-                    uint64_t down_bytes = ds4_expert_pager_bundle_size(s->qwen4_graph.pager, 2);
-                    if (ds4_expert_pager_alloc_double_bufs(s->qwen4_graph.pager, gate_bytes, up_bytes, down_bytes)) {
-                        fprintf(stderr, "ds4: Stage C async double-buffer enabled\n");
-                    } else {
-                        fprintf(stderr, "ds4: Warning: failed to alloc double buffers\n");
-                    }
-                } else {
-                    fprintf(stderr, "ds4: Warning: failed to start async worker\n");
-                }
+                /* Item 1.4b (prefetch tuning): the Stage C/D predictive prefetch is
+                 * NOT wired — async_start()/alloc_double_bufs() started an idle
+                 * worker and malloc'd 48×3×2 bundle buffers (~136 MiB), but nothing
+                 * ever calls async_prefetch/predict_next_layer, and the predictor
+                 * (top-10 globally-hottest experts) has near-zero precision against
+                 * a load-balanced MoE's per-token routing. MoE expert identity is
+                 * also known only immediately before the GEMM needs it (the router
+                 * runs just before the experts), so there is no compute window to
+                 * hide the SSD read behind. Starting it therefore only wasted
+                 * ~136 MiB of unified RAM that competes with the expert cache (the
+                 * proven lever, item 1.4) and added swap pressure on a busy box.
+                 * Removed: reclaim the RAM for the cache. The pager's async API is
+                 * left in place for a future routing-aware predictor. */
             }
         }
         /* Task 1 Step 2 (spec §25 Phase 2.1 FIX): initialize the paged KV cache
