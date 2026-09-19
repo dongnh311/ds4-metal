@@ -13885,6 +13885,15 @@ decode_again:
             if (ds4_token_is_stop_for_think_mode(s->engine,
                                                  token,
                                                  j->req.think_mode)) {
+                /* ignore_eos: the MTP-verified block proposed a stop token, but
+                 * this client wants generation to continue to max_tokens. toks[0]
+                 * was chosen with argmax_ignoring_eos and is never a stop, so a
+                 * stop can only appear at ti>=1; truncate the block here without
+                 * emitting it. kept<ntok then triggers the rewind to
+                 * block_start+kept and the next iteration re-samples via
+                 * argmax_ignoring_eos -- matching the plain path so --mtp honors
+                 * ignore_eos too. */
+                if (j->req.ignore_eos) break;
                 finish = "stop";
                 stop_detail = "stop token";
                 stop_token = token;
