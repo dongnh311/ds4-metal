@@ -1,0 +1,78 @@
+diff --git a/ds4.c b/ds4.c
+index 7f1234d..759ae29 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -74175,6 +74175,49 @@ static void qwen4_spec_note_first_draft(ds4_session *s, bool accepted_first) {
+  * it is the target argmax; exact sampling treats it as a point-mass proposal
+  * (accept with p(draft), else replay a residual sample) and always runs at
+  * depth 2. */
++/* DS4_QWEN4_PLD=1: prompt-lookup draft (verify-exact). Only changes the draft
++ * SOURCE, never the committed output — the MTP verify still accepts a draft only
++ * when it equals the target argmax. Given the committed history and the parent
++ * token the draft follows, find the most recent earlier occurrence of the suffix
++ * ending in `parent` and propose the tokens that followed it. Helps outputs that
++ * echo the context (code, edits, quoted text); a no-op when nothing matches. */
++static int qwen4_pld_enabled(void) {
++    static int c = -1;
++    if (c < 0) { const char *e = getenv("DS4_QWEN4_PLD"); c = (e && e[0] && e[0] != '0') ? 1 : 0; }
++    return c;
++}
++static int qwen4_pld_predict(const ds4_tokens *h, int app, int parent, int want, int *out) {
++    const int *v = h->v; const int n = h->len;
++    const int m = n + (app >= 0 ? 1 : 0);
++#define DS4_PLD_E(i) ((i) < n ? v[i] : app)
++    for (int ng = 4; ng >= 3; ng--) {  /* require >=3-token context match: strong-only, never displaces nextn on non-echo */
++        if (m < ng) continue;
++        int best = -1;
++        for (int i = 0; i + ng <= m; i++) {
++            int ok = 1;
++            for (int k = 0; k < ng - 1; k++)
++                if (DS4_PLD_E(i + k) != DS4_PLD_E(m - (ng - 1) + k)) { ok = 0; break; }
++            if (ok && DS4_PLD_E(i + ng - 1) == parent) best = i;
++        }
++        if (best >= 0) {
++            int start = best + ng, cnt = 0;
++            for (int j = start; j < m && cnt < want; j++) out[cnt++] = DS4_PLD_E(j);
++            if (cnt >= 1) return cnt;
++        }
++    }
++#undef DS4_PLD_E
++    return 0;
++}
++static void qwen4_pld_override(ds4_session *s, int app, int parent, int depth) {
++    if (!qwen4_pld_enabled() || !s->glm_mtp_have) return;
++    int out[2]; const int want = (depth == 3) ? 2 : 1;
++    const int got = qwen4_pld_predict(&s->checkpoint, app, parent, want, out);
++    if (got < 1) return;
++    s->glm_mtp_draft = out[0];
++    if (depth == 3) { if (got >= 2) { s->glm_mtp_draft2 = out[1]; s->glm_mtp_have2 = true; }
++                      else s->glm_mtp_have2 = false; }
++}
++
+ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float temperature, int top_k,
+                                         float top_p, float min_p, uint64_t *rng, bool exact_sampling,
+                                         int *accepted, int accepted_cap,
+@@ -74216,6 +74259,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
+                     s->glm_mtp_have2 = true;
+                 }
+             }
++            qwen4_pld_override(s, first_token, parent, depth);
+         }
+         if (qwen4_spec_trace()) {
+             fprintf(stderr, "ds4: spec pos %u token %d plain\n", pos, first_token);
+@@ -74329,6 +74373,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
+                     s->glm_mtp_have2 = true;
+                 }
+             }
++            qwen4_pld_override(s, -1, parent, depth);
+         }
+         s->qwen4_spec_accepted++;
+         accepted[0] = first_token;
+@@ -74360,6 +74405,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
+                     s->glm_mtp_have2 = true;
+                 }
+             }
++            qwen4_pld_override(s, -1, parent, depth);
+         }
+         s->qwen4_spec_accepted++;
+         accepted[0] = first_token;
