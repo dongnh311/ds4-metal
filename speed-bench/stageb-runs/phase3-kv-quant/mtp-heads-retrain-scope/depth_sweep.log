@@ -1,0 +1,13 @@
+=== mtpoff START 13:49:05 ===
+  rc=0  ds4: Qwen3.8 prefill: 192.29 t/s, generation: 36.49 t/s
+  mtp: 
+=== depth2 START 13:49:21 ===
+  rc=0  ds4: prefill: 194.89 t/s, generation: 41.73 t/s
+  mtp: ds4: Qwen3.8 mtp: 309 verify cycles, 202 drafts accepted (65.4%)
+=== depth3 START 13:49:36 ===
+  rc=0  ds4: prefill: 193.43 t/s, generation: 37.59 t/s
+  mtp: ds4: Qwen3.8 mtp: 246 verify cycles, 167 drafts accepted (67.9%)
+=== adaptive START 13:49:52 ===
+  rc=0  ds4: prefill: 193.51 t/s, generation: 42.15 t/s
+  mtp: ds4: Qwen3.8 mtp: 307 verify cycles, 201 drafts accepted (65.5%)
+DEPTH_SWEEP_DONE
