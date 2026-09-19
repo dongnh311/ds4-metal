@@ -51,26 +51,28 @@ def hadamard_rotate(W, block=HAD_BLOCK, inverse=False, seed=0x5eed):
     return out
 
 # ---------------------------------------------------------------- ternary ----
-def ternary_group(w, imp, taus=(0.5, 0.6, 0.7, 0.8, 0.9, 1.0)):
-    """Best imatrix-weighted ternary code+scale for one group.
-    t_i = sign(w_i)·[|w_i| > tau·mean|w|]; s = Σ imp·w·t / Σ imp·t²."""
+def ternary_group(w, imp, iters=5):
+    """imatrix-weighted ternary code+scale for one group, Lloyd-Max refined.
+    Minimises Σ imp·(w − s·t)², t∈{−1,0,+1}. Optimal 0/±s boundary is |w|=s/2;
+    optimal scale s = Σ imp·w·t / Σ imp·t². Alternate the two to convergence."""
     aw = np.abs(w)
     m = aw.mean()
     if m == 0:
         return np.zeros_like(w, np.int8), np.float32(0.0)
-    best = None
-    for tau in taus:
-        t = np.where(aw > tau * m, np.sign(w), 0.0).astype(np.float32)
+    thr = 0.7 * m                                     # init threshold
+    s = 0.0
+    for _ in range(iters):
+        t = np.where(aw > thr, np.sign(w), 0.0).astype(np.float32)
         denom = float((imp * t * t).sum())
         if denom == 0:
+            thr *= 0.6
             continue
         s = float((imp * w * t).sum() / denom)
-        err = float((imp * (w - s * t) ** 2).sum())
-        if best is None or err < best[0]:
-            best = (err, t.astype(np.int8), np.float32(s))
-    if best is None:
-        return np.zeros_like(w, np.int8), np.float32(0.0)
-    return best[1], best[2]
+        thr = abs(s) / 2.0                            # nearest-level boundary
+    t = np.where(aw > abs(s) / 2.0, np.sign(w), 0.0).astype(np.float32)
+    denom = float((imp * t * t).sum())
+    s = float((imp * w * t).sum() / denom) if denom else 0.0
+    return t.astype(np.int8), np.float32(s)
 
 def quantize(W, imatrix=None, block=HAD_BLOCK, group=GROUP, rotate=True, seed=0x5eed):
     """Quantize W [d0,d1]. Returns (codes int8 [d0,d1] in {-1,0,1}, scales
@@ -82,6 +84,12 @@ def quantize(W, imatrix=None, block=HAD_BLOCK, group=GROUP, rotate=True, seed=0x
         imp = np.ones(d0, np.float32)
     else:
         imp = np.asarray(imatrix, np.float32).reshape(d0)
+        if rotate:
+            # In the Hadamard-rotated basis the per-channel importance is
+            # E[(Hx)_i²] ≈ block-mean of E[x²] (|H_ik|²=1/block spreads it).
+            imp = imp.copy()
+            for i in range(0, d0, block):
+                imp[i:i + block] = imp[i:i + block].mean()
     assert d0 % group == 0, f"axis0 {d0} not divisible by group {group}"
     ng = d0 // group
     codes = np.zeros((d0, d1), np.int8)
@@ -133,3 +141,66 @@ def bits_per_weight(meta, packing="ptq1_0"):
 # ------------------------------------------------------------------ utils ----
 def rel_l2(a, b):
     return float(np.linalg.norm((a - b).ravel()) / (np.linalg.norm(a.ravel()) + 1e-30))
+
+def weighted_rel_l2(a, b, imp):
+    """imatrix-weighted relative error along axis 0 (the model-relevant metric):
+    sqrt(Σ imp·(a−b)² / Σ imp·a²)."""
+    w = np.asarray(imp, np.float32).reshape(-1, 1)
+    num = float((w * (a - b) ** 2).sum())
+    den = float((w * a ** 2).sum()) + 1e-30
+    return (num / den) ** 0.5
+
+def load_imatrix(path):
+    """Parse a llama.cpp GGUF imatrix → {tensor_name: importance[n_in]} where
+    importance = in_sum2 / counts (mean squared input activation per channel)."""
+    import struct
+    f = open(path, "rb"); buf = f.read(96 * 1024 * 1024); p = [0]
+    def rd(n): b = buf[p[0]:p[0]+n]; p[0]+=n; return b
+    def u32(): return struct.unpack('<I', rd(4))[0]
+    def u64(): return struct.unpack('<Q', rd(8))[0]
+    def gs(): return rd(u64()).decode('utf-8', 'replace')
+    SC = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8,11:8,12:8}
+    def skipval(vt):
+        if vt in (0,1,7): rd(1)
+        elif vt in (2,3): rd(2)
+        elif vt in (4,5,6): rd(4)
+        elif vt in (10,11,12): rd(8)
+        elif vt == 8: gs()
+        elif vt == 9:
+            et = u32(); c = u64()
+            if et == 8:
+                for _ in range(c): rd(u64())
+            elif et == 9:
+                for _ in range(c): skipval(9)
+            else: rd(SC[et]*c)
+    assert rd(4) == b'GGUF'; u32(); nt = u64(); nk = u64()
+    align = 32
+    for _ in range(nk):
+        k = gs(); vt = u32()
+        if k == 'general.alignment' and vt in (4, 10):
+            align = struct.unpack('<Q' if vt==10 else '<I', buf[p[0]:p[0]+(8 if vt==10 else 4)])[0]
+        skipval(vt)
+    infos = []
+    for _ in range(nt):
+        name = gs(); nd = u32(); dims = [u64() for _ in range(nd)]; tt = u32(); off = u64()
+        infos.append((name, dims, tt, off))
+    data_start = (p[0] + align - 1) // align * align
+    raw = {}
+    for name, dims, tt, off in infos:
+        if tt != 0:  # F32 only
+            continue
+        n = 1
+        for d in dims: n *= d
+        f.seek(data_start + off)
+        raw[name] = (np.frombuffer(f.read(n*4), np.float32).reshape(dims[::-1]) if len(dims) > 1
+                     else np.frombuffer(f.read(n*4), np.float32).copy())
+    f.close()
+    out = {}
+    for name, arr in raw.items():
+        if not name.endswith('.in_sum2'):
+            continue
+        base = name[:-len('.in_sum2')]
+        cnt = raw.get(base + '.counts')
+        c = float(np.mean(cnt)) if cnt is not None else 1.0
+        out[base] = np.asarray(arr, np.float32) / max(c, 1.0)
+    return out
