@@ -33,3 +33,23 @@ on PROD/Q8 too — NOT a regression. Uncensor behavior preserved.
 ## Verdict: PASS. orca-rebase base preserves uncensor behavior, quant fidelity, and
 coherence vs the shipped orca-bugfixes PROD. Remaining before a PROD switch:
 re-port the 4 Tier-1 fixes onto orca-rebase and re-run this gate on the fixed build.
+
+## Q8 gateway-model check (the model ai-gateway actually serves)
+The gateway serves Qwen3.8-Flash-Next-IQ2XXSImatrix-Q2KDownPad768-MTP.gguf (Q8
+dense, 42 GiB) — different from the imat Q4_K model used above. Re-ran old-base
+(orca-bugfixes 0857670) vs new-base (orca-rebase 38b790c) on THAT model:
+- Greedy --mtp AND plain both DIVERGE after ~2 sentences (both coherent).
+- BUT frontier cosine old-vs-new @512 = **0.99859**, rms 0.127, max_abs 0.75,
+  argmax MATCH (321), top5 5/5 — per-token fidelity essentially identical.
+- Root cause isolated: with `--quality` (Metal4 tensor route OFF) the two bases
+  are BYTE-IDENTICAL on Q8. So the divergence is entirely the Metal4 matmul2d
+  TensorOps route (the known M5 tensor-drift), which upstream invokes slightly
+  differently for the Q8 dense path — NOT introduced by the --ple/#1062 port. The
+  imat model doesn't show it because its Q4_K dense uses our custom GEMV, which
+  bypasses the tensor route (hence imat stays byte-identical).
+Verdict: the port math is equivalent (byte-identical with the tensor route off, and
+on imat with it on). On Q8 the greedy text shifts LATERALLY (a different equally-valid
+continuation, cosine 0.9986, argmax-stable) due to pre-existing M5 tensor-route
+non-determinism, not a quality regression. Acceptable for serving; if bit-exact Q8
+reproduction is required, run the tensor route off (--quality, slower) or adopt the
+M5 withhold (a11bf74). imat model output is unchanged (byte-identical).
