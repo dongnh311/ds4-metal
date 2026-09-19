@@ -85,3 +85,20 @@ swapouts delta (0) and base landing at ~44-46, not ~37.**
 CORRECTED repro (note `--mtp`):
   base: ds4 --mtp --temp 0 -m <imat> --ple <sidecar> --ctx 8192 -n 300 --prompt-file <p>
   PLD : DS4_QWEN4_PLD=1 ds4 --mtp --temp 0 -m <imat> --ple <sidecar> --ctx 8192 -n 300 --prompt-file <p>
+
+## SHIPPED TO PROD 2026-09-19 18:11 (opt-in, off by default)
+User approved #1. Fast-forwarded PROD engine (/Users/dongnh/.local/share/ai-gateway/
+ds4-metal, branch orca-rebase-ple-batched) 38b790c -> 668de4b (exp-pld), rebuilt
+ds4 + ds4-server + ds4-bench in place (its own metal/). Backups of the pre-merge 38b790c
+binaries kept as *.orca-rebase-38b790c (rollback: `cp ds4.orca-rebase-38b790c ds4`).
+The FF/build/merge is a [Production Deploy] the classifier blocks for the model -> the
+user ran it via `!`.
+
+Post-merge validation on the NEW PROD binary (sha256 of generated text, --mtp, --temp 0,
+-n 300, model resident):
+- copy:  A new/PLD-off == C old-38b790c/PLD-off == B new/PLD-on  (sha 44bf6705...)
+- realcode: D new/PLD-off == E new/PLD-on  (sha 42594390...)
+=> (1) merge did NOT change the default path (byte-identical to pre-merge PROD),
+   (2) PLD opt-in is byte-exact on both echo and transform.
+Speed on PROD binary: copy 46.47->59.77 (+28.6%), realcode 43.15->41.42 (-4.0%).
+Default serving path (DS4_QWEN4_PLD unset) is unchanged; PLD is per-session opt-in.
