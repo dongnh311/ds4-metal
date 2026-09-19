@@ -1,0 +1,64 @@
+ds4: PLE sidecar table: /Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-PLE-Q4_1.gguf (ple.weight [160, 320001536], CPU-only)
+ds4: PLE sidecar demand-paged (insufficient RAM headroom or DS4_QWEN4_PLE_PREFETCH_FULL=0)
+ds4: Metal device Apple M5 Pro, 64.00 GiB RAM
+ds4: Metal 4 tensor API enabled for Tensor kernels
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=on
+ds4: Metal model views created in 1.158 ms, residency requested in 332.665 ms, warmup 2.802 ms (mapped 41643.70 MiB from offset 10.51 MiB)
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 1.04 GiB (raw 0.81 + compressed 0.23) + buffers 7.74 GiB + resident model 40.67 GiB = 49.45 GiB planned
+ds4: memory detail: ctx=32768 prefill_cap=8192 raw_kv_rows=32768 compressed_kv_rows=8193 backend=metal
+0919 07:58:11 ds4-server: context buffers 8995.22 MiB (ctx=32768, backend=metal, prefill_chunk=8192, raw_kv_rows=32768, compressed_kv_rows=8193)
+0919 07:58:11 ds4-server: 8 resident sessions request at least 70.28 GiB of context buffers, or 16.07 GiB when the model shares one prefill workspace
+ds4: shared Qwen3.8 session transients: cap=8192, 5.52 GiB once; each further session costs its caches only
+0919 07:58:11 ds4-server: batched mode enabled resident_sessions=8 prefill_quantum=2048 mixed_prefill_quantum=128 decode_coalesce_us=2000
+0919 07:58:11 ds4-server: listening on http://127.0.0.1:8000
+0919 07:58:39 ds4-server: chat ctx=0..66:66 prompt start
+0919 07:58:39 ds4-server: chat ctx=0..66:66 prompt start
+0919 07:58:39 ds4-server: chat ctx=0..66:66 prefill chunk 66/66 (100.0%) chunk=0.00 t/s avg=147.75 t/s 0.447s
+0919 07:58:39 ds4-server: chat ctx=0..66:66 prompt done 0.447s
+0919 07:58:39 ds4-server: chat ctx=0..66:66 prefill chunk 66/66 (100.0%) chunk=0.00 t/s avg=77.73 t/s 0.849s
+0919 07:58:39 ds4-server: chat ctx=0..66:66 prompt done 0.849s
+0919 07:58:39 ds4-server: chat ctx=0..66:66 prompt start
+0919 07:58:39 ds4-server: chat ctx=0..66:66 prompt start
+0919 07:58:39 ds4-server: chat ctx=0..66:66 prompt start
+0919 07:58:39 ds4-server: chat ctx=0..66:66 prompt start
+0919 07:58:39 ds4-server: chat ctx=0..66:66 prompt start
+0919 07:58:39 ds4-server: chat ctx=0..66:66 prompt start
+0919 07:58:40 ds4-server: chat ctx=0..66:66 prefill chunk 66/66 (100.0%) chunk=0.00 t/s avg=144.81 t/s 0.456s
+0919 07:58:40 ds4-server: chat ctx=0..66:66 prompt done 0.456s
+0919 07:58:41 ds4-server: chat ctx=0..66:66 prefill chunk 66/66 (100.0%) chunk=0.00 t/s avg=61.42 t/s 1.075s
+0919 07:58:41 ds4-server: chat ctx=0..66:66 prompt done 1.075s
+0919 07:58:41 ds4-server: chat ctx=0..66:66 prefill chunk 66/66 (100.0%) chunk=0.00 t/s avg=38.32 t/s 1.722s
+0919 07:58:41 ds4-server: chat ctx=0..66:66 prompt done 1.722s
+0919 07:58:42 ds4-server: chat ctx=0..66:66 prefill chunk 66/66 (100.0%) chunk=0.00 t/s avg=26.60 t/s 2.482s
+0919 07:58:42 ds4-server: chat ctx=0..66:66 prompt done 2.482s
+0919 07:58:43 ds4-server: chat ctx=0..66:66 prefill chunk 66/66 (100.0%) chunk=0.00 t/s avg=19.53 t/s 3.380s
+0919 07:58:43 ds4-server: chat ctx=0..66:66 prompt done 3.380s
+0919 07:58:44 ds4-server: chat ctx=0..66:66 prefill chunk 66/66 (100.0%) chunk=0.00 t/s avg=15.75 t/s 4.191s
+0919 07:58:44 ds4-server: chat ctx=0..66:66 prompt done 4.191s
+ds4: Metal command batch failed: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)
+0919 07:58:44 ds4-server: chat ctx=66..88:22 gen=22 THINKING decoding chunk=4.78 t/s avg=4.78 t/s 4.605s
+0919 07:58:44 ds4-server: chat ctx=66..81:15 gen=15 THINKING decoding chunk=4.29 t/s avg=4.29 t/s 3.499s
+0919 07:58:44 ds4-server: chat ctx=66..90:24 gen=24 THINKING decoding chunk=4.79 t/s avg=4.79 t/s 5.008s
+0919 07:58:44 ds4-server: chat ctx=66..73:7 gen=7 THINKING decoding chunk=3.35 t/s avg=3.35 t/s 2.092s
+0919 07:58:44 ds4-server: chat ctx=66..84:18 gen=18 THINKING decoding chunk=4.37 t/s avg=4.37 t/s 4.118s
+0919 07:58:44 ds4-server: chat ctx=66..77:11 gen=11 THINKING decoding chunk=3.86 t/s avg=3.86 t/s 2.851s
+0919 07:58:44 ds4-server: chat ctx=66..69:3 gen=3 THINKING decoding chunk=2.51 t/s avg=2.51 t/s 1.193s
+ds4-server: thinking not closed, ignoring incomplete Qwen tool calls in reasoning
+ds4-server: thinking not closed, ignoring incomplete Qwen tool calls in reasoning
+ds4-server: thinking not closed, ignoring incomplete Qwen tool calls in reasoning
+ds4-server: thinking not closed, ignoring incomplete Qwen tool calls in reasoning
+ds4-server: thinking not closed, ignoring incomplete Qwen tool calls in reasoning
+ds4-server: thinking not closed, ignoring incomplete Qwen tool calls in reasoning
+ds4-server: thinking not closed, ignoring incomplete Qwen tool calls in reasoning
+ds4-server: thinking not closed, ignoring incomplete Qwen tool calls in reasoning
+0919 07:58:44 ds4-server: chat ctx=0..66:66 gen=11 THINKING finish=error error="metal speculative batch failed" 4.574s
+0919 07:58:44 ds4-server: chat ctx=0..66:66 gen=22 THINKING finish=error error="metal speculative batch failed" 5.455s
+0919 07:58:44 ds4-server: chat ctx=0..66:66 gen=18 THINKING finish=error error="metal speculative batch failed" 4.574s
+0919 07:58:44 ds4-server: chat ctx=0..66:66 gen=24 THINKING finish=error error="metal speculative batch failed" 5.455s
+0919 07:58:44 ds4-server: chat ctx=0..66:66 gen=7 THINKING finish=error error="metal speculative batch failed" 4.574s
+0919 07:58:44 ds4-server: chat ctx=0..66:66 gen=0 THINKING finish=error error="metal speculative batch failed" 4.574s
+0919 07:58:44 ds4-server: chat ctx=0..66:66 gen=15 THINKING finish=error error="metal speculative batch failed" 4.574s
+0919 07:58:44 ds4-server: chat ctx=0..66:66 gen=3 THINKING finish=error error="metal speculative batch failed" 4.574s
+0919 07:59:59 ds4-server: shutdown requested, draining requests
