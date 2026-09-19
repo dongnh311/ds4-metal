@@ -1,0 +1,34 @@
+ds4: PLE sidecar table: /Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-PLE-Q4_1.gguf (ple.weight [160, 320001536], CPU-only)
+ds4: PLE sidecar demand-paged (insufficient RAM headroom or DS4_QWEN4_PLE_PREFETCH_FULL=0)
+ds4: Metal device Apple M5 Pro, 64.00 GiB RAM
+ds4: Metal 4 tensor API enabled for Tensor kernels
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=on
+ds4: Metal model views created in 1.207 ms, residency requested in 4601.274 ms, warmup 3.092 ms (mapped 41643.70 MiB from offset 10.51 MiB)
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 7.29 GiB (raw 5.69 + compressed 1.60) + buffers 1.63 GiB + resident model 40.67 GiB = 49.59 GiB planned
+ds4: memory detail: ctx=229376 prefill_cap=1024 raw_kv_rows=229376 compressed_kv_rows=57345 backend=metal
+0919 10:07:45 ds4-server: context buffers 9135.17 MiB (ctx=229376, backend=metal, prefill_chunk=1024, raw_kv_rows=229376, compressed_kv_rows=57345)
+0919 10:07:45 ds4-server: KV disk cache /Users/dongnh/.local/share/ai-gateway/ds4-kv-cache (budget=32768 MiB, cross-quant=accept, min=512, cold_max=229376, continued=10000, trim=32, align=2048, hit_half_life=21600s)
+0919 10:07:45 ds4-server: listening on http://127.0.0.1:18086
+0919 10:07:54 ds4-server: chat ctx=0..63:63 prompt start
+ds4: Metal kernel_qwen4_dense_mm_reduce function not found
+ds4: Qwen3.8 kernel 'kernel_qwen4_dense_mm_reduce' is absent from the compiled Metal sources.
+ds4: Metal sources are loaded from ./metal at startup, so a binary newer
+ds4: than the working directory's metal/ files (e.g. run from an older
+ds4: checkout) produces this error. Run from the matching checkout, update
+ds4: metal/, or point DS4_METAL_QWEN4_SOURCE at a current qwen4.metal.
+0919 10:07:55 ds4-server: chat ctx=0..63:63 prefill chunk 63/63 (100.0%) chunk=0.00 t/s avg=80.29 t/s 0.785s
+0919 10:07:55 ds4-server: chat ctx=0..63:63 prompt done 0.785s
+0919 10:07:56 ds4-server: chat ctx=63..113:50 gen=50 THINKING decoding chunk=39.26 t/s avg=39.26 t/s 1.274s
+0919 10:07:57 ds4-server: chat ctx=113..123:10 gen=60 THINKING decoding chunk=27.93 t/s avg=36.77 t/s 1.632s
+ds4-server: thinking not closed, ignoring incomplete Qwen tool calls in reasoning
+0919 10:07:57 ds4-server: chat ctx=0..63:63 gen=60 THINKING finish=length 2.417s
+0919 10:08:22 ds4-server: live kv cache miss live=123 prompt=58 common=45 vision=match reason=token-mismatch
+0919 10:08:22 ds4-server: chat ctx=0..58:58 prompt start
+0919 10:08:22 ds4-server: chat ctx=0..58:58 prefill chunk 58/58 (100.0%) chunk=0.00 t/s avg=100.10 t/s 0.579s
+0919 10:08:22 ds4-server: chat ctx=0..58:58 prompt done 0.580s
+0919 10:08:23 ds4-server: chat ctx=58..77:19 gen=19 decoding chunk=39.07 t/s avg=39.07 t/s 0.486s
+0919 10:08:23 ds4-server: thinking live checkpoint remembered ctx=0..58:58 live=77 visible=347
+0919 10:08:23 ds4-server: chat ctx=0..58:58 gen=19 finish=stop 1.066s
+0919 10:08:23 ds4-server: shutdown requested, draining requests
