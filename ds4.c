@@ -57951,9 +57951,11 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     g->cap_tokens = cap_tokens;
     g->k_blocks = DS4_N_INDEXER_TOP_K / 4u;
     g->n_logit_rows = mtp ? 3u : 1u;
-    if (mtp) { /* DS4_QWEN4_PLD_SPAN=N widens verify to N+1 rows for prompt-lookup span verify */
+    if (mtp) { /* prompt-lookup span verify widens the verify to N+1 rows */
+        const char *pd = getenv("DS4_QWEN4_PLD");
         const char *pe = getenv("DS4_QWEN4_PLD_SPAN");
-        if (pe && pe[0]) { long n = strtol(pe, NULL, 10);
+        if ((pd && pd[0] && pd[0] != '0') || (pe && pe[0])) {
+            long n = (pe && pe[0]) ? strtol(pe, NULL, 10) : 8;
             if (n < 3) n = 3; if (n > 16) n = 16;
             if ((uint32_t)(n + 1) > g->n_logit_rows) g->n_logit_rows = (uint32_t)(n + 1); }
     }
@@ -58368,32 +58370,27 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
                qwen4_gemv(g->hc_u, m, up, g->hc_lo_act, T) &&
                ds4_gpu_qwen4_hc_mix_rows_tensor(g->mixed, g->hc_u, g->xn, T, DS4_N_EMBD, DS4_N_HC);
     }
-    if (T == 3u && g->verify_rows_exact) {
-        /* Split the 3-row gate/mix into the exact 2-row pair kernel plus the
-         * 1-row generic kernel, so every row matches its T <= 2 rounding. */
+    if (T > 2u && g->verify_rows_exact) {
+        /* Split the gate/mix into <=2-row sub-batches so every row matches its
+         * T <= 2 rounding (generalized from the 3-row verify for PLD span). */
         const uint64_t dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
-        ds4_gpu_tensor *xn2 = ds4_gpu_tensor_view(g->xn, 0, 2u * dim * sizeof(float));
-        ds4_gpu_tensor *lo2 = ds4_gpu_tensor_view(g->lo, 0, 2u * DS4_N_HC_LOWRANK * sizeof(float));
-        ds4_gpu_tensor *mixed2 = ds4_gpu_tensor_view(g->mixed, 0, 2u * DS4_N_EMBD * sizeof(float));
-        const bool ok2 = xn2 && lo2 && mixed2 &&
-            ds4_gpu_qwen4_hc_gate_mix_tensor(mixed2, xn2, lo2, m->map, m->size, up->abs_offset,
-                                             up->type, 2u, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
-        ds4_gpu_tensor_free(mixed2);
-        ds4_gpu_tensor_free(lo2);
-        ds4_gpu_tensor_free(xn2);
-        if (!ok2) return false;
-        ds4_gpu_tensor *xn1 = ds4_gpu_tensor_view(g->xn, 2u * dim * sizeof(float), dim * sizeof(float));
-        ds4_gpu_tensor *lo1 = ds4_gpu_tensor_view(g->lo, 2u * DS4_N_HC_LOWRANK * sizeof(float),
-                                                  DS4_N_HC_LOWRANK * sizeof(float));
-        ds4_gpu_tensor *mixed1 = ds4_gpu_tensor_view(g->mixed, 2u * DS4_N_EMBD * sizeof(float),
-                                                     DS4_N_EMBD * sizeof(float));
-        const bool ok1 = xn1 && lo1 && mixed1 &&
-            ds4_gpu_qwen4_hc_gate_mix_tensor(mixed1, xn1, lo1, m->map, m->size, up->abs_offset,
-                                             up->type, 1u, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
-        ds4_gpu_tensor_free(mixed1);
-        ds4_gpu_tensor_free(lo1);
-        ds4_gpu_tensor_free(xn1);
-        return ok1;
+        for (uint32_t sub0 = 0; sub0 < T; sub0 += 2u) {
+            const uint32_t subT = T - sub0 > 2u ? 2u : T - sub0;
+            ds4_gpu_tensor *xnv = ds4_gpu_tensor_view(g->xn, (uint64_t)sub0 * dim * sizeof(float),
+                                                      (uint64_t)subT * dim * sizeof(float));
+            ds4_gpu_tensor *lov = ds4_gpu_tensor_view(g->lo, (uint64_t)sub0 * DS4_N_HC_LOWRANK * sizeof(float),
+                                                      (uint64_t)subT * DS4_N_HC_LOWRANK * sizeof(float));
+            ds4_gpu_tensor *mixedv = ds4_gpu_tensor_view(g->mixed, (uint64_t)sub0 * DS4_N_EMBD * sizeof(float),
+                                                         (uint64_t)subT * DS4_N_EMBD * sizeof(float));
+            const bool oks = xnv && lov && mixedv &&
+                ds4_gpu_qwen4_hc_gate_mix_tensor(mixedv, xnv, lov, m->map, m->size, up->abs_offset,
+                                                 up->type, subT, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
+            ds4_gpu_tensor_free(mixedv);
+            ds4_gpu_tensor_free(lov);
+            ds4_gpu_tensor_free(xnv);
+            if (!oks) return false;
+        }
+        return true;
     }
     return ok && ds4_gpu_qwen4_hc_gate_mix_tensor(g->mixed, g->xn, g->lo, m->map, m->size, up->abs_offset,
                                                   up->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
@@ -58525,10 +58522,10 @@ static bool qwen4_graph_attention_tail(ds4_qwen4_gpu_graph *g, const ds4_model *
                                             DS4_N_ROT, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS)) {
         return false;
     }
-    if (T == 3u && g->verify_rows_exact) {
-        /* 3-row speculative verify: run the attention core as 2/1-row
-         * sub-batches so every dispatch keeps the exact T <= 2 kernel paths
-         * (prefill T = 3 tails keep their own kernel selection). */
+    if (T > 2u && g->verify_rows_exact) {
+        /* speculative verify: run the attention core as <=2-row sub-batches so
+         * every dispatch keeps the exact T <= 2 kernel paths (prefill tails keep
+         * their own kernel selection). Generalized from 3 to N rows for PLD span. */
         for (uint32_t sub0 = 0; sub0 < T; sub0 += 2u) {
             const uint32_t subT = T - sub0 > 2u ? 2u : T - sub0;
             ds4_gpu_tensor *q = sub0 ? ds4_gpu_tensor_view(g->q, (uint64_t)sub0 * q_dim * sizeof(float),
@@ -60340,6 +60337,7 @@ struct ds4_session {
     size_t dspark_conf_features_cap;
 #endif
     int mtp_draft_token;
+    int pld_cooldown;      /* PLD span back-off after a partial accept */
 #ifndef DS4_NO_GPU
     int dspark_draft_tokens[DS4_DSPARK_MAX_BLOCK_SIZE];
     uint32_t dspark_draft_len;
@@ -74227,10 +74225,16 @@ static void qwen4_pld_override(ds4_session *s, int app, int parent, int depth) {
 /* Prompt-lookup SPAN: search the committed history for the most recent earlier
  * occurrence of the suffix ending at `first_token` (>=3-token key) and return up
  * to `want` tokens that followed it. Verify-exact via the span verifier below. */
+/* Confidence-gated: require a >=DS4_PLD_MIN_NG context match and cap the proposed
+ * span to the match length (a longer exact context predicts a longer reliable
+ * continuation), so a wasted big verify forward stays bounded on non-echo output. */
 static int qwen4_pld_span2(const int *cp, int cn, int first_token, int want, int *out) {
-    if (cn < 3 || want < 1) return 0;
+    static int min_ng = -1;
+    if (min_ng < 0) { const char *e = getenv("DS4_QWEN4_PLD_MIN_NG"); min_ng = (e && e[0]) ? atoi(e) : 5;
+                      if (min_ng < 3) min_ng = 3; }
+    if (cn < min_ng || want < 1) return 0;
     int maxng = cn + 1; if (maxng > 8) maxng = 8;
-    for (int ng = maxng; ng >= 3; ng--) {
+    for (int ng = maxng; ng >= min_ng; ng--) {
         int best = -1;
         for (int i = 0; i + ng <= cn; i++) {
             int ok = 1;
@@ -74239,8 +74243,9 @@ static int qwen4_pld_span2(const int *cp, int cn, int first_token, int want, int
             if (ok && cp[i + ng - 1] == first_token) best = i;
         }
         if (best >= 0) {
+            int cap = ng < want ? ng : want;   /* span length tied to match confidence */
             int start = best + ng, cnt = 0;
-            for (int j = start; j < cn && cnt < want; j++) out[cnt++] = cp[j];
+            for (int j = start; j < cn && cnt < cap; j++) out[cnt++] = cp[j];
             if (cnt >= 1) return cnt;
         }
     }
@@ -74264,18 +74269,35 @@ static int qwen4_span_verify(ds4_session *s, int first_token, const int *span, i
     int toks[18]; toks[0] = first_token;
     for (int i = 0; i < ns; i++) toks[1 + i] = span[i];
     if (!qwen4_graph_ensure_snap0(g) || !qwen4_graph_state_copy0(g, true)) return -2; /* caller falls back */
-    g->snap_after_first = false; g->snap_after_second = false; g->verify_rows_exact = false;
-    ds4_gpu_qwen4_set_verify_rows_exact(false);
-    if (!qwen4_graph_forward_tokens(g, m, w, toks, T, rows, true)) {
+    g->snap_after_first = false; g->snap_after_second = false;
+    g->verify_rows_exact = true;             /* per-row exact attention/gate over the span */
+    ds4_gpu_qwen4_set_verify_rows_exact(true);
+    const bool fok = qwen4_graph_forward_tokens(g, m, w, toks, T, rows, true);
+    if (!fok) {
+        g->verify_rows_exact = false; ds4_gpu_qwen4_set_verify_rows_exact(false);
         if (errlen) snprintf(err, errlen, "Qwen3.8 span verify failed"); s->checkpoint_valid = false; return -1;
     }
     int k = 0;
     while (k < ns && sample_argmax(rows + (size_t)k * V, V) == span[k]) k++;
-    if (!qwen4_graph_state_copy0(g, false)) {
-        if (errlen) snprintf(err, errlen, "Qwen3.8 span restore failed"); s->checkpoint_valid = false; return -1;
-    }
-    if (!qwen4_graph_forward_tokens(g, m, w, toks, (uint32_t)k + 1u, s->logits, false)) {
-        if (errlen) snprintf(err, errlen, "Qwen3.8 span replay failed"); s->checkpoint_valid = false; return -1;
+    if (k == ns) {
+        /* full accept: the verify forward already advanced state over all committed
+         * tokens, so no replay -- just take the last row's logits (byte-exact via the
+         * per-row split). This is the win: ~ns tokens committed in ONE forward. */
+        memcpy(s->logits, rows + (size_t)ns * V, (size_t)V * sizeof(float));
+        g->verify_rows_exact = false; ds4_gpu_qwen4_set_verify_rows_exact(false);
+        s->pld_cooldown = 0;   /* span paid off */
+    } else {
+        /* partial accept: restore the pre-block state and replay the committed prefix */
+        if (!qwen4_graph_state_copy0(g, false)) {
+            g->verify_rows_exact = false; ds4_gpu_qwen4_set_verify_rows_exact(false);
+            if (errlen) snprintf(err, errlen, "Qwen3.8 span restore failed"); s->checkpoint_valid = false; return -1;
+        }
+        const bool rok = qwen4_graph_forward_tokens(g, m, w, toks, (uint32_t)k + 1u, s->logits, false);
+        g->verify_rows_exact = false; ds4_gpu_qwen4_set_verify_rows_exact(false);
+        s->pld_cooldown = 6;   /* wasted a big verify -> back off a few cycles */
+        if (!rok) {
+            if (errlen) snprintf(err, errlen, "Qwen3.8 span replay failed"); s->checkpoint_valid = false; return -1;
+        }
     }
     token_vec_push(&s->checkpoint, first_token);
     for (int i = 0; i < k; i++) token_vec_push(&s->checkpoint, span[i]);
@@ -74300,15 +74322,18 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     const uint32_t V = DS4_N_VOCAB;
     const int depth = (exact_sampling && temperature > 0.0f) || getenv("DS4_QWEN4_NO_MTP_BATCH") != NULL
         ? 2 : qwen4_spec_depth(s);
+    if (s->pld_cooldown > 0) s->pld_cooldown--;
     /* DS4_QWEN4_PLD_SPAN: prompt-lookup span verify (greedy/opportunistic only). */
-    if (qwen4_pld_enabled() && !(exact_sampling && temperature > 0.0f) && g->n_logit_rows >= 5) {
+    if (qwen4_pld_enabled() && !(exact_sampling && temperature > 0.0f) && g->n_logit_rows >= 5 && s->pld_cooldown == 0) {
         int maxspan = (int)g->n_logit_rows - 1;
         if (maxspan > accepted_cap - 1) maxspan = accepted_cap - 1;
         if (maxspan > (int)g->cap_tokens - 1) maxspan = (int)g->cap_tokens - 1;
         if (pos + (uint32_t)maxspan + 1u > g->ctx_cap) maxspan = (int)(g->ctx_cap - pos) - 1;
         int span[18];
         int ns = (maxspan >= 3) ? qwen4_pld_span2(s->checkpoint.v, s->checkpoint.len, first_token, maxspan, span) : 0;
-        if (ns >= 3) {
+        static int min_span = -1;
+        if (min_span < 0) { const char *e = getenv("DS4_QWEN4_PLD_MINSPAN"); min_span = (e && e[0]) ? atoi(e) : 8; if (min_span < 2) min_span = 2; }
+        if (ns >= min_span) {
             int r = qwen4_span_verify(s, first_token, span, ns, accepted, accepted_cap, err, errlen);
             if (r != -2) return r;   /* -2 = snapshot unavailable, fall through to nextn path */
         }
