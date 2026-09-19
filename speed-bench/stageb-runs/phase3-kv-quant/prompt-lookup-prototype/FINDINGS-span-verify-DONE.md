@@ -62,3 +62,26 @@ fall back to #2 (that fixed-width version) or drop PLD entirely.
   Tunables: DS4_QWEN4_PLD_SPAN (max span), _MIN_NG, _MINSPAN.
 - NOTE: live re-measurement is currently blocked -- the box has ~28 GiB stale swap from
   the benchmark marathon; clean absolute numbers need `sudo purge` or an idle drain.
+
+## CLEAN RE-MEASURE 2026-09-19 16:41 (corrects the "swap-thrash / needs purge" note above)
+Certified A/B, model RESIDENT (swapouts+0MB every run, base ~44-46 confirms residency),
+ctx 8192, -n 300, --temp 0, imat + PLE demand-paged (DS4_QWEN4_PLE_PREFETCH_FULL=0):
+
+| workload | base `--mtp` | PLD `--mtp` + DS4_QWEN4_PLD=1 | delta |
+|---|---|---|---|
+| copy / echo | 46.58 t/s | 59.23 t/s | **+27.2%** |
+| realcode transform | 42.61 t/s | 41.26 t/s | -3.2% |
+| chat | 41.33 t/s | 42.77 t/s | +3.5% |
+
+**ROOT CAUSE of the earlier "flat ~37, no win, needs purge" runs: the A/B harness omitted
+`--mtp`.** PLD lives inside `ds4_session_qwen4_spec_cycle`, which the engine only enters
+when `engine->glm_mtp` is set (CLI `--mtp`). Without `--mtp` decode takes the MTP-off path
+(~36.5 t/s) and the PLD branch never executes -> base == PLD == ~37, which looked like a
+thrashed box but was a missing flag. The ~28 GiB stale swap is real but IRRELEVANT: it is
+never touched during decode (swapouts+0 with the model resident), so no `sudo purge` is
+needed for a clean measure. **Correct A/B: `--mtp` on BOTH sides; certify residency by
+swapouts delta (0) and base landing at ~44-46, not ~37.**
+
+CORRECTED repro (note `--mtp`):
+  base: ds4 --mtp --temp 0 -m <imat> --ple <sidecar> --ctx 8192 -n 300 --prompt-file <p>
+  PLD : DS4_QWEN4_PLD=1 ds4 --mtp --temp 0 -m <imat> --ple <sidecar> --ctx 8192 -n 300 --prompt-file <p>
