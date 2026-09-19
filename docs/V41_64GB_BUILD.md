@@ -8,6 +8,21 @@ rewritten, degraded, or modified unless a proven generic fix passes all Qwen
 benchmarks — **and gated by a Phase-0 feasibility measurement that must prove
 the target tok/s is physically reachable before runtime optimization begins.**
 
+## Definition of Done (the North Star — all five must hold)
+
+Confirmed goal (2026-09-19): **DeepSeek-V4.1-Flash Q2 usable on M5 Pro 64 GB,
+single-stream, for agent workloads, without degrading Qwen3.8.** DONE iff:
+
+1. `ds4 --ssd-streaming` loads V4.1-Flash Q2 on 64 GB **zero-swap**;
+2. decode **≥10 t/s (floor), target 15–20 t/s**;
+3. passes **ds4-eval core** + a real **agent smoke** (coherent + correct);
+4. **Qwen3.8 regression green** (no regression on the protected subsystem);
+5. reproducible (pinned model/commit, recorded bench).
+
+Non-goals: resident/>30 t/s (SSD-bound); big-machine/TP (Ivan's lane);
+ternary/Bonsai is an **optional** accelerator, parked until Phase 0(b) shows a
+speed shortfall.
+
 ## 0. Status & preconditions
 
 - **DEFERRED.** Build starts when the scallop-branch work completes and frees
