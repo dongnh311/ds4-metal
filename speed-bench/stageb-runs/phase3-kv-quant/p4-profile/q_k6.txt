@@ -1,0 +1,5 @@
+We need to respond to the user: "Write a Python function to compute the nth prime number, with a docstring, type hints, and a brief complexity note."
+
+Need produce final answer with code. Need likely include function nth_prime(n: int) -> int with docstring, type hints, complexity note. Could implement efficient trial division with 6k±1 optimization. Complexity note: O(n sqrt(p_n)) maybe with trial division? Actually checking primes up to sqrt(candidate) for each candidate. Could mention O(n sqrt(p_n)) time, O(1) space. Or if using sieve? nth prime requires upper bound. Could implement simple trial division. Need maybe handle n <= 0. Could include doctest? Not necessary. Need ensure correct.
+
+Let's craft

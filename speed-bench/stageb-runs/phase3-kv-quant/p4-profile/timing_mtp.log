@@ -1,0 +1,18 @@
+ds4: PLE sidecar table: /Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-PLE-Q4_1.gguf (ple.weight [160, 320001536], CPU-only)
+ds4: PLE sidecar demand-paged (insufficient RAM headroom or DS4_QWEN4_PLE_PREFETCH_FULL=0)
+ds4: Metal device Apple M5 Pro, 64.00 GiB RAM
+ds4: Metal kernel source dir: /Users/dongnh/.local/share/ai-gateway/ds4-metal (exe-relative)
+ds4: Metal 4 tensor API enabled for Tensor kernels
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=on
+ds4: Metal model views created in 1.031 ms, residency requested in 329.510 ms, warmup 3.048 ms (mapped 41643.70 MiB from offset 10.51 MiB)
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 0.13 GiB (raw 0.10 + compressed 0.03) + buffers 3.49 GiB + resident model 40.67 GiB = 44.29 GiB planned
+ds4: memory detail: ctx=4096 prefill_cap=4096 raw_kv_rows=4096 compressed_kv_rows=1025 backend=metal
+ds4: memory: KV 0.13 GiB (raw 0.10 + compressed 0.03) + buffers 3.49 GiB = 3.62 GiB context
+ds4: memory detail: ctx=4096 prefill_cap=4096 raw_kv_rows=4096 compressed_kv_rows=1025 backend=metal
+processing 65 input tokens: 65/65 (100.0%)
+We need to explain speculative decoding in detail. User asks in English. Need produce final answer detailed. Need think through content.
+
+Speculative decoding: LLM inference acceleration technique. Idea: draft model generates multiple candidate tokens quickly, target model verifies in parallel via one forward pass (or few) using rejection sampling to preserve
+ds4: prefill: 115.13 t/s, generation: 40.95 t/s

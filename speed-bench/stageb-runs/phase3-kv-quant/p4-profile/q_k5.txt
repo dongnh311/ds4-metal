@@ -1,0 +1,10 @@
+The user wants a Python function to compute the nth prime number.
+I need to include:
+1.  Docstring
+2.  Type hints
+3.  Brief complexity note
+
+Let's think about the algorithm.
+- Trial division is simple and good for small n.
+- Sieve of Eratosthenes is better for finding all primes up to N, but we need the nth prime, so we don't know the upper bound exactly (though we can estimate with the prime number theorem).
+- A simple trial division with optimization (checking up to sqrt, skipping evens) is O(n * sqrt(p_n)) where p_n is the nth prime. Since p_n ~ n log n, it's roughly O(n^(1.5) * sqrt(log

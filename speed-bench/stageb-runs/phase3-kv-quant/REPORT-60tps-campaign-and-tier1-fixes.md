@@ -11,11 +11,13 @@ p2-throughput,p3-gates}.
 1. **Four Tier-1 latent-bug fixes delivered and validated** (softplus log1p accuracy,
    moe_reduce isfinite guard, ignore_eos under --mtp, #1050 tool-call message).
    No quality regression, decode t/s unchanged. Engine commit orca-bugfixes 0857670.
-2. **60 t/s single-stream --mtp is NOT reachable** on this model/hardware with the
-   in-scope levers (no new flags, no retrain, no quality loss). Honest baseline is
-   **~42.8 t/s** and that is at/near the architectural + kernel ceiling. Every
-   engine lever in the plan (FLUSH_LAYER, MTP tuning, #1056 kernel port) was tried
-   and yields nothing — see Phase 2. The reasons are structural, not tuning gaps.
+2. **60 t/s single-stream --mtp is NOT reachable** on this model/hardware — now
+   MEASURED, not inferred (Phase 4). Decode is **92% GPU-compute-bound** (PLE gather
+   only 4%). The biggest lever, cutting active experts 10→4 (major quality loss,
+   cosine 0.842), reaches only **52 t/s** because experts are ~30-40% of GPU compute
+   and the non-expert work (dense/GDN/HC/attn) floors at ~52-55 t/s. Honest baseline
+   is **~42.8 t/s**. Every in-scope engine lever (FLUSH_LAYER, MTP tuning, #1056
+   port) yields nothing; see Phase 2 & 4. The ceiling is structural.
 3. **All Tier-2 risk gates pass** (repetition, MTP verify-exactness, ignore_eos,
    M5 tensor-drift argmax-stable to 8K).
 
@@ -62,6 +64,25 @@ by metal-swap A/B (Q8/imat old-vs-new cosine 0.995, argmax MATCH).
   new knob → would require your go-ahead per the no-new-flag rule).
 - For **aggregate** throughput (NOT single-stream latency): the #1062 multi-session
   batching (65x @16 streams) via a --ple forward-port — the deferred big project.
+
+## Phase 4 — "try everything for 60" (measured profile + expert-reduction curve)
+After you authorized trying every avenue, I profiled decode and drove the biggest
+lever in an isolated worktree (PROD untouched). Receipt: p4-profile/.
+- **Decode = 92% GPU compute** (DS4_QWEN4_TIMING=1, MTP-off): gpu 36.54 ms/token vs
+  stage/PLE 1.66, encode 1.29, read 0.04. PLE demand-paging is NOT the bottleneck.
+- **Active-expert curve** (model routes 10; diagnostic env clamps top-k; --mtp;
+  cosine vs full at frontier 512):
+  | k | cosine vs full | --mtp t/s | vs full |
+  |---|---|---|---|
+  | 10 (shipped) | 1.000 | 41.7 | — |
+  | 6 | 0.947 | 45.6 | +9% |
+  | 5 | 0.927 | 48.4 | +16% |
+  | 4 | 0.842 | 52.1 | +25% |
+- **Even gutting experts to k=4 (visible quality loss) only hits 52 t/s** — the
+  non-expert GPU floor (~52-55) blocks 60. The expert cut also compounds the Q4_K
+  gap (k=4 ≈ 0.80 vs Q8). 60 single-stream needs a model change (fewer layers or
+  more MTP heads = retrain), not tuning. The k-curve is an OPTIONAL speed/quality
+  dial you can choose (e.g. k=6 = +9% near the current fidelity budget), not shipped.
 
 ## Phase 3 — risk gates (receipt p3-gates): ALL PASS
 - ignore_eos under --mtp: fixed & A/B-proven (28→120 tokens). Gap noted:
