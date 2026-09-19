@@ -57951,6 +57951,12 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     g->cap_tokens = cap_tokens;
     g->k_blocks = DS4_N_INDEXER_TOP_K / 4u;
     g->n_logit_rows = mtp ? 3u : 1u;
+    if (mtp) { /* DS4_QWEN4_PLD_SPAN=N widens verify to N+1 rows for prompt-lookup span verify */
+        const char *pe = getenv("DS4_QWEN4_PLD_SPAN");
+        if (pe && pe[0]) { long n = strtol(pe, NULL, 10);
+            if (n < 3) n = 3; if (n > 16) n = 16;
+            if ((uint32_t)(n + 1) > g->n_logit_rows) g->n_logit_rows = (uint32_t)(n + 1); }
+    }
     g->n_block_cap = ctx_cap / 4u + 1u;
     static bool warned_ctx = false;
     if (!warned_ctx && g_qwen4_native_ctx && ctx_cap > g_qwen4_native_ctx && !g_qwen4_rope_yarn) {
@@ -74175,6 +74181,112 @@ static void qwen4_spec_note_first_draft(ds4_session *s, bool accepted_first) {
  * it is the target argmax; exact sampling treats it as a point-mass proposal
  * (accept with p(draft), else replay a residual sample) and always runs at
  * depth 2. */
+/* DS4_QWEN4_PLD=1: prompt-lookup draft (verify-exact). Only changes the draft
+ * SOURCE, never the committed output — the MTP verify still accepts a draft only
+ * when it equals the target argmax. Given the committed history and the parent
+ * token the draft follows, find the most recent earlier occurrence of the suffix
+ * ending in `parent` and propose the tokens that followed it. Helps outputs that
+ * echo the context (code, edits, quoted text); a no-op when nothing matches. */
+static int qwen4_pld_enabled(void) {
+    static int c = -1;
+    if (c < 0) { const char *e = getenv("DS4_QWEN4_PLD"); c = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return c;
+}
+static int qwen4_pld_predict(const ds4_tokens *h, int app, int parent, int want, int *out) {
+    const int *v = h->v; const int n = h->len;
+    const int m = n + (app >= 0 ? 1 : 0);
+#define DS4_PLD_E(i) ((i) < n ? v[i] : app)
+    for (int ng = 4; ng >= 3; ng--) {  /* require >=3-token context match: strong-only, never displaces nextn on non-echo */
+        if (m < ng) continue;
+        int best = -1;
+        for (int i = 0; i + ng <= m; i++) {
+            int ok = 1;
+            for (int k = 0; k < ng - 1; k++)
+                if (DS4_PLD_E(i + k) != DS4_PLD_E(m - (ng - 1) + k)) { ok = 0; break; }
+            if (ok && DS4_PLD_E(i + ng - 1) == parent) best = i;
+        }
+        if (best >= 0) {
+            int start = best + ng, cnt = 0;
+            for (int j = start; j < m && cnt < want; j++) out[cnt++] = DS4_PLD_E(j);
+            if (cnt >= 1) return cnt;
+        }
+    }
+#undef DS4_PLD_E
+    return 0;
+}
+static void qwen4_pld_override(ds4_session *s, int app, int parent, int depth) {
+    if (!qwen4_pld_enabled() || !s->glm_mtp_have) return;
+    int out[2]; const int want = (depth == 3) ? 2 : 1;
+    const int got = qwen4_pld_predict(&s->checkpoint, app, parent, want, out);
+    if (got < 1) return;
+    s->glm_mtp_draft = out[0];
+    if (depth == 3) { if (got >= 2) { s->glm_mtp_draft2 = out[1]; s->glm_mtp_have2 = true; }
+                      else s->glm_mtp_have2 = false; }
+}
+
+/* Prompt-lookup SPAN: search the committed history for the most recent earlier
+ * occurrence of the suffix ending at `first_token` (>=3-token key) and return up
+ * to `want` tokens that followed it. Verify-exact via the span verifier below. */
+static int qwen4_pld_span2(const int *cp, int cn, int first_token, int want, int *out) {
+    if (cn < 3 || want < 1) return 0;
+    int maxng = cn + 1; if (maxng > 8) maxng = 8;
+    for (int ng = maxng; ng >= 3; ng--) {
+        int best = -1;
+        for (int i = 0; i + ng <= cn; i++) {
+            int ok = 1;
+            for (int k = 0; k < ng - 1; k++)
+                if (cp[i + k] != cp[cn - (ng - 1) + k]) { ok = 0; break; }
+            if (ok && cp[i + ng - 1] == first_token) best = i;
+        }
+        if (best >= 0) {
+            int start = best + ng, cnt = 0;
+            for (int j = start; j < cn && cnt < want; j++) out[cnt++] = cp[j];
+            if (cnt >= 1) return cnt;
+        }
+    }
+    return 0;
+}
+/* PROBE (DS4_QWEN4_PLD_SPAN): verify [first_token, span...] in one forward, accept
+ * the longest argmax-matching prefix, then ALWAYS restore snap0 and replay the
+ * committed tokens for a clean recurrent state. Always-replay isolates the
+ * correctness of the T>3 all-rows forward + snap0 restore; byte-exactness proves it. */
+static int qwen4_span_verify(ds4_session *s, int first_token, const int *span, int ns,
+                             int *accepted, int accepted_cap, char *err, size_t errlen) {
+    ds4_engine *e = s->engine; ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+    const ds4_model *m = &e->model; const ds4_weights *w = &e->weights;
+    const uint32_t V = DS4_N_VOCAB;
+    if (ns + 1 > accepted_cap) ns = accepted_cap - 1;
+    if (ns < 1) return 0;
+    const uint32_t T = (uint32_t)ns + 1u;
+    if (!s->qwen4_verify_logits)
+        s->qwen4_verify_logits = xmalloc((size_t)(g->n_logit_rows > 4u ? g->n_logit_rows : 4u) * (size_t)V * sizeof(float));
+    float *rows = s->qwen4_verify_logits;
+    int toks[18]; toks[0] = first_token;
+    for (int i = 0; i < ns; i++) toks[1 + i] = span[i];
+    if (!qwen4_graph_ensure_snap0(g) || !qwen4_graph_state_copy0(g, true)) return -2; /* caller falls back */
+    g->snap_after_first = false; g->snap_after_second = false; g->verify_rows_exact = false;
+    ds4_gpu_qwen4_set_verify_rows_exact(false);
+    if (!qwen4_graph_forward_tokens(g, m, w, toks, T, rows, true)) {
+        if (errlen) snprintf(err, errlen, "Qwen3.8 span verify failed"); s->checkpoint_valid = false; return -1;
+    }
+    int k = 0;
+    while (k < ns && sample_argmax(rows + (size_t)k * V, V) == span[k]) k++;
+    if (!qwen4_graph_state_copy0(g, false)) {
+        if (errlen) snprintf(err, errlen, "Qwen3.8 span restore failed"); s->checkpoint_valid = false; return -1;
+    }
+    if (!qwen4_graph_forward_tokens(g, m, w, toks, (uint32_t)k + 1u, s->logits, false)) {
+        if (errlen) snprintf(err, errlen, "Qwen3.8 span replay failed"); s->checkpoint_valid = false; return -1;
+    }
+    token_vec_push(&s->checkpoint, first_token);
+    for (int i = 0; i < k; i++) token_vec_push(&s->checkpoint, span[i]);
+    s->checkpoint_valid = true;
+    s->glm_mtp_have = 0; s->glm_mtp_have2 = false; s->mtp_draft_valid = false;
+    s->qwen4_spec_cycles++; s->qwen4_spec_accepted += (uint64_t)k;
+    accepted[0] = first_token;
+    for (int i = 0; i < k; i++) accepted[1 + i] = span[i];
+    return k + 1;
+}
+
 static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float temperature, int top_k,
                                         float top_p, float min_p, uint64_t *rng, bool exact_sampling,
                                         int *accepted, int accepted_cap,
@@ -74188,6 +74300,19 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     const uint32_t V = DS4_N_VOCAB;
     const int depth = (exact_sampling && temperature > 0.0f) || getenv("DS4_QWEN4_NO_MTP_BATCH") != NULL
         ? 2 : qwen4_spec_depth(s);
+    /* DS4_QWEN4_PLD_SPAN: prompt-lookup span verify (greedy/opportunistic only). */
+    if (qwen4_pld_enabled() && !(exact_sampling && temperature > 0.0f) && g->n_logit_rows >= 5) {
+        int maxspan = (int)g->n_logit_rows - 1;
+        if (maxspan > accepted_cap - 1) maxspan = accepted_cap - 1;
+        if (maxspan > (int)g->cap_tokens - 1) maxspan = (int)g->cap_tokens - 1;
+        if (pos + (uint32_t)maxspan + 1u > g->ctx_cap) maxspan = (int)(g->ctx_cap - pos) - 1;
+        int span[18];
+        int ns = (maxspan >= 3) ? qwen4_pld_span2(s->checkpoint.v, s->checkpoint.len, first_token, maxspan, span) : 0;
+        if (ns >= 3) {
+            int r = qwen4_span_verify(s, first_token, span, ns, accepted, accepted_cap, err, errlen);
+            if (r != -2) return r;   /* -2 = snapshot unavailable, fall through to nextn path */
+        }
+    }
     if (s->glm_mtp_have && first_token != s->glm_mtp_parent) s->glm_mtp_have = 0;
     if (depth == 3 && s->glm_mtp_have && s->glm_mtp_have2 && !g->snap2_ple_hist &&
         accepted_cap >= 3 && pos + 3u <= g->ctx_cap && g->cap_tokens >= 3u) {
@@ -74216,6 +74341,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
                     s->glm_mtp_have2 = true;
                 }
             }
+            qwen4_pld_override(s, first_token, parent, depth);
         }
         if (qwen4_spec_trace()) {
             fprintf(stderr, "ds4: spec pos %u token %d plain\n", pos, first_token);
@@ -74230,7 +74356,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     const int toks[3] = { first_token, d, d2 };
     const uint32_t T = deep ? 3u : 2u;
     /* Three verifier rows plus the logits before the block, for exact rewinds. */
-    if (!s->qwen4_verify_logits) s->qwen4_verify_logits = xmalloc(4u * (size_t)V * sizeof(float));
+    if (!s->qwen4_verify_logits) s->qwen4_verify_logits = xmalloc((size_t)(s->qwen4_graph.n_logit_rows > 4u ? s->qwen4_graph.n_logit_rows : 4u) * (size_t)V * sizeof(float));
     float *rows = s->qwen4_verify_logits;
     /* Exact sampling rewinds to the block start to resample the boundary
      * token when the caller discards a block that crossed a sampling-mode
@@ -74329,6 +74455,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
                     s->glm_mtp_have2 = true;
                 }
             }
+            qwen4_pld_override(s, -1, parent, depth);
         }
         s->qwen4_spec_accepted++;
         accepted[0] = first_token;
@@ -74360,6 +74487,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
                     s->glm_mtp_have2 = true;
                 }
             }
+            qwen4_pld_override(s, -1, parent, depth);
         }
         s->qwen4_spec_accepted++;
         accepted[0] = first_token;
@@ -80067,7 +80195,7 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
         for (int i = 0; i < count; i++) {
             ds4_session *s = items[i].session;
             ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
-            if (!s->qwen4_verify_logits) s->qwen4_verify_logits = xmalloc(4u * (size_t)V * sizeof(float));
+            if (!s->qwen4_verify_logits) s->qwen4_verify_logits = xmalloc((size_t)(s->qwen4_graph.n_logit_rows > 4u ? s->qwen4_graph.n_logit_rows : 4u) * (size_t)V * sizeof(float));
             float *rows = s->qwen4_verify_logits;
             if (!ds4_gpu_tensor_read(arena->batch_logits, (uint64_t)mem[i].row0 * V * sizeof(float), rows,
                                      (uint64_t)mem[i].n * V * sizeof(float))) {
