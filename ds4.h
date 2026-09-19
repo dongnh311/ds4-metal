@@ -131,6 +131,7 @@ typedef struct {
 typedef struct {
     const char *model_path;
     const char *mtp_path;
+    const char *ple_path;
     const char *vision_path;
     ds4_backend backend;
     int n_threads;
