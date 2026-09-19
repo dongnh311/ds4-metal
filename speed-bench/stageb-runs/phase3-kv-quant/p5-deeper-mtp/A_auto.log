@@ -1,0 +1,22 @@
+ds4: PLE sidecar table: /Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-PLE-Q4_1.gguf (ple.weight [160, 320001536], CPU-only)
+ds4: PLE sidecar demand-paged (insufficient RAM headroom or DS4_QWEN4_PLE_PREFETCH_FULL=0)
+ds4: Metal device Apple M5 Pro, 64.00 GiB RAM
+ds4: Metal 4 tensor API enabled for Tensor kernels
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=on
+ds4: Metal model views created in 0.920 ms, residency requested in 302.288 ms, warmup 2.341 ms (mapped 41643.70 MiB from offset 10.51 MiB)
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 0.13 GiB (raw 0.10 + compressed 0.03) + buffers 3.82 GiB + resident model 40.67 GiB = 44.61 GiB planned
+ds4: memory detail: ctx=4096 prefill_cap=4096 raw_kv_rows=4096 compressed_kv_rows=1025 backend=metal
+ds4: memory: KV 0.13 GiB (raw 0.10 + compressed 0.03) + buffers 3.82 GiB = 3.95 GiB context
+ds4: memory detail: ctx=4096 prefill_cap=4096 raw_kv_rows=4096 compressed_kv_rows=1025 backend=metal
+processing 157 input tokens: 157/157 (100.0%)
+We need answer user's request: detailed technical explanation of speculative decoding accelerating autoregressive LLM inference. Cover draft model proposing candidate tokens, target verifying in parallel, accept/reject sampling criterion preserving target distribution, multi-token blocks, wall-clock speedup depends on acceptance rate and relative cost draft vs verify. Then explain how Multi-Token Prediction (MTP) heads differ from separate draft model. Thorough precise.
+
+Need produce final answer. Need think through content. Need ensure correctness.
+
+Speculative decoding basics: autoregressive generation bottleneck sequential decoding: each token requires forward pass through large target model, memory-bound, low utilization. Speculative decoding uses smaller/faster draft model to generate K candidate tokens sequentially (or block) then target model verifies all K in one forward pass (or parallel) using causal attention over prefix + candidates. If accepted, append tokens; if rejected at position i, sample replacement from target distribution at that position (or modified distribution) and continue. This reduces number of target forward passes from K to ~1 per block, but adds draft passes.
+
+Need detail draft model: can be smaller LLM, quantized, self-drafting, tree, etc. It proposes next tokens x_{t+1},...,x_{t+K} conditioned on prefix x_{1:t}. It may use greedy or sampling. For correctness, if draft uses sampling q(x), target p(x). Verification: for each proposed token x_i, accept with probability min(1, p(x_i)/q(x_i)) if q(x_i)>0. If reject, sample residual token from normalized residual distribution (p(x)-q(x))_+ / sum(p-q)_+? Need precise. For speculative sampling algorithm: Given draft distribution q and target p. For proposed x ~ q, accept with prob min(1, p(x)/q(x)). If accepted output x. If rejected, sample y from residual distribution r(y) = (p(y)-q(y))
+ds4: prefill: 255.30 t/s, generation: 42.69 t/s
+ds4: Qwen3.8 mtp: 237 verify cycles, 160 drafts accepted (67.5%)
