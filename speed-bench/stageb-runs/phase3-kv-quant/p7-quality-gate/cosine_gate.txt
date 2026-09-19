@@ -1,0 +1,3 @@
+COSINE GATE (orca-rebase base): imat-vs-Q8 @512  cosine=0.989487  rms=0.3490  max_abs=1.918
+  argmax Q8=321 imat=321 MATCH  top5_overlap=4/5
+  (shipped reference on orca-bugfixes was ~0.949-0.954 @512)

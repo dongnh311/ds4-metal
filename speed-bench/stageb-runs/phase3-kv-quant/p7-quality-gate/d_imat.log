@@ -1,0 +1,13 @@
+ds4: PLE sidecar table: /Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-PLE-Q4_1.gguf (ple.weight [160, 320001536], CPU-only)
+ds4: PLE sidecar demand-paged (insufficient RAM headroom or DS4_QWEN4_PLE_PREFETCH_FULL=0)
+ds4: Metal device Apple M5 Pro, 64.00 GiB RAM
+ds4: Metal 4 tensor API enabled for Tensor kernels
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=on
+ds4: Metal model views created in 0.878 ms, residency requested in 310.381 ms, warmup 2.842 ms (mapped 41643.70 MiB from offset 10.51 MiB)
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 0.02 GiB (raw 0.02 + compressed 0.00) + buffers 0.87 GiB + resident model 40.67 GiB = 41.56 GiB planned
+ds4: memory detail: ctx=641 prefill_cap=641 raw_kv_rows=641 compressed_kv_rows=161 backend=metal
+ds4-bench: context buffers 912.30 MiB (ctx=641, backend=metal, prefill_chunk=641, raw_kv_rows=641, compressed_kv_rows=161)
+ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes
+512,512,550.53,128,35.94,29.761,127,36.07,0
