@@ -30,6 +30,17 @@ Gate results (prod engine, orca-rebase-ple-batched + Q4_K/Q8_0 down port):
   (meth) probe stays refused, consistent with partial-abliteration strength of the
   source model itself.
 
-Quality gate: `ds4-eval --suite core` not yet run (64GB host RAM pressure with the
-52.7GB Q4_K main resident); to run on a machine with more headroom or after freeing
-memory.
+Quality gate: `ds4-eval --suite core --questions 12 --retry-incomplete` (thinking ON,
+default budget, prod engine + `--ple` sidecar, ctx 2048 on the 64GB host), Q8 main:
+
+| down experts | passed | incomplete | failed |
+|---|---|---|---|
+| **Q4_K (new, Complete)** | **9/12** | 3 | 0 |
+| Q2_K (old, Q2KDown baseline, same recipe) | 8/12 | 4 | 0 |
+
+The Q4_K-down rebuild is not a quality regression vs the Q2_K down experts — it
+scores **1 case better (9 vs 8)**, 0 failed on both. The 3–4 "incomplete" cases are
+hard SuperGPQA/AIME reasoning items that exhaust the token budget while still
+thinking (long-form, no single correct letter extracted) — a budget artifact, not
+wrong answers. Q4_K is strictly a finer grid than the Q2_K it replaces, so this is
+the expected direction (the imat Q4_K main `ssm_out`-only variant is the same).
