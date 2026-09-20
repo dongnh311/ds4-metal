@@ -2629,8 +2629,10 @@ static inline float qwen4_row_dot(device const char *row, device const float *x,
         }
     } else if (weight_type == 12) {
         /* q4_K: 256-element super-blocks (d, dmin, 12 packed 6-bit scale/min pairs, 128 nibble bytes);
-         * lane owns 8 consecutive elements of every block: group = lane/4, l = (lane%4)*8 */
-        const uint nb = in_dim / 256;
+         * lane owns 8 consecutive elements of every block: group = lane/4, l = (lane%4)*8.
+         * Padded Q4_K down rows (768 physical / 640 logical) round up to full
+         * blocks like Q2_K and skip the activation tail. */
+        const uint nb = (in_dim + 255u) / 256u;
         const uint group = tiisg / 4, l = (tiisg % 4) * 8;
         for (uint ib = 0; ib < nb; ib++) {
             device const uchar *blk = (device const uchar *)(row + (uint64_t)ib * 144);
@@ -2644,7 +2646,11 @@ static inline float qwen4_row_dot(device const char *row, device const float *x,
             device const uchar *qs = blk + 16 + (group >> 1) * 32 + l;
             const uint shift = (group & 1u) * 4u;
             device const float *y = x + ib * 256 + group * 32 + l;
-            for (uint i = 0; i < 8; i++) acc += (ds * (float)((qs[i] >> shift) & 0xFu) - dm) * y[i];
+            for (uint i = 0; i < 8; i++) {
+                /* Padded Q4_K down weights have no corresponding activation tail. */
+                if (ib * 256u + group * 32u + l + i >= in_dim) continue;
+                acc += (ds * (float)((qs[i] >> shift) & 0xFu) - dm) * y[i];
+            }
         }
     } else if (weight_type == 10) {
         /* q2_K: 84-byte super-blocks of 256 (16 scale/min nibble pairs, 64 packed 2-bit bytes, d, dmin);
