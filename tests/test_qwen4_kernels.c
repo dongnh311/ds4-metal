@@ -1372,7 +1372,7 @@ static void test_idx_prefilter(void) {
 static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, uint32_t F,
                            uint32_t T, uint32_t wtype, uint32_t dtype) {
     /* Nonzero random padding ensures kernels ignore the physical tail. */
-    const uint32_t DF = dtype == 10u ? (F + 255u) / 256u * 256u : F;
+    const uint32_t DF = (dtype == 10u || dtype == 12u) ? (F + 255u) / 256u * 256u : F;
     double *gate_w, *up_w, *down_w, *sg_w, *su_w, *sd_w;
     uint64_t gate_off, up_off, down_off, sg_off, su_off, sd_off;
     const bool q8 = wtype != 0u;
@@ -1515,7 +1515,7 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
     ds4_gpu_tensor *gR = upload(R0, (uint64_t)T * 4 * E);
     ds4_gpu_tensor *ginj = upload(injv, (uint64_t)T * 4 * CH * 4);
     require_ok(ds4_gpu_qwen4_moe_reduce_tensor(gout, gpart, gw, gsg, NULL, gR, ginj, T, slots, n_out, E, 4), "moe reduce");
-    const char *dname = dtype == 10u ? "q2_K" : dtype == 39u ? "mxfp4" : q8 ? "q8_0" : "f32";
+    const char *dname = dtype == 10u ? "q2_K" : dtype == 39u ? "mxfp4" : dtype == 12u ? "q4_K" : q8 ? "q8_0" : "f32";
     snprintf(name, sizeof(name), "moe %s E=%u F=%u slots=%u T=%u: reduce+combine", dname, E, F, slots, T);
     check_tensor(name, gR, R_ref, (uint64_t)T * 4 * E, 2e-5);
     ds4_gpu_tensor_free(ginj); ds4_gpu_tensor_free(gR); free(R_ref); free(injv); free(R0);
@@ -3135,6 +3135,13 @@ int main(void) {
     test_moe(&arena, 16, 10, 2560, 640, 1, 12u);
     test_moe(&arena, 16, 10, 2560, 640, 2, 12u);
     test_moe_types(&arena, 16, 10, 2560, 640, 2, 12u, 39u);
+    /* Padded Q4_K down rows (IQ2 or Q4_K gate/up; production trunk recipe). */
+    test_moe_types(&arena, 16, 10, 2560, 640, 1, 16u, 12u);
+    test_moe_types(&arena, 16, 10, 2560, 640, 2, 16u, 12u);
+    test_moe_types(&arena, 16, 10, 2560, 640, 1, 12u, 12u);
+    /* Unpadded Q8_0 down rows (MTP blk.48 recipe). */
+    test_moe_types(&arena, 16, 10, 2560, 640, 1, 16u, 8u);
+    test_moe_types(&arena, 8, 6, 256, 640, 3, 12u, 8u);
     test_moe_types(&arena, 16, 10, 2560, 640, 1, 16u, 10u);
     test_moe_types(&arena, 16, 10, 2560, 640, 37, 16u, 10u);
     test_moe_types(&arena, 8, 6, 256, 256, 9, 16u, 10u);

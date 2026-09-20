@@ -5600,9 +5600,11 @@ static void weights_validate_qwen4_layout(
         tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
         tensor_expect_qwen4_expert_layout(l->ffn_gate_exps, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         tensor_expect_qwen4_expert_layout(l->ffn_up_exps,   DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        /* Q2_K down rows store 640 logical inputs in three 256-value blocks.
-         * Activations remain 640 wide; only the weight row stride is padded. */
-        const uint32_t down_width = l->ffn_down_exps->type == DS4_TENSOR_Q2_K ?
+        /* Q2_K and Q4_K down rows store 640 logical inputs in three 256-value
+         * blocks (Q4_K super-blocks). Activations remain 640 wide; only the
+         * weight row stride is padded. */
+        const uint32_t down_width = (l->ffn_down_exps->type == DS4_TENSOR_Q2_K ||
+                                     l->ffn_down_exps->type == DS4_TENSOR_Q4_K) ?
             (DS4_N_FF_EXP + 255u) / 256u * 256u : DS4_N_FF_EXP;
         tensor_expect_qwen4_expert_layout(l->ffn_down_exps, down_width, DS4_N_EMBD, DS4_N_EXPERT);
         if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {

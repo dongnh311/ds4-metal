@@ -49190,7 +49190,8 @@ int ds4_gpu_qwen4_moe_down_tensor(
         uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
         uint32_t ff_dim, uint32_t out_dim,
         uint64_t shared_down_offset, uint32_t shared_type) {
-    const uint32_t weight_dim = weight_type == 10u ? (ff_dim + 255u) / 256u * 256u : ff_dim;
+    const uint32_t weight_dim = (weight_type == 10u || weight_type == 12u) ?
+        (ff_dim + 255u) / 256u * 256u : ff_dim;
     const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, weight_dim);
     const uint64_t expert_bytes = (uint64_t)row_bytes * out_dim;
     const bool has_shared = shared_type != UINT32_MAX;
@@ -49497,7 +49498,8 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
         const void *model_map, uint64_t model_size, uint64_t down_offset,
         uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
         uint32_t ff_dim, uint32_t out_dim, uint32_t list_cap) {
-    const uint32_t weight_dim = weight_type == 10u ? (ff_dim + 255u) / 256u * 256u : ff_dim;
+    const uint32_t weight_dim = (weight_type == 10u || weight_type == 12u) ?
+        (ff_dim + 255u) / 256u * 256u : ff_dim;
     const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, weight_dim);
     const uint64_t expert_bytes = (uint64_t)row_bytes * out_dim;
     const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens, false);
@@ -49643,7 +49645,8 @@ int ds4_gpu_qwen4_moe_down_tensor_with_bufs(
         uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
         uint32_t ff_dim, uint32_t out_dim,
         uint64_t shared_down_offset, uint32_t shared_type) {
-    const uint32_t weight_dim = weight_type == 10u ? (ff_dim + 255u) / 256u * 256u : ff_dim;
+    const uint32_t weight_dim = (weight_type == 10u || weight_type == 12u) ?
+        (ff_dim + 255u) / 256u * 256u : ff_dim;
     const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, weight_dim);
     const uint64_t expert_bytes = (uint64_t)row_bytes * out_dim;
     const bool has_shared = shared_type != UINT32_MAX;
@@ -49766,7 +49769,8 @@ int ds4_gpu_qwen4_moe_mm_down_tensor_with_bufs(
         void **down_bufs, uint64_t *down_inners,
         uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
         uint32_t ff_dim, uint32_t out_dim, uint32_t list_cap) {
-    const uint32_t weight_dim = weight_type == 10u ? (ff_dim + 255u) / 256u * 256u : ff_dim;
+    const uint32_t weight_dim = (weight_type == 10u || weight_type == 12u) ?
+        (ff_dim + 255u) / 256u * 256u : ff_dim;
     const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, weight_dim);
     const uint64_t expert_bytes = (uint64_t)row_bytes * out_dim;
     const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens, false);
