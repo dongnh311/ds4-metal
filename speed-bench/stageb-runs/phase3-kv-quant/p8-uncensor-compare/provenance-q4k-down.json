@@ -1,0 +1,42 @@
+{
+  "Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q4KDownPad768-MTP.gguf": {
+    "bytes": 56576878080,
+    "sha256": "a97923674018e37119a6c877e7847114f14773b8884275373ae9cbef4d52c27f",
+    "manifest": "Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q4KDownPad768-MTP.gguf.json",
+    "template": "/Users/dongnh/orca/workspaces/ds4-metal/scallop/gguf/Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q2KDownPad768-MTP.gguf",
+    "replaced_tensors": 49,
+    "trunk_down_kind": 12,
+    "mtp_down_kind": 8,
+    "quantize_source": "/Users/dongnh/orca/workspaces/ds4-metal/scallop/gguf/orca-bf16-selective",
+    "imatrix_sha256": "a5863123db1ca458727e738955bef7bfc199520aa2bee3a30142a1aff9254154",
+    "library_sha256": "d0f3e9709bc63a78e77ffdb2200ff01efef7d3771c0e74bb275c272f53684d33",
+    "format": {
+      "trunk_down": "Q4_K",
+      "mtp_down": "Q8_0"
+    },
+    "padding": {
+      "logical_input": 640,
+      "physical_input": 768
+    }
+  },
+  "Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q4KDownPad768-DenseQ4Kselimat-MTP.gguf": {
+    "bytes": 55447856768,
+    "sha256": "20b4c617a5e7a8d3976d328daf04c48c0f250f47c9a1e7ad91265e698616c41d",
+    "manifest": "Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q4KDownPad768-DenseQ4Kselimat-MTP.gguf.json",
+    "template": "/Users/dongnh/orca/workspaces/ds4-metal/scallop/gguf/Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q2KDownPad768-DenseQ4Kselimat-MTP.gguf",
+    "replaced_tensors": 49,
+    "trunk_down_kind": 12,
+    "mtp_down_kind": 8,
+    "quantize_source": "/Users/dongnh/orca/workspaces/ds4-metal/scallop/gguf/orca-bf16-selective",
+    "imatrix_sha256": "a5863123db1ca458727e738955bef7bfc199520aa2bee3a30142a1aff9254154",
+    "library_sha256": "d0f3e9709bc63a78e77ffdb2200ff01efef7d3771c0e74bb275c272f53684d33",
+    "format": {
+      "trunk_down": "Q4_K",
+      "mtp_down": "Q8_0"
+    },
+    "padding": {
+      "logical_input": 640,
+      "physical_input": 768
+    }
+  }
+}

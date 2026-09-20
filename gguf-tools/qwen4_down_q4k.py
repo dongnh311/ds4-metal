@@ -137,7 +137,7 @@ def stage_quantize(a):
                                        'seconds': time.monotonic() - start}
         save(manifest, report)
         print(f'{MTP_DOWN}: {len(raw)} bytes, {time.monotonic() - start:.1f}s', flush=True)
-    imatrix.f = None
+    imatrix.close()
     print(f'Verified {len(report["tensors"])} payloads in {manifest}', flush=True)
 
 
