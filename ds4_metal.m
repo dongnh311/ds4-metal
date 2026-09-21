@@ -1550,10 +1550,25 @@ static int ds4_gpu_stream_expert_cache_mark_entries_inflight(
 
 static int ds4_gpu_stream_expert_cache_wait_inflight(const char *label);
 
+/* ---- QSA per-kernel GPU-timestamp profiling (non-disruptive) --------------
+ * A committed command buffer can be tagged with a slot via the associated
+ * object below; when it completes in the normal token-end wait we add its GPU
+ * span (GPUEndTime-GPUStartTime) to that slot. No mid-decode waits, so decode
+ * is not disrupted. Enabled from ds4.c via DS4_QWEN4_QSA_PROFILE. */
+#define DS4_QSA_PROF_SLOTS 12
+static double g_qsa_prof_gpu_ms[DS4_QSA_PROF_SLOTS];
+static const char kQsaSlotKey;
+
 static int ds4_gpu_wait_pending_command_buffers(const char *label) {
     int ok = 1;
     for (id<MTLCommandBuffer> pending in g_pending_cbs) {
         if (!ds4_gpu_wait_command_buffer(pending, label)) ok = 0;
+        NSNumber *slot = objc_getAssociatedObject(pending, &kQsaSlotKey);
+        if (slot) {
+            const int s = slot.intValue;
+            if (s >= 0 && s < DS4_QSA_PROF_SLOTS)
+                g_qsa_prof_gpu_ms[s] += (pending.GPUEndTime - pending.GPUStartTime) * 1000.0;
+        }
     }
     [g_pending_cbs removeAllObjects];
     ds4_gpu_stream_expert_cache_note_pending_completed();
@@ -9536,6 +9551,19 @@ int ds4_gpu_flush_commands(void) {
 
 int ds4_gpu_commands_active(void) {
     return g_batch_cb != nil;
+}
+
+/* Tag the current batch CB (containing the just-dispatched QSA sub-step) with
+ * `slot`, then commit it (into g_pending_cbs) so it pipelines normally. Its GPU
+ * span is accumulated into g_qsa_prof_gpu_ms[slot] when it completes at the next
+ * token-end wait. slot<0 just flushes (seals prior work untagged). */
+int ds4_gpu_qsa_prof_seal(int slot) {
+    if (g_batch_cb && slot >= 0)
+        objc_setAssociatedObject(g_batch_cb, &kQsaSlotKey, @(slot), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return ds4_gpu_flush_commands();
+}
+void ds4_gpu_qsa_prof_get(double *out, int n) {
+    for (int i = 0; i < n && i < DS4_QSA_PROF_SLOTS; i++) out[i] = g_qsa_prof_gpu_ms[i];
 }
 
 /* Exact M5 full-FFN overlap inside one concurrent compute encoder.  Shared
@@ -48116,6 +48144,7 @@ enum {
     QWEN4_K_IDX_SELECT_PRE,
     QWEN4_K_IDX_SCORE_MM,
     QWEN4_K_IDX_EXPAND,
+    QWEN4_K_KV_GATHER,
     QWEN4_K_ATTN_DECODE_NPT8,
     QWEN4_K_ATTN_DECODE_NPT4,
     QWEN4_K_ATTN_DECODE_NPT1,
@@ -48221,6 +48250,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_idx_select_pre",
     "kernel_qwen4_idx_score_mm",
     "kernel_qwen4_idx_expand",
+    "kernel_qwen4_kv_gather",
     "kernel_qwen4_attn_decode_npt8",
     "kernel_qwen4_attn_decode_npt4",
     "kernel_qwen4_attn_decode_npt1",
@@ -49217,12 +49247,39 @@ uint64_t ds4_gpu_qwen4_attn_part_floats(uint32_t n_tokens, uint32_t n_head, uint
     return (uint64_t)n_tokens * n_head * QWEN4_ATTN_MAX_SPLITS * (2u + head_dim);
 }
 
+/* P1: gather QSA-selected K/V rows into contiguous per-token buffers so the
+ * sparse decode reads them sequentially (use_sel == 2).  pos0 bounds the live
+ * cache the selected positions index into. */
+int ds4_gpu_qwen4_kv_gather_tensor(
+        ds4_gpu_tensor *kc_g, ds4_gpu_tensor *vc_g,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *sel_tokens, const ds4_gpu_tensor *n_sel,
+        uint32_t n_tokens, uint32_t n_head_kv, uint32_t head_dim, uint32_t sel_stride, uint32_t pos0) {
+    struct { uint32_t n_tokens, n_head_kv, head_dim, sel_stride; } args =
+        { n_tokens, n_head_kv, head_dim, sel_stride };
+    const uint64_t cache_bytes = (uint64_t)(pos0 + n_tokens) * n_head_kv * head_dim * 2u;
+    const uint64_t gath_bytes  = (uint64_t)n_tokens * sel_stride * n_head_kv * head_dim * 2u;
+    qwen4_bind b[6];
+    if (n_tokens == 0 || n_head_kv == 0 || head_dim == 0 || sel_stride == 0 ||
+        !qwen4_bind_tensor(&b[0], k_cache, cache_bytes, "gather k cache") ||
+        !qwen4_bind_tensor(&b[1], v_cache, cache_bytes, "gather v cache") ||
+        !qwen4_bind_tensor(&b[2], sel_tokens, (uint64_t)n_tokens * sel_stride * sizeof(int32_t), "gather sel") ||
+        !qwen4_bind_tensor(&b[3], n_sel, (uint64_t)n_tokens * sizeof(uint32_t), "gather n_sel") ||
+        !qwen4_bind_tensor(&b[4], kc_g, gath_bytes, "gather kc_g") ||
+        !qwen4_bind_tensor(&b[5], vc_g, gath_bytes, "gather vc_g")) {
+        return 0;
+    }
+    const uint32_t threads = head_dim < 256u ? head_dim : 256u;
+    return qwen4_dispatch(QWEN4_K_KV_GATHER, &args, sizeof(args), b, 6,
+                          MTLSizeMake(sel_stride, n_head_kv, n_tokens), MTLSizeMake(threads, 1, 1), 0);
+}
+
 int ds4_gpu_qwen4_attn_decode_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
         const ds4_gpu_tensor *sel_tokens, const ds4_gpu_tensor *n_sel, ds4_gpu_tensor *part,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
-        uint32_t pos0, bool use_sel, uint32_t sel_stride, float scale) {
+        uint32_t pos0, uint32_t use_sel, uint32_t sel_stride, float scale) {
     const uint32_t n_keys = use_sel ? sel_stride : pos0 + n_tokens;
     uint32_t n_splits = 1;
     if (part) {
@@ -49233,10 +49290,12 @@ int ds4_gpu_qwen4_attn_decode_tensor(
     const uint32_t keys_per_split = (n_keys + n_splits - 1) / n_splits;
     struct { uint32_t n_tokens, n_head, n_head_kv, head_dim, pos0, use_sel, sel_stride; float scale;
              uint32_t n_splits, keys_per_split, pad0, pad1; } args =
-        { n_tokens, n_head, n_head_kv, head_dim, pos0, use_sel ? 1u : 0u, sel_stride, scale,
+        { n_tokens, n_head, n_head_kv, head_dim, pos0, use_sel, sel_stride, scale,
           n_splits, keys_per_split, 0, 0 };
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
-    const uint64_t cache_bytes = (uint64_t)(pos0 + n_tokens) * n_head_kv * head_dim * 2u;
+    const uint64_t cache_bytes = use_sel == 2u
+        ? (uint64_t)n_tokens * sel_stride * n_head_kv * head_dim * 2u
+        : (uint64_t)(pos0 + n_tokens) * n_head_kv * head_dim * 2u;
     const uint64_t part_bytes = (uint64_t)n_tokens * n_head * n_splits * (2u + head_dim) * sizeof(float);
     qwen4_bind b[8];
     if (n_tokens == 0 || n_head_kv == 0 || (n_head % n_head_kv) != 0 || n_head / n_head_kv > 12 ||

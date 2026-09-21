@@ -2093,6 +2093,45 @@ kernel void kernel_qwen4_idx_expand_rows(
                          sel_tokens + (uint64_t)r * args.sel_stride, n_sel + r, tid, ntg);
 }
 
+/* P1 compact selected-KV gather: copy the QSA-selected rows out of the full
+ * K/V cache into a contiguous per-token buffer so the sparse decode reads
+ * them sequentially instead of scattered.  One threadgroup per (idx, kv head,
+ * token); its head_dim threads copy one K and one V element each.  Rows past
+ * n_sel[tok] are skipped (the decode caps its loop at n_sel).  Output layout
+ * matches the cache the decode expects with p = tok*sel_stride + idx. */
+struct ds4_metal_args_qwen4_kv_gather {
+    uint32_t n_tokens;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+    uint32_t sel_stride;
+};
+
+kernel void kernel_qwen4_kv_gather(
+        constant ds4_metal_args_qwen4_kv_gather &args,
+        device const half     *k_cache,     /* [cap][Hkv*D] */
+        device const half     *v_cache,     /* [cap][Hkv*D] */
+        device const int32_t  *sel_tokens,  /* [T][sel_stride] */
+        device const uint32_t *n_sel,       /* [T] */
+        device half           *kc_g,        /* [T][sel_stride][Hkv*D] */
+        device half           *vc_g,        /* [T][sel_stride][Hkv*D] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]],
+        uint3 ntg   [[threads_per_threadgroup]]) {
+    const uint idx = tgpig.x;
+    const uint kvh = tgpig.y;
+    const uint tok = tgpig.z;
+    if (idx >= args.sel_stride || kvh >= args.n_head_kv || tok >= args.n_tokens) return;
+    if (idx >= n_sel[tok]) return;
+    const uint D = args.head_dim, Hkv = args.n_head_kv;
+    const uint p = (uint)sel_tokens[(uint64_t)tok * args.sel_stride + idx];
+    const uint64_t src = ((uint64_t)p * Hkv + kvh) * D;
+    const uint64_t dst = (((uint64_t)tok * args.sel_stride + idx) * Hkv + kvh) * D;
+    for (uint i = tpitg.x; i < D; i += ntg.x) {
+        kc_g[dst + i] = k_cache[src + i];
+        vc_g[dst + i] = v_cache[src + i];
+    }
+}
+
 struct ds4_metal_args_qwen4_attn_decode {
     uint32_t n_tokens;
     uint32_t n_head;
@@ -2120,7 +2159,7 @@ struct ds4_metal_args_qwen4_attn_decode {
 template <uint NPT>
 static inline void qwen4_attn_decode_tile(
         constant ds4_metal_args_qwen4_attn_decode &args, uint split, uint kvh, uint tok,
-        uint n, uint n_splits, uint keys_per_split, uint part_splits, bool use_sel,
+        uint n, uint n_splits, uint keys_per_split, uint part_splits, uint use_sel,
         device const float *q, device const float *gate,
         device const half *k_cache, device const half *v_cache, device const int32_t *sel,
         device float *out, device float *part, ushort sgitg, ushort tiisg) {
@@ -2148,7 +2187,7 @@ static inline void qwen4_attn_decode_tile(
         for (uint i = 0; i < NPT; i++) acc[g][i] = 0.0f;
     }
     for (uint idx = k0; idx < k1; idx++) {
-        const uint p = use_sel ? (uint)sel[idx] : idx;
+        const uint p = (use_sel == 1u) ? (uint)sel[idx] : (use_sel == 2u) ? (tok * args.sel_stride + idx) : idx;
         device const half *kr = k_cache + ((uint64_t)p * Hkv + kvh) * D + tiisg * NPT;
         device const half *vr = v_cache + ((uint64_t)p * Hkv + kvh) * D + tiisg * NPT;
         float kv[NPT], vv[NPT];
@@ -2210,7 +2249,7 @@ kernel void kernel_qwen4_attn_decode(
     if (split >= args.n_splits || kvh >= args.n_head_kv || tok >= args.n_tokens) return;
     const uint n = args.use_sel ? n_sel[tok] : args.pos0 + tok + 1;
     qwen4_attn_decode_tile<NPT>(args, split, kvh, tok, n, args.n_splits, args.keys_per_split, args.n_splits,
-                                args.use_sel != 0, q, gate, k_cache, v_cache,
+                                args.use_sel, q, gate, k_cache, v_cache,
                                 sel_tokens + (uint64_t)tok * args.sel_stride, out, part, sgitg, tiisg);
 }
 
@@ -2249,7 +2288,7 @@ kernel void kernel_qwen4_attn_decode_rows(
     const uint2 sp = qwen4_attn_row_splits(n_keys, args.keys_per_split, args.n_splits);
     if (split >= sp.x) return;
     const uint n = e.use_sel ? n_sel[r] : e.pos + 1u;
-    qwen4_attn_decode_tile<NPT>(args, split, kvh, r, n, sp.x, sp.y, args.n_splits, e.use_sel != 0, q, gate,
+    qwen4_attn_decode_tile<NPT>(args, split, kvh, r, n, sp.x, sp.y, args.n_splits, (e.use_sel ? 1u : 0u), q, gate,
                                 reinterpret_cast<device const half *>(e.k_cache),
                                 reinterpret_cast<device const half *>(e.v_cache),
                                 sel_tokens + (uint64_t)r * args.sel_stride, out, part, sgitg, tiisg);

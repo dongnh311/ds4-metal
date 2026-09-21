@@ -3453,12 +3453,19 @@ int ds4_gpu_qwen4_idx_expand_tensor(
 /* part (optional, decode-sized batches): partial-softmax scratch of
  * ds4_gpu_qwen4_attn_part_floats() floats enabling key-split parallelism */
 uint64_t ds4_gpu_qwen4_attn_part_floats(uint32_t n_tokens, uint32_t n_head, uint32_t head_dim);
+/* P1 compact selected-KV gather (see ds4_metal.m); use_sel==2 on the decode
+ * then reads the gathered buffers sequentially. */
+int ds4_gpu_qwen4_kv_gather_tensor(
+        ds4_gpu_tensor *kc_g, ds4_gpu_tensor *vc_g,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *sel_tokens, const ds4_gpu_tensor *n_sel,
+        uint32_t n_tokens, uint32_t n_head_kv, uint32_t head_dim, uint32_t sel_stride, uint32_t pos0);
 int ds4_gpu_qwen4_attn_decode_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
         const ds4_gpu_tensor *sel_tokens, const ds4_gpu_tensor *n_sel, ds4_gpu_tensor *part,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
-        uint32_t pos0, bool use_sel, uint32_t sel_stride, float scale);
+        uint32_t pos0, uint32_t use_sel, uint32_t sel_stride, float scale);
 /* Routed experts; shared_type == UINT32_MAX disables the shared-expert slot,
  * otherwise mid/part carry n_slots+1 entries and the reduce weights the last
  * one by sigmoid(shared_gate). */
