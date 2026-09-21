@@ -7152,6 +7152,24 @@ static void config_validate_qwen4_model(const ds4_model *m) {
         }
         g_ds4_qwen4_ple.n_heads = n_heads;
     }
+
+    /* Diagnostic: shrink the QSA indexer top_k at load time to trade recall
+     * for decode compute (attn_decode_sparse is compute-bound, scales with
+     * blocks attended). Unset/0 = no change (byte-identical baseline). Clamped
+     * to < original and to a multiple of the compress ratio (4) so k_blocks is
+     * integer. Every downstream buffer/kernel reads DS4_N_INDEXER_TOP_K live. */
+    {
+        const char *e_topk = getenv("DS4_QWEN4_TOPK_OVERRIDE");
+        uint32_t req = e_topk ? (uint32_t)strtoul(e_topk, NULL, 10) : 0u;
+        const uint32_t orig = g_ds4_shape.n_indexer_top_k;
+        if (req > 0u && req < orig) {
+            req &= ~3u;
+            if (req == 0u) req = 4u;
+            g_ds4_shape.n_indexer_top_k = req;
+            fprintf(stderr, "ds4: indexer top_k override %u -> %u (k_blocks %u)\n",
+                    orig, req, req / 4u);
+        }
+    }
 }
 
 static void config_validate_model(const ds4_model *m) {
@@ -58634,6 +58652,79 @@ static void qwen4_qsa_profile_dump(void) {
     fprintf(stderr, "ds4:   %-20s %9.2f ms  (QSA-attention GPU total, all QSA layers x tokens)\n", "TOTAL", tot);
 }
 
+/* ---- Coarse whole-decode STAGE profiling via GPU timestamps (no sync) ------
+ * Same non-disruptive seal mechanism as the QSA profiler, but sealed at the
+ * top-level stage boundaries of qwen4_graph_forward_tokens so we get a true
+ * GPU-busy split across ple/hc_attn/gdn/attn/hc_ffn/moe/output WITHOUT the
+ * per-stage CPU sync that DS4_QWEN4_TIMING=2 pays (which over-attributes to
+ * many-small-kernel stages like the hyper-connection mix). Armed for decode
+ * (T<=8: draft T=1 + MTP verify T=2..). Off by default => byte-identical.
+ * Do not combine with DS4_QWEN4_QSA_PROFILE (shared accumulator slots). */
+enum { STG_NONE=0, STG_PLE=1, STG_HCATTN=2, STG_GDN=3, STG_ATTN=4,
+       STG_HCFFN=5, STG_MOE=6, STG_OUT=7, STG_N=8 };
+static const char *g_stg_names[STG_N] = {
+    "", "ple", "hc_attn", "gdn", "attn", "hc_ffn", "moe", "output" };
+static double g_stg_gpu[STG_N];
+static uint64_t g_stg_steps;
+static int g_stg_armed;
+static void qwen4_stage_ts_dump(void);
+static int qwen4_stage_ts_enabled(void) {
+    static int c = -1;
+    if (c < 0) {
+        const char *e = getenv("DS4_QWEN4_STAGE_TS_PROFILE");
+        c = (e && e[0] && e[0] != '0') ? 1 : 0;
+        if (c) atexit(qwen4_stage_ts_dump);
+    }
+    return c;
+}
+static void qwen4_stage_ts_dump(void) {
+    if (g_stg_steps == 0) return;
+    ds4_gpu_qsa_prof_get(g_stg_gpu, STG_N);
+    double tot = 0.0;
+    for (int i = 1; i < STG_N; i++) tot += g_stg_gpu[i];
+    fprintf(stderr, "ds4: === STAGE TS profile (%llu decode steps, GPU timestamps, NO sync) ===\n",
+            (unsigned long long)g_stg_steps);
+    for (int i = 1; i < STG_N; i++)
+        fprintf(stderr, "ds4:   %-10s %9.2f ms  %5.1f%%\n",
+                g_stg_names[i], g_stg_gpu[i], tot > 0.0 ? 100.0 * g_stg_gpu[i] / tot : 0.0);
+    fprintf(stderr, "ds4:   %-10s %9.2f ms  (decode GPU total, all stages x steps)\n", "TOTAL", tot);
+}
+static inline void stg_seal(int slot) { if (g_stg_armed) (void)ds4_gpu_qsa_prof_seal(slot); }
+
+/* ---- MoE-internal GPU-timestamp profiling (env DS4_QWEN4_MOE_TS_PROFILE) ---
+ * Splits the decode MoE (T<=8) into router / mid(gate+up+swiglu, IQ2_XXS) /
+ * down(Q2_K) / reduce via the same non-sync seal. Localizes whether the MoE
+ * decode cost is the expert matmuls (dequant/occupancy) or overhead (router/
+ * reduce/launch). Off by default; do not combine with the other TS profilers. */
+enum { MTS_ROUTER=1, MTS_MID=2, MTS_DOWN=3, MTS_REDUCE=4, MTS_TOPK=5, MTS_N=6 };
+static const char *g_mts_names[MTS_N] = { "", "router_gemv", "mid(gate+up)", "down", "reduce", "router_topk" };
+static double g_mts_gpu[MTS_N];
+static uint64_t g_mts_calls;
+static int g_mts_armed;
+static void qwen4_moe_ts_dump(void);
+static int qwen4_moe_ts_enabled(void) {
+    static int c = -1;
+    if (c < 0) {
+        const char *e = getenv("DS4_QWEN4_MOE_TS_PROFILE");
+        c = (e && e[0] && e[0] != '0') ? 1 : 0;
+        if (c) atexit(qwen4_moe_ts_dump);
+    }
+    return c;
+}
+static void qwen4_moe_ts_dump(void) {
+    if (g_mts_calls == 0) return;
+    ds4_gpu_qsa_prof_get(g_mts_gpu, MTS_N);
+    double tot = 0.0;
+    for (int i = 1; i < MTS_N; i++) tot += g_mts_gpu[i];
+    fprintf(stderr, "ds4: === MoE-internal TS profile (%llu moe calls, GPU timestamps, NO sync) ===\n",
+            (unsigned long long)g_mts_calls);
+    for (int i = 1; i < MTS_N; i++)
+        fprintf(stderr, "ds4:   %-12s %9.2f ms  %5.1f%%\n",
+                g_mts_names[i], g_mts_gpu[i], tot > 0.0 ? 100.0 * g_mts_gpu[i] / tot : 0.0);
+    fprintf(stderr, "ds4:   %-12s %9.2f ms  (MoE GPU total)\n", "TOTAL", tot);
+}
+static inline void mts_seal(int slot) { if (g_mts_armed) (void)ds4_gpu_qsa_prof_seal(slot); }
+
 /* In-kernel FP8 KV active: env-selected AND buffers allocated. */
 static bool qwen4_kv_fp8_active(const ds4_qwen4_gpu_graph *g) {
     if (!g->kv_fp8) return false;
@@ -58849,11 +58940,15 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     const bool profile = T > 8u && getenv("DS4_QWEN4_MOE_PROFILE") != NULL;
     double elapsed[7] = {0}, last = 0;
     if (!qwen4_moe_profile_boundary(profile, &last, &elapsed[0])) return false;
-    bool ok = qwen4_gemv(g->router, m, l->ffn_gate_inp, g->mixed, T) &&
-              ds4_gpu_qwen4_router_topk_tensor(g->selected, g->weights, g->router, g->mixed, m->map, m->size,
+    g_mts_armed = qwen4_moe_ts_enabled() && (T <= 8u) && !qwen4_stage_ts_enabled() && !qwen4_qsa_profile_enabled();
+    if (g_mts_armed) { (void)ds4_gpu_qsa_prof_seal(-1); g_mts_calls++; }
+    bool ok = qwen4_gemv(g->router, m, l->ffn_gate_inp, g->mixed, T);
+    mts_seal(MTS_ROUTER);
+    if (ok) ok = ds4_gpu_qwen4_router_topk_tensor(g->selected, g->weights, g->router, g->mixed, m->map, m->size,
                                                l->ffn_gate_inp_shexp->abs_offset, l->ffn_gate_inp_shexp->type,
-                                               DS4_N_EMBD, g->sh_gate_logit, T, DS4_N_EXPERT, DS4_N_EXPERT_USED) &&
-              qwen4_moe_profile_boundary(profile, &last, &elapsed[0]);
+                                               DS4_N_EMBD, g->sh_gate_logit, T, DS4_N_EXPERT, DS4_N_EXPERT_USED);
+    mts_seal(MTS_TOPK);
+    if (ok) ok = qwen4_moe_profile_boundary(profile, &last, &elapsed[0]);
     /* Prefill-sized batches route each expert's tokens through tiled GEMMs
      * (weights read once per 32 tokens) and run the shared expert as dense
      * GEMMs; decode keeps the per-(token, slot) row kernels with the shared
@@ -58956,17 +59051,20 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                           DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
                                           shared_dense ? 0u : l->ffn_gate_shexp->abs_offset,
                                           shared_dense ? 0u : l->ffn_up_shexp->abs_offset,
-                                          shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type) != 0 &&
-             ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, l->ffn_down_exps->abs_offset,
+                                          shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type) != 0;
+        mts_seal(MTS_MID);
+        if (ok) ok = ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, l->ffn_down_exps->abs_offset,
                                            l->ffn_down_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED, DS4_N_FF_EXP,
                                            DS4_N_EMBD, shared_dense ? 0u : l->ffn_down_shexp->abs_offset,
                                            shared_dense ? UINT32_MAX : l->ffn_down_shexp->type) != 0;
+        mts_seal(MTS_DOWN);
     }
     if (ok) {
         ok = ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, g->sh_gate_logit,
                                              shared_dense ? g->sh_out : NULL, g->R, g->inj, T, DS4_N_EXPERT_USED,
                                              DS4_N_EXPERT_USED + (shared_dense ? 0u : 1u), DS4_N_EMBD, DS4_N_HC) != 0;
     }
+    mts_seal(MTS_REDUCE);
     return ok;
 }
 
@@ -59058,6 +59156,8 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
      * report GPU ms per group (adds sync overhead; diagnostics only) */
     double prof[6] = {0};
     const bool prof_on = timing == 2 && T > 1u;
+    g_stg_armed = qwen4_stage_ts_enabled() && (T <= 8u);
+    if (g_stg_armed) { (void)ds4_gpu_qsa_prof_seal(-1); g_stg_steps++; }
     double prof_last = prof_on ? now_sec() : 0.0;
 #define QWEN4_PROF(idx_) do { \
         if (prof_on) { \
@@ -59083,8 +59183,10 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
                                                g->snap_after_second ? g->snap2_ple_hist : NULL, 1u);
         }
         QWEN4_PROF(0);
+        stg_seal(STG_PLE);
         if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, T);
         QWEN4_PROF(1);
+        stg_seal(STG_HCATTN);
         if (ok) {
             ok = ds4_qwen4_layer_is_linear(il) ? qwen4_graph_linear(g, m, l, il, T)
                                                : qwen4_graph_attention(g, m, l, il, pos0, T);
@@ -59096,6 +59198,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
             ok = qwen4_graph_apply_steering_attn(g, il, T);
         }
         QWEN4_PROF(ds4_qwen4_layer_is_linear(il) ? 2 : 3);
+        stg_seal(ds4_qwen4_layer_is_linear(il) ? STG_GDN : STG_ATTN);
         if (T == 1u && !g->mtp_R && DS4_N_HC == 4u && ds4_gpu_qwen4_decode_fusions_enabled() &&
             l->hc_ffn_inject->type == DS4_TENSOR_F16) {
             if (ok) ok = ds4_gpu_qwen4_hc_combine_norm_tensor(g->hc_u, g->blk, g->inj,
@@ -59115,6 +59218,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
             if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
         }
         QWEN4_PROF(4);
+        stg_seal(STG_HCFFN);
         if (ok) ok = qwen4_graph_moe(g, m, l, T);   /* the reduce folds the combine in */
         if (ok && g->dump_prompt_rows)
             metal_graph_debug_dump_tensor("qwen_router", g->router,
@@ -59122,6 +59226,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         if (ok && g->dump_prompt_rows) qwen4_graph_dump_last_ffn(g, il, T);
         if (ok) ok = qwen4_graph_apply_steering_ffn(g, il, T);
         QWEN4_PROF(5);
+        stg_seal(STG_MOE);
         /* Submit this prefix while the host encodes the remaining layers.
          * Flush keeps the same ordered queue and retains pending buffers;
          * end_commands below waits for both batches before inputs are reused. */
@@ -59151,6 +59256,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         }
         if (ok) ok = qwen4_gemv(g->logits, m, w->output, g->mixed, 1);
     }
+    stg_seal(STG_OUT);
     const double t2 = timing ? now_sec() : 0.0;
     if (!ds4_gpu_end_commands()) ok = false;
     const double t3 = timing ? now_sec() : 0.0;
