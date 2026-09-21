@@ -216,6 +216,29 @@ def main() -> None:
     LAYER_COUNT = 48
     EXPERT_COUNT = 512
 
+    # Read actual GGUF types/dims from the header so the index matches the
+    # input model (Q2K main -> down type 10; Q4K Complete main -> down 12).
+    def tensor_kind(name):
+        t, dims, _ = r.tensors[name]
+        return t, dims
+
+    gate_t0, gate_dims0 = tensor_kind("blk.0.ffn_gate_exps.weight")
+    up_t0, up_dims0 = tensor_kind("blk.0.ffn_up_exps.weight")
+    down_t0, down_dims0 = tensor_kind("blk.0.ffn_down_exps.weight")
+    print(f"  gate/up type: {gate_t0} dims {gate_dims0} | down type: {down_t0} dims {down_dims0}")
+    for layer in range(1, LAYER_COUNT):
+        gt, gd = tensor_kind(f"blk.{layer}.ffn_gate_exps.weight")
+        ut, ud = tensor_kind(f"blk.{layer}.ffn_up_exps.weight")
+        dt, dd = tensor_kind(f"blk.{layer}.ffn_down_exps.weight")
+        if (gt, gd) != (gate_t0, gate_dims0) or (ut, ud) != (up_t0, up_dims0) or \
+           (dt, dd) != (down_t0, down_dims0):
+            raise SystemExit(f"layer {layer} expert type/dims differ from layer 0 — "
+                             f"bundle builder assumes uniform layers")
+    # dims reported in the index: header dims without the trailing expert dim
+    gate_dims = list(gate_dims0[:-1])
+    up_dims = list(up_dims0[:-1])
+    down_dims = list(down_dims0[:-1])
+
     bundles = []
     current_offset = 0
 
@@ -232,8 +255,8 @@ def main() -> None:
                 "tensor": "gate",
                 "offset": gate_offset,
                 "size": len(gate_data),
-                "type": 16,
-                "dims": [2560, 640],
+                "type": gate_t0,
+                "dims": gate_dims,
             })
             current_offset = next_page_aligned(current_offset + len(gate_data))
 
@@ -247,8 +270,8 @@ def main() -> None:
                 "tensor": "up",
                 "offset": up_offset,
                 "size": len(up_data),
-                "type": 16,
-                "dims": [2560, 640],
+                "type": up_t0,
+                "dims": up_dims,
             })
             current_offset = next_page_aligned(current_offset + len(up_data))
 
@@ -262,8 +285,8 @@ def main() -> None:
                 "tensor": "down",
                 "offset": down_offset,
                 "size": len(down_data),
-                "type": 10,
-                "dims": [768, 2560],
+                "type": down_t0,
+                "dims": down_dims,
             })
             current_offset = next_page_aligned(current_offset + len(down_data))
 
