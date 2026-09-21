@@ -90,6 +90,45 @@ static inline float dsv4_e4m3fn_dequant(float x) {
     return sign * dsv4_e4m3fn_value(best);
 }
 
+/* Byte-packing twins of dsv4_e4m3fn_dequant, for the in-kernel FP8 KV cache
+ * (DS4_QWEN4_KV_FP8).  encode() finds the SAME code `best` + sign as the round
+ * trip above and returns the E4M3FN byte (bit 7 = sign, bits 0-6 = the 7-bit
+ * magnitude code, i.e. (exp<<3)|mant; 127/NaN is never produced because best is
+ * capped at 126).  decode() is its inverse.  A store then load reproduces
+ * dsv4_e4m3fn_dequant(x) exactly, so the flat FP8 path matches qwen4_fp8sim_vec
+ * (ds4.c) which the quality gate certifies. */
+static inline uchar dsv4_e4m3fn_encode(float x) {
+    const uchar sgn = x < 0.0f ? 0x80 : 0x00;
+    const float ax = min(abs(x), 448.0f);
+
+    int lo = 0;
+    int hi = 126;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (dsv4_e4m3fn_value(mid) <= ax) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    int best = lo;
+    if (best < 126) {
+        const float best_diff = abs(ax - dsv4_e4m3fn_value(best));
+        const float next_diff = abs(ax - dsv4_e4m3fn_value(best + 1));
+        if (next_diff < best_diff || (next_diff == best_diff && ((best + 1) & 1) == 0 && (best & 1) != 0)) {
+            best = best + 1;
+        }
+    }
+
+    return sgn | (uchar)best;
+}
+
+static inline float dsv4_e4m3fn_decode(uchar b) {
+    return (b & 0x80) ? -dsv4_e4m3fn_value((int)(b & 0x7f))
+                      :  dsv4_e4m3fn_value((int)(b & 0x7f));
+}
+
 static inline float dsv4_e2m1fn_dequant(float x) {
     const float sign = x < 0.0f ? -1.0f : 1.0f;
     const float ax = min(abs(x), 6.0f);

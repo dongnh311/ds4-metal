@@ -1261,7 +1261,7 @@ struct ds4_metal_args_qwen4_attn_prep {
     uint32_t cache_cap;
     float    rope_base;
     float    eps;
-    uint32_t pad0;
+    uint32_t fp8;              /* 1: write E4M3 bytes + per-64-block scale to *_fp8/*_scale */
     float    rope_mscale;      /* YaRN magnitude scale on cos/sin (1 without) */
     float    rope_freq[32];    /* per-pair inverse frequencies (YaRN-adjusted) */
 };
@@ -1285,15 +1285,19 @@ static inline void qwen4_rope_neox(thread float *x, uint n_rot, uint4 p3, consta
  * stay per session, so a row reaches its own through GPU addresses instead
  * of bound buffers; its transients are row r of the batch arena. */
 struct ds4_metal_qwen4_attn_row {
-    uint64_t k_cache;      /* [cap][Hkv*D] half */
-    uint64_t v_cache;      /* [cap][Hkv*D] half */
+    uint64_t k_cache;      /* [cap][Hkv*D] half (or E4M3 bytes aliased when fp8) */
+    uint64_t v_cache;      /* [cap][Hkv*D] half (or E4M3 bytes aliased when fp8) */
     uint64_t ik_cache;     /* [cap][Di] float */
     uint64_t block_key;    /* [n_block_cap][Di] half */
     uint64_t pos3;         /* [cap] uint4 rope positions */
+    uint64_t k_cache_fp8;  /* [cap][Hkv*D] E4M3 bytes (fp8 only) */
+    uint64_t v_cache_fp8;  /* [cap][Hkv*D] E4M3 bytes (fp8 only) */
+    uint64_t k_scale;      /* [cap][Hkv][D/64] per-block scale (fp8 only) */
+    uint64_t v_scale;      /* [cap][Hkv][D/64] per-block scale (fp8 only) */
     uint32_t pos;          /* the row's token position */
     uint32_t n_blocks;     /* complete indexer blocks at pos: (pos + 1) / ratio */
     uint32_t use_sel;      /* 1: block-sparse attention, 0: dense over 0..pos */
-    uint32_t pad0;
+    uint32_t fp8;          /* 1: K/V are E4M3 bytes with per-64-block scale */
 };
 
 /* Per (token, head) simdgroup: RMSNorm + NeoX rope of one query head (from
@@ -1307,7 +1311,9 @@ static inline void qwen4_attn_prep_slot(
         device const float *iq, device const float *ik,
         device const float *g_q, device const float *g_k, device const float *g_iq,
         device float *q_out, device float *gate_out, device half *k_cache, device half *v_cache,
-        device float *iq_out, device float *ik_cache, threadgroup float *row, ushort tiisg) {
+        device float *iq_out, device float *ik_cache,
+        device uchar *k_cache_fp8, device uchar *v_cache_fp8, device half *k_scale, device half *v_scale,
+        threadgroup float *row, ushort tiisg) {
     const uint H = args.n_head, Hkv = args.n_head_kv, D = args.head_dim;
     const uint Hi = args.n_idx_head, Di = args.idx_dim;
     float v[8];   /* D/32 <= 8 */
@@ -1356,6 +1362,36 @@ static inline void qwen4_attn_prep_slot(
             for (uint i = 0; i < args.n_rot; i++) row[i] = tmp[i];
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (args.fp8) {
+            /* E4M3 byte-pack, per-64-block power-of-2 scale (mirrors the CPU
+             * reference): block blk=tiisg>>3 spans this lane's 8 elems over 8
+             * lanes; reduce block absmax across those 8 lanes. */
+            const uint blk = tiisg >> 3;
+            float ka = 0.0f, va = 0.0f;
+            for (uint i = 0; i < npt; i++) {
+                ka = max(ka, abs(row[tiisg * npt + i]));
+                va = max(va, abs(vs[tiisg * npt + i]));
+            }
+            for (ushort o = 1; o < 8; o <<= 1) {
+                ka = max(ka, simd_shuffle_xor(ka, o));
+                va = max(va, simd_shuffle_xor(va, o));
+            }
+            ka = max(ka, 1.0e-4f);
+            va = max(va, 1.0e-4f);
+            const float ks  = exp2(ceil(log2(ka  / 448.0f)));
+            const float vsc = exp2(ceil(log2(va  / 448.0f)));
+            device uchar *dkf = k_cache_fp8 + ((uint64_t)pos * Hkv + h) * D;
+            device uchar *dvf = v_cache_fp8 + ((uint64_t)pos * Hkv + h) * D;
+            for (uint i = 0; i < npt; i++) {
+                dkf[tiisg * npt + i] = dsv4_e4m3fn_encode(clamp(row[tiisg * npt + i] / ks,  -448.0f, 448.0f));
+                dvf[tiisg * npt + i] = dsv4_e4m3fn_encode(clamp(vs[tiisg * npt + i]  / vsc, -448.0f, 448.0f));
+            }
+            if ((tiisg & 7u) == 0u) {
+                k_scale[((uint64_t)pos * Hkv + h) * (D / 64u) + blk] = (half)ks;
+                v_scale[((uint64_t)pos * Hkv + h) * (D / 64u) + blk] = (half)vsc;
+            }
+            return;
+        }
         device half *dk = k_cache + ((uint64_t)pos * Hkv + h) * D;
         device half *dv = v_cache + ((uint64_t)pos * Hkv + h) * D;
         for (uint i = 0; i < npt; i++) {
@@ -1410,6 +1446,10 @@ kernel void kernel_qwen4_attn_prep(
         device float       *iq_out,    /* [T][Hi*Di] */
         device float       *ik_cache,  /* [cap][Di] raw */
         device const uint4 *pos3,      /* [cap] rope positions (t, h, w) */
+        device uchar       *k_cache_fp8,/* [cap][Hkv*D] E4M3 bytes (fp8 only) */
+        device uchar       *v_cache_fp8,/* [cap][Hkv*D] E4M3 bytes (fp8 only) */
+        device half        *k_scale,    /* [cap][Hkv][D/64] per-block scale (fp8 only) */
+        device half        *v_scale,    /* [cap][Hkv][D/64] per-block scale (fp8 only) */
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]]) {
 
@@ -1419,7 +1459,8 @@ kernel void kernel_qwen4_attn_prep(
     const uint pos = args.pos0 + tok;
     threadgroup float row[576];
     qwen4_attn_prep_slot(args, slot, tok, pos, pos3[pos], qg, kproj, vproj, iq, ik, g_q, g_k, g_iq,
-                         q_out, gate_out, k_cache, v_cache, iq_out, ik_cache, row, tiisg);
+                         q_out, gate_out, k_cache, v_cache, iq_out, ik_cache,
+                         k_cache_fp8, v_cache_fp8, k_scale, v_scale, row, tiisg);
 }
 
 /* The same per (row, head) work for a decode batch: row r's projections and
@@ -1448,7 +1489,10 @@ kernel void kernel_qwen4_attn_prep_rows(
     qwen4_attn_prep_slot(args, tgpig.x, r, e.pos, reinterpret_cast<device const uint4 *>(e.pos3)[e.pos],
                          qg, kproj, vproj, iq, ik, g_q, g_k, g_iq, q_out, gate_out,
                          reinterpret_cast<device half *>(e.k_cache), reinterpret_cast<device half *>(e.v_cache),
-                         iq_out, reinterpret_cast<device float *>(e.ik_cache), row, tiisg);
+                         iq_out, reinterpret_cast<device float *>(e.ik_cache),
+                         reinterpret_cast<device uchar *>(e.k_cache_fp8), reinterpret_cast<device uchar *>(e.v_cache_fp8),
+                         reinterpret_cast<device half *>(e.k_scale), reinterpret_cast<device half *>(e.v_scale),
+                         row, tiisg);
 }
 
 struct ds4_metal_args_qwen4_idx_block {
@@ -2143,7 +2187,7 @@ struct ds4_metal_args_qwen4_attn_decode {
     float    scale;
     uint32_t n_splits;    /* key ranges per (token, kv head); > 1 writes partials */
     uint32_t keys_per_split;
-    uint32_t pad0;
+    uint32_t fp8;         /* 1: k/v_cache are E4M3 bytes with per-64-block k/v_scale */
     uint32_t pad1;
 };
 
@@ -2162,6 +2206,8 @@ static inline void qwen4_attn_decode_tile(
         uint n, uint n_splits, uint keys_per_split, uint part_splits, uint use_sel,
         device const float *q, device const float *gate,
         device const half *k_cache, device const half *v_cache, device const int32_t *sel,
+        device const uchar *k_cache_fp8, device const uchar *v_cache_fp8,
+        device const half *k_scale, device const half *v_scale, uint fp8,
         device float *out, device float *part, ushort sgitg, ushort tiisg) {
     const uint H = args.n_head, Hkv = args.n_head_kv;
     constexpr uint D = NPT * 32;
@@ -2188,11 +2234,24 @@ static inline void qwen4_attn_decode_tile(
     }
     for (uint idx = k0; idx < k1; idx++) {
         const uint p = (use_sel == 1u) ? (uint)sel[idx] : (use_sel == 2u) ? (tok * args.sel_stride + idx) : idx;
-        device const half *kr = k_cache + ((uint64_t)p * Hkv + kvh) * D + tiisg * NPT;
-        device const half *vr = v_cache + ((uint64_t)p * Hkv + kvh) * D + tiisg * NPT;
+        const uint64_t kvbase = ((uint64_t)p * Hkv + kvh) * D + tiisg * NPT;
         float kv[NPT], vv[NPT];
+        if (fp8) {
+            /* one scale per lane: this lane's NPT elems share one 64-block */
+            const uint64_t sidx = ((uint64_t)p * Hkv + kvh) * (D / 64u) + (tiisg * NPT) / 64u;
+            const float ksc = (float)k_scale[sidx];
+            const float vsc = (float)v_scale[sidx];
 #pragma unroll
-        for (uint i = 0; i < NPT; i++) { kv[i] = (float)kr[i]; vv[i] = (float)vr[i]; }
+            for (uint i = 0; i < NPT; i++) {
+                kv[i] = (float)(half)(dsv4_e4m3fn_decode(k_cache_fp8[kvbase + i]) * ksc);
+                vv[i] = (float)(half)(dsv4_e4m3fn_decode(v_cache_fp8[kvbase + i]) * vsc);
+            }
+        } else {
+            device const half *kr = k_cache + kvbase;
+            device const half *vr = v_cache + kvbase;
+#pragma unroll
+            for (uint i = 0; i < NPT; i++) { kv[i] = (float)kr[i]; vv[i] = (float)vr[i]; }
+        }
 #pragma unroll
         for (uint g = 0; g < QWEN4_ATTN_HPS; g++) {
             if (g < ng) {
@@ -2240,6 +2299,10 @@ kernel void kernel_qwen4_attn_decode(
         device const uint32_t *n_sel,     /* [T] */
         device float         *out,        /* [T][H*D] */
         device float         *part,       /* [T][Hkv][n_splits][group][2+D] */
+        device const uchar   *k_cache_fp8,/* [cap][Hkv*D] E4M3 bytes (fp8 only) */
+        device const uchar   *v_cache_fp8,/* [cap][Hkv*D] E4M3 bytes (fp8 only) */
+        device const half    *k_scale,    /* [cap][Hkv][D/64] scale (fp8 only) */
+        device const half    *v_scale,    /* [cap][Hkv][D/64] scale (fp8 only) */
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort sgitg [[simdgroup_index_in_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]]) {
@@ -2250,7 +2313,9 @@ kernel void kernel_qwen4_attn_decode(
     const uint n = args.use_sel ? n_sel[tok] : args.pos0 + tok + 1;
     qwen4_attn_decode_tile<NPT>(args, split, kvh, tok, n, args.n_splits, args.keys_per_split, args.n_splits,
                                 args.use_sel, q, gate, k_cache, v_cache,
-                                sel_tokens + (uint64_t)tok * args.sel_stride, out, part, sgitg, tiisg);
+                                sel_tokens + (uint64_t)tok * args.sel_stride,
+                                k_cache_fp8, v_cache_fp8, k_scale, v_scale, args.fp8,
+                                out, part, sgitg, tiisg);
 }
 
 /* The split count and width the host picks for one row from its key count
@@ -2291,7 +2356,12 @@ kernel void kernel_qwen4_attn_decode_rows(
     qwen4_attn_decode_tile<NPT>(args, split, kvh, r, n, sp.x, sp.y, args.n_splits, (e.use_sel ? 1u : 0u), q, gate,
                                 reinterpret_cast<device const half *>(e.k_cache),
                                 reinterpret_cast<device const half *>(e.v_cache),
-                                sel_tokens + (uint64_t)r * args.sel_stride, out, part, sgitg, tiisg);
+                                sel_tokens + (uint64_t)r * args.sel_stride,
+                                reinterpret_cast<device const uchar *>(e.k_cache_fp8),
+                                reinterpret_cast<device const uchar *>(e.v_cache_fp8),
+                                reinterpret_cast<device const half *>(e.k_scale),
+                                reinterpret_cast<device const half *>(e.v_scale), e.fp8,
+                                out, part, sgitg, tiisg);
 }
 
 /* Merge the split partials of one (token, head) and apply the gate. */
@@ -2428,7 +2498,8 @@ QWEN4_ATTN_ROWS_INSTANCE(4)
 template [[host_name("kernel_qwen4_attn_decode_npt" #NPT_)]] \
 kernel void kernel_qwen4_attn_decode<NPT_>(constant ds4_metal_args_qwen4_attn_decode &, device const float *, \
         device const float *, device const half *, device const half *, device const int32_t *, device const uint32_t *, \
-        device float *, device float *, uint3, ushort, ushort); \
+        device float *, device float *, device const uchar *, device const uchar *, device const half *, \
+        device const half *, uint3, ushort, ushort); \
 template [[host_name("kernel_qwen4_attn_merge_npt" #NPT_)]] \
 kernel void kernel_qwen4_attn_merge<NPT_>(constant ds4_metal_args_qwen4_attn_decode &, device const float *, \
         device const float *, device float *, uint3, ushort);
@@ -2455,6 +2526,10 @@ kernel void kernel_qwen4_attn_mm(
         device const int32_t *sel_tokens, /* [T][sel_stride] */
         device const uint32_t *n_sel,     /* [T] */
         device float         *out,        /* [T][H*D] */
+        device const uchar   *k_cache_fp8,/* [cap][Hkv*D] E4M3 bytes (fp8 only) */
+        device const uchar   *v_cache_fp8,/* [cap][Hkv*D] E4M3 bytes (fp8 only) */
+        device const half    *k_scale,    /* [cap][Hkv][D/64] scale (fp8 only) */
+        device const half    *v_scale,    /* [cap][Hkv][D/64] scale (fp8 only) */
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tid [[thread_index_in_threadgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]],
@@ -2503,12 +2578,28 @@ kernel void kernel_qwen4_attn_mm(
             const uint key = tid >> 3, seg = tid & 7u;
             const int p = kpos[key];
             const uint64_t row = ((uint64_t)max(p, 0) * Hkv + kvh) * D;
+            if (args.fp8) {
+                /* this thread's 32 elems [seg*32..+31] share one 64-block seg>>1 */
+                const uint64_t sidx = ((uint64_t)max(p, 0) * Hkv + kvh) * (D / 64u) + (seg >> 1);
+                const float ksc = p >= 0 ? (float)k_scale[sidx] : 0.0f;
+                const float vsc = p >= 0 ? (float)v_scale[sidx] : 0.0f;
+                device const uchar *kb = k_cache_fp8 + row + seg * 32u;
+                device const uchar *vb = v_cache_fp8 + row + seg * 32u;
+                threadgroup half *kd = Ks + key * D + seg * 32u;
+                threadgroup half *vd = Vs + key * D + seg * 32u;
+#pragma unroll
+                for (uint u = 0; u < 32u; u++) {
+                    kd[u] = p >= 0 ? (half)(dsv4_e4m3fn_decode(kb[u]) * ksc) : (half)0.0h;
+                    vd[u] = p >= 0 ? (half)(dsv4_e4m3fn_decode(vb[u]) * vsc) : (half)0.0h;
+                }
+            } else {
             device const uint4 *kr = (device const uint4 *)(k_cache + row) + seg * 4;
             device const uint4 *vr = (device const uint4 *)(v_cache + row) + seg * 4;
             threadgroup uint4 *kd = (threadgroup uint4 *)(Ks + key * D) + seg * 4;
             threadgroup uint4 *vd = (threadgroup uint4 *)(Vs + key * D) + seg * 4;
 #pragma unroll
             for (uint u = 0; u < 4; u++) { kd[u] = p >= 0 ? kr[u] : uint4(0u); vd[u] = p >= 0 ? vr[u] : uint4(0u); }
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
