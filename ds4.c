@@ -73312,7 +73312,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
          * qwen4_graph_alloc so full-attention layers allocate E4M3 byte buffers +
          * per-64-block scale INSTEAD of the half k/v cache (the KV memory win).
          * qwen4_graph_alloc preserves kv_fp8 across its memset. */
-        s->qwen4_graph.kv_fp8 = (getenv("DS4_QWEN4_KV_FP8") != NULL);
+        { const char *e_fp8 = getenv("DS4_QWEN4_KV_FP8"); s->qwen4_graph.kv_fp8 = (e_fp8 && e_fp8[0] && e_fp8[0] != '0'); }
         if (s->qwen4_graph.kv_fp8) {
             fprintf(stderr, "ds4: in-kernel FP8 KV cache enabled (E4M3, per-64-block scale)\n");
         }
