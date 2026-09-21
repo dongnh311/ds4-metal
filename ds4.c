@@ -58725,6 +58725,54 @@ static void qwen4_moe_ts_dump(void) {
 }
 static inline void mts_seal(int slot) { if (g_mts_armed) (void)ds4_gpu_qsa_prof_seal(slot); }
 
+/* Diagnostic (SCALE-1b): capture routed expert selections per (pos, layer) for
+ * offline routing-locality / cache-sim analysis. env DS4_QWEN4_ROUTER_LOG=<path>.
+ * Off by default. Decode T==1 only. NO mid-graph sync: each layer's `selected`
+ * is blitted (GPU->GPU, in the active command buffer) into a persistent log
+ * buffer; the whole buffer is read back once per token after end_commands. */
+static FILE *g_router_log_fp = NULL;
+static int g_router_log_en = -1;
+static ds4_gpu_tensor *g_router_logbuf = NULL;
+static uint32_t g_router_log_maxlayer = 0;
+static int qwen4_router_log_enabled(void) {
+    if (g_router_log_en < 0) {
+        const char *pth = getenv("DS4_QWEN4_ROUTER_LOG");
+        g_router_log_en = (pth && pth[0]) ? 1 : 0;
+        if (g_router_log_en) {
+            g_router_log_fp = fopen(pth, "w");
+            if (g_router_log_fp) fprintf(g_router_log_fp, "# pos layer e0..e%u\n", (unsigned)DS4_N_EXPERT_USED - 1u);
+        }
+    }
+    return g_router_log_en && g_router_log_fp;
+}
+static void qwen4_router_capture(ds4_qwen4_gpu_graph *g, uint32_t il) {
+    if (!qwen4_router_log_enabled()) return;
+    const uint32_t nu = DS4_N_EXPERT_USED;
+    if (!g_router_logbuf) {
+        g_router_logbuf = ds4_gpu_tensor_alloc((uint64_t)DS4_N_LAYER * nu * sizeof(int32_t));
+        if (!g_router_logbuf) { g_router_log_en = 0; return; }
+    }
+    if (il >= DS4_N_LAYER) return;
+    (void)ds4_gpu_tensor_copy(g_router_logbuf, (uint64_t)il * nu * sizeof(int32_t),
+                              g->selected, 0, (uint64_t)nu * sizeof(int32_t));
+    if (il + 1u > g_router_log_maxlayer) g_router_log_maxlayer = il + 1u;
+}
+static void qwen4_router_flush(uint32_t pos) {
+    if (!qwen4_router_log_enabled() || !g_router_logbuf || g_router_log_maxlayer == 0) return;
+    const uint32_t nu = DS4_N_EXPERT_USED;
+    static int32_t *host = NULL;
+    if (!host) host = xmalloc((size_t)DS4_N_LAYER * nu * sizeof(int32_t));
+    const uint32_t nl = g_router_log_maxlayer;
+    if (ds4_gpu_tensor_read(g_router_logbuf, 0, host, (uint64_t)nl * nu * sizeof(int32_t)) == 0) return;
+    for (uint32_t il = 0; il < nl; il++) {
+        fprintf(g_router_log_fp, "%u %u", pos, il);
+        for (uint32_t i = 0; i < nu; i++) fprintf(g_router_log_fp, " %d", host[il * nu + i]);
+        fprintf(g_router_log_fp, "\n");
+    }
+    fflush(g_router_log_fp);
+    g_router_log_maxlayer = 0;
+}
+
 /* In-kernel FP8 KV active: env-selected AND buffers allocated. */
 static bool qwen4_kv_fp8_active(const ds4_qwen4_gpu_graph *g) {
     if (!g->kv_fp8) return false;
@@ -59220,6 +59268,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         QWEN4_PROF(4);
         stg_seal(STG_HCFFN);
         if (ok) ok = qwen4_graph_moe(g, m, l, T);   /* the reduce folds the combine in */
+        if (ok && T == 1u) qwen4_router_capture(g, il);
         if (ok && g->dump_prompt_rows)
             metal_graph_debug_dump_tensor("qwen_router", g->router,
                                            (uint64_t)T * DS4_N_EXPERT, il, pos0);
@@ -59260,6 +59309,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     const double t2 = timing ? now_sec() : 0.0;
     if (!ds4_gpu_end_commands()) ok = false;
     const double t3 = timing ? now_sec() : 0.0;
+    if (T == 1u) qwen4_router_flush(pos0);
     if (ok && logits_out) {
         const uint64_t rows = all_rows ? T : 1u;
         ok = ds4_gpu_tensor_read(g->logits, 0, logits_out, rows * DS4_N_VOCAB * sizeof(float)) != 0;
