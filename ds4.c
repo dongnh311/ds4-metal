@@ -58448,6 +58448,49 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
 /* Dense-prefix + sparse-tail attention core for rows [0,T) of the given row
  * views at absolute position cpos0.  n_blocks_after covers the whole chunk
  * (the caller writes the pooled block keys once). */
+/* ---- QSA decode profiling (env DS4_QWEN4_QSA_PROFILE, off by default) ------
+ * P0 instrumentation: attribute per-kernel wall-clock across the QSA decode
+ * sub-steps by GPU-synchronizing after each dispatch. Profiling mode is SLOWER
+ * by design (the extra syncs serialize the pipeline); the per-kernel SPLIT is
+ * the signal, not absolute t/s. When disabled every hook is a no-op so the
+ * default decode path is byte-unchanged. */
+static void qwen4_qsa_profile_dump(void);
+static int qwen4_qsa_profile_enabled(void) {
+    static int c = -1;
+    if (c < 0) {
+        const char *e = getenv("DS4_QWEN4_QSA_PROFILE");
+        c = (e && e[0] && e[0] != '0') ? 1 : 0;
+        if (c) atexit(qwen4_qsa_profile_dump);
+    }
+    return c;
+}
+enum { QSA_PF_PREDRAIN = 0, QSA_PF_PREP, QSA_PF_BLOCK_KEY, QSA_PF_SCORE,
+       QSA_PF_SELECT, QSA_PF_EXPAND, QSA_PF_ATTN_DENSE, QSA_PF_ATTN_SPARSE, QSA_PF_N };
+static const char *g_qsa_pf_names[QSA_PF_N] = {
+    "pre-drain(qkv/proj)", "attn_prep", "idx_block_key", "idx_score",
+    "idx_select", "idx_expand", "attn_decode_dense", "attn_decode_sparse" };
+static double g_qsa_pf[QSA_PF_N];
+static uint64_t g_qsa_pf_layers;   /* QSA-layer decode-steps observed */
+static double g_qsa_pf_t0;
+static int g_qsa_pf_armed;         /* set per _tail call: enabled AND decode (T==1) */
+static inline void qsa_pf_begin(void) { if (g_qsa_pf_armed) g_qsa_pf_t0 = now_sec(); }
+static inline void qsa_pf_end(int slot) {
+    if (g_qsa_pf_armed) { ds4_gpu_synchronize(); g_qsa_pf[slot] += now_sec() - g_qsa_pf_t0; }
+}
+static void qwen4_qsa_profile_dump(void) {
+    if (g_qsa_pf_layers == 0) return;
+    double tot = 0.0;
+    for (int i = 0; i < QSA_PF_N; i++) tot += g_qsa_pf[i];
+    fprintf(stderr, "ds4: === QSA decode profile (%llu QSA-layer steps, sync-serialized; SPLIT is the signal, not t/s) ===\n",
+            (unsigned long long)g_qsa_pf_layers);
+    for (int i = 0; i < QSA_PF_N; i++)
+        fprintf(stderr, "ds4:   %-20s %9.1f ms  %5.1f%%   %.5f ms/layer-step\n",
+                g_qsa_pf_names[i], g_qsa_pf[i] * 1e3,
+                tot > 0.0 ? 100.0 * g_qsa_pf[i] / tot : 0.0,
+                g_qsa_pf[i] * 1e3 / (double)g_qsa_pf_layers);
+    fprintf(stderr, "ds4:   %-20s %9.1f ms\n", "TOTAL", tot * 1e3);
+}
+
 static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
                                        ds4_gpu_tensor *q_rows, ds4_gpu_tensor *gate_rows,
                                        ds4_gpu_tensor *iqn_rows, ds4_gpu_tensor *o_rows,
@@ -58458,12 +58501,14 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
     const uint32_t sparse_pos = (g->k_blocks + 1u) * ratio - 1u;
     const uint32_t clast = cpos0 + cT - 1u;
     const uint32_t n_dense = clast < sparse_pos ? cT : (sparse_pos > cpos0 ? sparse_pos - cpos0 : 0u);
-    if (n_dense > 0 &&
-        !ds4_gpu_qwen4_attn_decode_tensor(o_rows, q_rows, gate_rows, g->layer_k_cache[il], g->layer_v_cache[il],
+    if (n_dense > 0) {
+        qsa_pf_begin();
+        const bool dok = ds4_gpu_qwen4_attn_decode_tensor(o_rows, q_rows, gate_rows, g->layer_k_cache[il], g->layer_v_cache[il],
                                           g->sel_tokens, g->n_sel, cT <= 2u ? g->attn_part : NULL, n_dense,
                                           DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, cpos0, false, g->sel_stride,
-                                          scale)) {
-        return false;
+                                          scale);
+        qsa_pf_end(QSA_PF_ATTN_DENSE);
+        if (!dok) return false;
     }
     if (n_dense >= cT) return true;
     const uint32_t n_sparse = cT - n_dense;
@@ -58477,18 +58522,34 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
     ds4_gpu_tensor *iqn = ds4_gpu_tensor_view(iqn_rows,
             (uint64_t)n_dense * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
             (uint64_t)n_sparse * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
-    const bool ok = q && gate && o && iqn &&
-        ds4_gpu_qwen4_idx_score_tensor(g->score, n_sparse <= 2u ? g->tile_max : NULL, iqn,
+    bool ok = q && gate && o && iqn;
+    if (ok) {
+        qsa_pf_begin();
+        ok = ds4_gpu_qwen4_idx_score_tensor(g->score, n_sparse <= 2u ? g->tile_max : NULL, iqn,
                                        g->layer_block_key[il], n_sparse, n_blocks_after,
-                                       DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM, sp0, ratio) &&
-        qwen4_idx_select(g->sel_blocks, g->score, n_sparse <= 2u ? g->tile_max : NULL,
-                         n_blocks_after, n_sparse, g->k_blocks) &&
-        ds4_gpu_qwen4_idx_expand_tensor(g->sel_tokens, g->n_sel, g->sel_blocks, n_sparse, g->k_blocks, ratio,
-                                        sp0, g->sel_stride) &&
-        ds4_gpu_qwen4_attn_decode_tensor(o, q, gate, g->layer_k_cache[il], g->layer_v_cache[il],
+                                       DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM, sp0, ratio);
+        qsa_pf_end(QSA_PF_SCORE);
+    }
+    if (ok) {
+        qsa_pf_begin();
+        ok = qwen4_idx_select(g->sel_blocks, g->score, n_sparse <= 2u ? g->tile_max : NULL,
+                         n_blocks_after, n_sparse, g->k_blocks);
+        qsa_pf_end(QSA_PF_SELECT);
+    }
+    if (ok) {
+        qsa_pf_begin();
+        ok = ds4_gpu_qwen4_idx_expand_tensor(g->sel_tokens, g->n_sel, g->sel_blocks, n_sparse, g->k_blocks, ratio,
+                                        sp0, g->sel_stride);
+        qsa_pf_end(QSA_PF_EXPAND);
+    }
+    if (ok) {
+        qsa_pf_begin();
+        ok = ds4_gpu_qwen4_attn_decode_tensor(o, q, gate, g->layer_k_cache[il], g->layer_v_cache[il],
                                          g->sel_tokens, g->n_sel, cT <= 2u ? g->attn_part : NULL, n_sparse,
                                          DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, sp0, true, g->sel_stride,
                                          scale);
+        qsa_pf_end(QSA_PF_ATTN_SPARSE);
+    }
     ds4_gpu_tensor_free(iqn);
     ds4_gpu_tensor_free(o);
     ds4_gpu_tensor_free(gate);
@@ -58504,23 +58565,38 @@ static bool qwen4_graph_attention_tail(ds4_qwen4_gpu_graph *g, const ds4_model *
     const uint32_t ratio = 4u;
     const uint32_t last = pos0 + T - 1u;
     const uint32_t q_dim = DS4_N_HEAD * DS4_N_HEAD_DIM;
-    if (!(ds4_gpu_qwen4_attn_prep_tensor(g->q, g->gate, g->layer_k_cache[il], g->layer_v_cache[il], g->iqn,
+    /* Profile DECODE only (T==1): prefill's dense multi-row tails would both
+     * pollute the per-kernel averages and be crippled by the per-step syncs. */
+    g_qsa_pf_armed = qwen4_qsa_profile_enabled() && (T == 1u);
+    if (g_qsa_pf_armed) {
+        /* drain everything queued before this QSA layer (this layer's qkv/proj
+         * gemvs + any unflushed prior layers) so attn_prep timing is isolated;
+         * this slot is NOT a QSA sub-kernel, just the pipeline baseline. */
+        const double _t = now_sec();
+        ds4_gpu_synchronize();
+        g_qsa_pf[QSA_PF_PREDRAIN] += now_sec() - _t;
+        g_qsa_pf_layers++;
+    }
+    qsa_pf_begin();
+    const bool prep_ok = ds4_gpu_qwen4_attn_prep_tensor(g->q, g->gate, g->layer_k_cache[il], g->layer_v_cache[il], g->iqn,
                                          g->layer_ik_cache[il], g->qg, g->kp, g->vp, g->iq, g->ik, g->pos3,
                                          m->map, m->size, l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
                                          l->indexer_q_norm->abs_offset, T, DS4_N_HEAD, DS4_N_HEAD_KV,
                                          DS4_N_HEAD_DIM, DS4_N_ROT, DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
-                                         pos0, g->ctx_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS))) {
-        return false;
-    }
+                                         pos0, g->ctx_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS);
+    qsa_pf_end(QSA_PF_PREP);
+    if (!prep_ok) return false;
     /* blocks whose last token falls in this chunk get their pooled keys */
     const uint32_t first_block = pos0 / ratio;
     const uint32_t n_blocks_after = (last + 1u) / ratio;
-    if (n_blocks_after > first_block &&
-        !ds4_gpu_qwen4_idx_block_key_tensor(g->layer_block_key[il], g->layer_ik_cache[il], g->pos3, m->map, m->size,
+    if (n_blocks_after > first_block) {
+        qsa_pf_begin();
+        const bool bk_ok = ds4_gpu_qwen4_idx_block_key_tensor(g->layer_block_key[il], g->layer_ik_cache[il], g->pos3, m->map, m->size,
                                             l->indexer_k_norm->abs_offset, first_block,
                                             n_blocks_after - first_block, ratio, DS4_N_INDEXER_HEAD_DIM,
-                                            DS4_N_ROT, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS)) {
-        return false;
+                                            DS4_N_ROT, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS);
+        qsa_pf_end(QSA_PF_BLOCK_KEY);
+        if (!bk_ok) return false;
     }
     if (T > 2u && g->verify_rows_exact) {
         /* speculative verify: run the attention core as <=2-row sub-batches so
