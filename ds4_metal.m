@@ -14430,6 +14430,13 @@ void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
         g_stream_expert_cache_decode_tokens;
 }
 
+/* DS4_METAL_STREAMING_EXPERT_EVICT_LRU=1: evict by recency alone. */
+static int ds4_gpu_stream_expert_evict_lru(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_METAL_STREAMING_EXPERT_EVICT_LRU") != NULL;
+    return v;
+}
+
 /* Tokens between halvings of the route hotness the eviction ranks by
  * (DS4_METAL_STREAMING_EXPERT_HOTNESS_DECAY overrides the default 16). */
 static uint64_t ds4_gpu_stream_expert_hotness_decay_tokens(void) {
@@ -15481,7 +15488,7 @@ static void ds4_gpu_stream_expert_cache_prune_layer(
                 ds4_gpu_stream_expert_cache_is_protected(expert, protect_ids, n_protect)) {
                 continue;
             }
-            const uint32_t hotness =
+            const uint32_t hotness = ds4_gpu_stream_expert_evict_lru() ? 0u :
                 g_stream_expert_cache_route_hotness[layer][expert];
             if (hotness < lowest_hotness ||
                 (hotness == lowest_hotness && e->last_used < oldest)) {
@@ -15587,7 +15594,7 @@ retry:
                                                             n_protect)) {
                 continue;
             }
-            const uint32_t hotness =
+            const uint32_t hotness = ds4_gpu_stream_expert_evict_lru() ? 0u :
                 g_stream_expert_cache_route_hotness[layer][expert];
             if (hotness < lowest_hotness ||
                 (hotness == lowest_hotness && e->last_used < oldest)) {
@@ -50393,6 +50400,20 @@ static int qgate_requested(void) {
  * poll that follows their write. Down writes one partial per (row, slot) and
  * the reduce adds the slots in order, so the output is byte-identical.
  */
+/* Advance the cache's aging clock once per decode step (at the first streamed
+ * layer) so the route hotness halves every DS4_METAL_STREAMING_EXPERT_HOTNESS_DECAY
+ * steps. Without it the qwen4 path ranked victims by hotness accumulated since
+ * start: 8K, 1200 tokens, 12 streamed @ 6GB took 8634 misses, 7570 with aging.
+ * DS4_QWEN4_STREAM_AGING=0 restores the old ranking. */
+static int qgate_aging(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_QWEN4_STREAM_AGING");
+        v = !(e && e[0] == '0');
+    }
+    return v;
+}
+
 static int qgate_split_requested(void) {
     static int v = -1;
     if (v < 0) {
@@ -50670,6 +50691,7 @@ static void qgate_service(const qgate_req *r) {
                       unique_ids, n_unique, r->n_total_expert, r->gate_offset, r->up_offset,
                       r->down_offset, r->gate_expert_bytes, r->down_expert_bytes, NULL, NULL, entries);
         }
+        if (qgate_aging()) ds4_gpu_stream_expert_cache_note_token(r->layer);
         ds4_gpu_stream_expert_cache_note_selected_hotness(r->layer, unique_ids, n_unique);
         ds4_gpu_stream_expert_cache_prune_layer(r->layer, r->n_total_expert, n_unique, unique_ids, n_unique);
         ds4_gpu_stream_expert_cache_prune_global(r->layer, unique_ids, n_unique);
