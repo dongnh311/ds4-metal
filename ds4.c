@@ -57847,6 +57847,8 @@ typedef struct ds4_qwen4_gpu_graph {
      * When kv_fp8 is set these REPLACE the half layer_k/v_cache (the memory win);
      * layer_k/v_cache stay NULL for full-attn layers. */
     bool kv_fp8;
+    /* DS4_QWEN4_KV_Q4: the *_fp8 buffers hold 4-bit nibbles (half the bytes) */
+    bool kv_q4;
     ds4_gpu_tensor *layer_k_cache_fp8[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_v_cache_fp8[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_k_scale[DS4_MAX_LAYER];
@@ -58153,9 +58155,17 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
      * one-shot generate, bench) allocates E4M3 byte K/V + per-64-block scale
      * instead of the half cache. */
     { const char *e_fp8 = getenv("DS4_QWEN4_KV_FP8"); g->kv_fp8 = (e_fp8 && e_fp8[0] && e_fp8[0] != '0'); }
+    /* DS4_QWEN4_KV_Q4=1: 4-bit K/V (signed levels on a per-64-block absmax scale)
+     * in the same buffers as the FP8 cache, half their size. Head dim 256 only. */
+    { const char *e_q4 = getenv("DS4_QWEN4_KV_Q4"); g->kv_q4 = (e_q4 && e_q4[0] && e_q4[0] != '0') && DS4_N_HEAD_DIM == 256u; }
+    if (g->kv_q4) g->kv_fp8 = true;
     if (g->kv_fp8) {
         static int announced = 0;
-        if (!announced) { announced = 1; fprintf(stderr, "ds4: in-kernel FP8 KV cache active (E4M3, per-64-block scale)\n"); }
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, g->kv_q4 ? "ds4: in-kernel 4-bit KV cache active (per-64-block scale)\n"
+                                     : "ds4: in-kernel FP8 KV cache active (E4M3, per-64-block scale)\n");
+        }
     }
     if (!qwen4_graph_weights_supported(w)) return false;
     mtp = mtp && DS4_N_NEXTN_PREDICT != 0;
@@ -58300,8 +58310,9 @@ private_state:
             if (g->kv_fp8) {
                 /* In-kernel FP8: E4M3 byte cache (1 B/elem) + per-64-block fp16
                  * scale INSTEAD of the half k/v cache -- the KV memory win. */
-                g->layer_k_cache_fp8[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 1u);
-                g->layer_v_cache_fp8[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 1u);
+                const uint64_t kv_bytes = g->kv_q4 ? (uint64_t)ctx_cap * kv_dim / 2u : (uint64_t)ctx_cap * kv_dim;
+                g->layer_k_cache_fp8[il] = ds4_gpu_tensor_alloc(kv_bytes);
+                g->layer_v_cache_fp8[il] = ds4_gpu_tensor_alloc(kv_bytes);
                 g->layer_k_scale[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * (kv_dim / 64u) * 2u);
                 g->layer_v_scale[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * (kv_dim / 64u) * 2u);
             } else {
@@ -58883,6 +58894,10 @@ static bool qwen4_kv_fp8_active(const ds4_qwen4_gpu_graph *g) {
     }
     return false;
 }
+/* KV storage passed to the kernels: 0 half, 1 E4M3, 2 4-bit. */
+static uint32_t qwen4_kv_mode(const ds4_qwen4_gpu_graph *g) {
+    return qwen4_kv_fp8_active(g) ? (g->kv_q4 ? 2u : 1u) : 0u;
+}
 static ds4_gpu_tensor *qwen4_kcache(ds4_qwen4_gpu_graph *g, uint32_t il) {
     return qwen4_kv_fp8_active(g) ? g->layer_k_cache_fp8[il] : g->layer_k_cache[il];
 }
@@ -58907,7 +58922,7 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
                                           scale,
                                           g->layer_k_cache_fp8[il], g->layer_v_cache_fp8[il],
                                           g->layer_k_scale[il], g->layer_v_scale[il],
-                                          qwen4_kv_fp8_active(g) ? 1u : 0u);
+                                          qwen4_kv_mode(g));
         qsa_pf_end(QSA_PF_ATTN_DENSE);
         if (!dok) return false;
     }
@@ -58965,7 +58980,7 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
                                          scale,
                                          g->layer_k_cache_fp8[il], g->layer_v_cache_fp8[il],
                                          g->layer_k_scale[il], g->layer_v_scale[il],
-                                         qwen4_kv_fp8_active(g) ? 1u : 0u);
+                                         qwen4_kv_mode(g));
         qsa_pf_end(QSA_PF_ATTN_SPARSE);
     }
     ds4_gpu_tensor_free(iqn);
@@ -58993,7 +59008,7 @@ static bool qwen4_graph_attention_tail(ds4_qwen4_gpu_graph *g, const ds4_model *
         g_qsa_pf_layers++;
     }
     qsa_pf_begin();
-    const uint32_t kv_fp8 = qwen4_kv_fp8_active(g) ? 1u : 0u;
+    const uint32_t kv_fp8 = qwen4_kv_mode(g);
     const bool prep_ok = ds4_gpu_qwen4_attn_prep_tensor(g->q, g->gate, qwen4_kcache(g, il), qwen4_vcache(g, il), g->iqn,
                                          g->layer_ik_cache[il], g->qg, g->kp, g->vp, g->iq, g->ik, g->pos3,
                                          m->map, m->size, l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
@@ -63099,7 +63114,7 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
 }
 #endif
 #ifdef DS4_HAS_QWEN4_GPU
-static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows, bool fp8);
+static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows, bool fp8, bool q4);
 #endif
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
@@ -63114,7 +63129,7 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
         bytes += (uint64_t)DS4_N_VOCAB * sizeof(float);
         const uint32_t rows = (uint32_t)s->checkpoint.len;
         const uint32_t mtp_rows = s->qwen4_graph.mtp_pos < rows ? s->qwen4_graph.mtp_pos : rows;
-        bytes += qwen4_payload_tensor_bytes(rows, mtp_rows, s->qwen4_graph.kv_fp8);
+        bytes += qwen4_payload_tensor_bytes(rows, mtp_rows, s->qwen4_graph.kv_fp8, s->qwen4_graph.kv_q4);
         return bytes;
 #endif
     }
@@ -63259,6 +63274,9 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
  * conv history and n-gram context.  The header's raw_live field carries the
  * family tag so a DeepSeek payload is never read as a Qwen one. */
 #define DS4_QWEN4_PAYLOAD_TAG 0x51573802u
+/* 4-bit KV checkpoints carry their own tag: their K/V spans are half the FP8
+ * size, so neither format may restore into the other. */
+#define DS4_QWEN4_PAYLOAD_TAG_KV_Q4 0x51573812u
 
 static uint64_t qwen4_payload_lin_state_bytes(void) {
     return (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM * DS4_N_LIN_HEAD_DIM * sizeof(float);
@@ -63270,8 +63288,8 @@ static uint64_t qwen4_payload_lin_hist_bytes(void) {
 static uint64_t qwen4_payload_kv_bytes(uint32_t rows) {
     return (uint64_t)rows * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
 }
-static uint64_t qwen4_payload_kv_fp8_bytes(uint32_t rows) {
-    return (uint64_t)rows * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 1u;
+static uint64_t qwen4_payload_kv_fp8_bytes(uint32_t rows, bool q4) {
+    return (uint64_t)rows * DS4_N_HEAD_KV * DS4_N_HEAD_DIM / (q4 ? 2u : 1u);
 }
 static uint64_t qwen4_payload_kv_scale_bytes(uint32_t rows) {
     return (uint64_t)rows * (DS4_N_HEAD_KV * DS4_N_HEAD_DIM / 64u) * 2u;
@@ -63286,14 +63304,14 @@ static uint64_t qwen4_payload_ple_hist_bytes(void) {
     return (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * DS4_N_EMBD * DS4_N_HC * sizeof(float);
 }
 
-static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows, bool fp8) {
+static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows, bool fp8, bool q4) {
     uint64_t bytes = sizeof(uint32_t);   /* mtp_rows */
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (ds4_qwen4_layer_is_linear(il)) {
             bytes += qwen4_payload_lin_state_bytes() + qwen4_payload_lin_hist_bytes();
         } else {
             const uint32_t n = ds4_qwen4_layer_is_nextn(il) ? mtp_rows : rows;
-            const uint64_t kvb = fp8 ? 2u * (qwen4_payload_kv_fp8_bytes(n) + qwen4_payload_kv_scale_bytes(n))
+            const uint64_t kvb = fp8 ? 2u * (qwen4_payload_kv_fp8_bytes(n, q4) + qwen4_payload_kv_scale_bytes(n))
                                      : 2u * qwen4_payload_kv_bytes(n);
             bytes += kvb + qwen4_payload_ik_bytes(n) + qwen4_payload_block_key_bytes(n);
         }
@@ -63382,7 +63400,7 @@ static int qwen4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_
         DS4_N_HEAD_DIM,
         DS4_N_INDEXER_HEAD_DIM,
         DS4_N_VOCAB,
-        DS4_QWEN4_PAYLOAD_TAG,
+        g->kv_q4 ? DS4_QWEN4_PAYLOAD_TAG_KV_Q4 : DS4_QWEN4_PAYLOAD_TAG,
     };
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
@@ -63406,11 +63424,11 @@ static int qwen4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_
         } else {
             const uint32_t n = ds4_qwen4_layer_is_nextn(il) ? mtp_rows : rows;
             if (g->kv_fp8) {
-                rc = payload_write_tensor_span(fp, g->layer_k_cache_fp8[il], 0, qwen4_payload_kv_fp8_bytes(n),
+                rc = payload_write_tensor_span(fp, g->layer_k_cache_fp8[il], 0, qwen4_payload_kv_fp8_bytes(n, g->kv_q4),
                                                buf, DS4_SESSION_IO_CHUNK, err, errlen);
                 if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_k_scale[il], 0, qwen4_payload_kv_scale_bytes(n),
                                                             buf, DS4_SESSION_IO_CHUNK, err, errlen);
-                if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_v_cache_fp8[il], 0, qwen4_payload_kv_fp8_bytes(n),
+                if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_v_cache_fp8[il], 0, qwen4_payload_kv_fp8_bytes(n, g->kv_q4),
                                                             buf, DS4_SESSION_IO_CHUNK, err, errlen);
                 if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_v_scale[il], 0, qwen4_payload_kv_scale_bytes(n),
                                                             buf, DS4_SESSION_IO_CHUNK, err, errlen);
@@ -63449,7 +63467,8 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
     }
     ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
     const uint32_t rows = h[7];
-    if (h[12] != DS4_QWEN4_PAYLOAD_TAG || h[8] != DS4_N_LAYER || h[9] != DS4_N_HEAD_DIM ||
+    if (h[12] != (g->kv_q4 ? DS4_QWEN4_PAYLOAD_TAG_KV_Q4 : DS4_QWEN4_PAYLOAD_TAG) ||
+        h[8] != DS4_N_LAYER || h[9] != DS4_N_HEAD_DIM ||
         h[10] != DS4_N_INDEXER_HEAD_DIM || h[11] != DS4_N_VOCAB || h[6] != DS4_N_EMBD * DS4_N_HC) {
         payload_set_err(err, errlen, "KV checkpoint was written by a different model family or shape");
         return 1;
@@ -63506,11 +63525,11 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
         } else {
             const uint32_t n = ds4_qwen4_layer_is_nextn(il) ? mtp_rows : rows;
             if (g->kv_fp8) {
-                rc = payload_read_tensor_span(fp, g->layer_k_cache_fp8[il], 0, qwen4_payload_kv_fp8_bytes(n),
+                rc = payload_read_tensor_span(fp, g->layer_k_cache_fp8[il], 0, qwen4_payload_kv_fp8_bytes(n, g->kv_q4),
                                               buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
                 if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_k_scale[il], 0, qwen4_payload_kv_scale_bytes(n),
                                                            buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
-                if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_v_cache_fp8[il], 0, qwen4_payload_kv_fp8_bytes(n),
+                if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_v_cache_fp8[il], 0, qwen4_payload_kv_fp8_bytes(n, g->kv_q4),
                                                            buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
                 if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_v_scale[il], 0, qwen4_payload_kv_scale_bytes(n),
                                                            buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
@@ -79444,7 +79463,7 @@ static bool qwen4_batch_attention_rows(int count, ds4_qwen4_gpu_graph *rowg,
         rows[i].v_scale = r->layer_v_scale[il];
         rows[i].pos = r->pos;
         rows[i].use_sel = r->pos >= sparse_pos;
-        rows[i].fp8 = qwen4_kv_fp8_active((ds4_qwen4_gpu_graph *)r) ? 1 : 0;
+        rows[i].fp8 = (int)qwen4_kv_mode(r);
         if (r->pos >= r->ctx_cap) return false;
     }
     return qwen4_batch_attention_entries(rows, (uint32_t)count, g, m, l, il);
@@ -79480,7 +79499,7 @@ static bool qwen4_batch_attention(int count, ds4_qwen4_gpu_graph *rowg,
                                             pos0, r->ctx_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS,
                                             r->layer_k_cache_fp8[il], r->layer_v_cache_fp8[il],
                                             r->layer_k_scale[il], r->layer_v_scale[il],
-                                            qwen4_kv_fp8_active(r) ? 1u : 0u, r->ik_ring);
+                                            qwen4_kv_mode(r), r->ik_ring);
         const uint32_t first_block = pos0 / ratio;
         const uint32_t n_blocks_after = (pos0 + 1u) / ratio;
         if (ok && n_blocks_after > first_block) {

@@ -432,3 +432,45 @@ context size (the K=32 fallback for 256K is no longer needed). On this counting
 output (97% MTP acceptance, few new experts) gate and drain decode at the same
 rate. `DS4_QWEN4_PLE_EVICT_TOKENS=1024` costs long-context prefill: the same
 248K prefill ran at 435-446 t/s without it.
+
+## 4-bit KV cache (opt-in, DS4_QWEN4_KV_Q4=1)
+
+`DS4_QWEN4_KV_Q4=1` stores K/V as 4-bit signed levels (-7..7) on the FP8
+cache's per-64-block fp16 scale (absmax/7), in the FP8 buffers at half their
+size: each lane's 8 elements are one 32-bit word, read as one word in the decode
+tile and as four words per 32-element segment in the prefill attention. Head
+dim 256 only. Its checkpoints carry their own payload tag, so a 4-bit and an
+FP8/BF16 session never restore each other's KV (the FP8 server rejects a 4-bit
+checkpoint as "a different model family or shape" and prefills).
+
+NLL at 64K depth (same scoring as the fake-quant table):
+
+| KV | EN fresh | repeat | VI fresh |
+|---|---:|---:|---:|
+| BF16 | 1.0777 | 0.0173 | - |
+| FP8 | 1.0882 | 0.0163 | 1.9258 |
+| 4-bit packed | 1.0785 | 0.0166 | 1.9472 |
+
+The packed cache is within about +-2% of FP8 (better on English, worse on
+Vietnamese, equal on retrieval), much closer than the fake-quant estimate,
+which paid the FP8 container's rounding on top of the 4-bit levels. At 8K it
+decodes coherently in English and Vietnamese at FP8 speed (35.7 / 35.5 t/s vs
+33.4 / 34.2). At a full 256K context with 12 streamed layers: peak wired 48.28
+GiB vs 50.01 GiB for FP8 (-1.7 GiB), decode 32.36 t/s, needle HIT, correct
+count, expert cache locked. Server checkpoint save and restore reproduce the
+reply byte for byte.
+
+## PLE sidecar eviction for the stream config
+
+Full 256K context, 12 streamed layers, gates, ring, FP8 (identical output in
+all three, swap unchanged):
+
+| DS4_QWEN4_PLE_EVICT_TOKENS | prefill t/s | gen t/s | peak wired | compressor max |
+|---|---:|---:|---:|---:|
+| unset (no eviction) | 492 | 32.44 | 50.02 GiB | 3.0 GiB |
+| 8192 | 460 | 31.56 | 50.94 GiB | 3.2 GiB |
+| 1024 (PROD setting) | 374 | 33.33 | 50.06 GiB | 4.4 GiB |
+
+Dropping the sidecar pages every 1024 tokens makes long prefill re-fault the
+table; without eviction the clean pages stay in the page cache (reclaimable)
+and nothing swaps. For the stream config, leave the eviction off.

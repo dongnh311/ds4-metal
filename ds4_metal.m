@@ -49358,14 +49358,15 @@ int ds4_gpu_qwen4_attn_prep_tensor(
         uint32_t n_tokens, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, pos0, cache_cap;
         float rope_base, eps; uint32_t fp8; float rope_mscale; float rope_freq[32]; uint32_t ik_ring, kv_simq;
     } args = { n_tokens, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, pos0, cache_cap,
-               rope_base, eps, fp8, 1.0f, { 0 }, ik_ring, fp8 ? qwen4_kv_simq_mode() : 0u };
+               rope_base, eps, fp8, 1.0f, { 0 }, ik_ring, fp8 == 1u ? qwen4_kv_simq_mode() : 0u };
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
     const uint64_t kv_bytes = (uint64_t)n_tokens * n_head_kv * head_dim * sizeof(float);
     const uint64_t iq_bytes = (uint64_t)n_tokens * n_idx_head * idx_dim * sizeof(float);
     const uint64_t kv_elems = (uint64_t)cache_cap * n_head_kv * head_dim;
-    const uint64_t cache_bytes = kv_elems * (fp8 ? 1u : 2u);
-    const uint64_t fp8_bytes = fp8 ? kv_elems : cache_bytes;
+    /* fp8: 1 = E4M3 bytes, 2 = 4-bit nibbles (half a byte per element) */
+    const uint64_t cache_bytes = fp8 == 2u ? kv_elems / 2u : kv_elems * (fp8 ? 1u : 2u);
+    const uint64_t fp8_bytes = cache_bytes;
     const uint64_t scale_bytes = fp8 ? (uint64_t)cache_cap * (n_head_kv * head_dim / 64u) * 2u : cache_bytes;
     ds4_gpu_tensor *kf  = fp8 ? k_cache_fp8 : k_cache;
     ds4_gpu_tensor *vf  = fp8 ? v_cache_fp8 : v_cache;
@@ -49574,10 +49575,10 @@ int ds4_gpu_qwen4_attn_decode_tensor(
     const uint64_t kv_rows = (use_sel == 2u) ? (uint64_t)n_tokens * sel_stride
                                              : (uint64_t)(pos0 + n_tokens);
     const uint64_t kv_elems = kv_rows * n_head_kv * head_dim;
-    const uint64_t cache_bytes = kv_elems * (fp8 ? 1u : 2u);
+    const uint64_t cache_bytes = fp8 == 2u ? kv_elems / 2u : kv_elems * (fp8 ? 1u : 2u);
     const uint64_t part_bytes = (uint64_t)n_tokens * n_head * n_splits * (2u + head_dim) * sizeof(float);
     /* FP8 slots (bind the half cache when off; the kernel BF16 path ignores them) */
-    const uint64_t fp8_bytes = fp8 ? kv_elems : cache_bytes;
+    const uint64_t fp8_bytes = cache_bytes;
     const uint64_t scale_bytes = fp8 ? (uint64_t)(pos0 + n_tokens) * (n_head_kv * head_dim / 64u) * 2u : cache_bytes;
     const ds4_gpu_tensor *kf  = fp8 ? k_cache_fp8 : k_cache;
     const ds4_gpu_tensor *vf  = fp8 ? v_cache_fp8 : v_cache;
@@ -49693,7 +49694,7 @@ int ds4_gpu_qwen4_attn_rows_stage(ds4_gpu_tensor *table, uint64_t entry0,
         e[i].pos = rows[i].pos;
         e[i].n_blocks = (rows[i].pos + 1u) / ratio;
         e[i].use_sel = rows[i].use_sel ? 1u : 0u;
-        e[i].fp8 = rows[i].fp8 ? 1u : 0u;
+        e[i].fp8 = (uint32_t)rows[i].fp8;   /* 0 half, 1 E4M3, 2 4-bit */
     }
     return ds4_gpu_tensor_write(table, entry0 * sizeof(e[0]), e, (uint64_t)n_rows * sizeof(e[0]));
 }
@@ -49740,8 +49741,8 @@ int ds4_gpu_qwen4_attn_prep_rows_tensor(
         uint32_t n_tokens, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, pos0, cache_cap;
         float rope_base, eps; uint32_t fp8; float rope_mscale; float rope_freq[32]; uint32_t ik_ring, kv_simq;
     } args = { n_rows, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, 0u, 0u,
-               rope_base, eps, (rows && n_rows > 0u && rows[0].fp8) ? 1u : 0u, 1.0f, { 0 }, ik_ring,
-               (rows && n_rows > 0u && rows[0].fp8) ? qwen4_kv_simq_mode() : 0u };
+               rope_base, eps, (rows && n_rows > 0u) ? (uint32_t)rows[0].fp8 : 0u, 1.0f, { 0 }, ik_ring,
+               (rows && n_rows > 0u && rows[0].fp8 == 1) ? qwen4_kv_simq_mode() : 0u };
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     const uint64_t q_bytes = (uint64_t)n_rows * n_head * head_dim * sizeof(float);
     const uint64_t kv_bytes = (uint64_t)n_rows * n_head_kv * head_dim * sizeof(float);

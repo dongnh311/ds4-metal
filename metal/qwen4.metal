@@ -1420,6 +1420,24 @@ static inline void qwen4_attn_prep_slot(
             }
             ka = max(ka, 1.0e-4f);
             va = max(va, 1.0e-4f);
+            if (args.fp8 == 2u && npt == 8u) {
+                /* 4-bit KV: this lane's 8 elems as 8 nibbles of one word, signed
+                 * levels -7..7 (+8) on a per-64-block absmax/7 fp16 scale. */
+                const half ksh = (half)(ka / 7.0f), vsh = (half)(va / 7.0f);
+                const float ksq = (float)ksh, vsq = (float)vsh;
+                uint kw = 0u, vw = 0u;
+                for (uint i = 0; i < 8u; i++) {
+                    kw |= (uint)(clamp(rint(kx[i] / ksq), -7.0f, 7.0f) + 8.0f) << (4u * i);
+                    vw |= (uint)(clamp(rint(vx[i] / vsq), -7.0f, 7.0f) + 8.0f) << (4u * i);
+                }
+                reinterpret_cast<device uint *>(k_cache_fp8)[((uint64_t)pos * Hkv + h) * (D / 8u) + tiisg] = kw;
+                reinterpret_cast<device uint *>(v_cache_fp8)[((uint64_t)pos * Hkv + h) * (D / 8u) + tiisg] = vw;
+                if ((tiisg & 7u) == 0u) {
+                    k_scale[((uint64_t)pos * Hkv + h) * (D / 64u) + blk] = ksh;
+                    v_scale[((uint64_t)pos * Hkv + h) * (D / 64u) + blk] = vsh;
+                }
+                return;
+            }
             const float ks  = exp2(ceil(log2(ka  / 448.0f)));
             const float vsc = exp2(ceil(log2(va  / 448.0f)));
             device uchar *dkf = k_cache_fp8 + ((uint64_t)pos * Hkv + h) * D;
@@ -2281,7 +2299,19 @@ static inline void qwen4_attn_decode_tile(
         const uint p = (use_sel == 1u) ? (uint)sel[idx] : (use_sel == 2u) ? (tok * args.sel_stride + idx) : idx;
         const uint64_t kvbase = ((uint64_t)p * Hkv + kvh) * D + tiisg * NPT;
         float kv[NPT], vv[NPT];
-        if (fp8) {
+        if (fp8 == 2u && NPT == 8u) {
+            /* 4-bit KV: one word of 8 nibbles per lane */
+            const uint64_t sidx = ((uint64_t)p * Hkv + kvh) * (D / 64u) + (tiisg * NPT) / 64u;
+            const float ksc = (float)k_scale[sidx];
+            const float vsc = (float)v_scale[sidx];
+            const uint kw = reinterpret_cast<device const uint *>(k_cache_fp8)[kvbase >> 3];
+            const uint vw = reinterpret_cast<device const uint *>(v_cache_fp8)[kvbase >> 3];
+#pragma unroll
+            for (uint i = 0; i < NPT; i++) {
+                kv[i] = (float)(half)((float)((int)((kw >> (4u * i)) & 15u) - 8) * ksc);
+                vv[i] = (float)(half)((float)((int)((vw >> (4u * i)) & 15u) - 8) * vsc);
+            }
+        } else if (fp8) {
             /* one scale per lane: this lane's NPT elems share one 64-block */
             const uint64_t sidx = ((uint64_t)p * Hkv + kvh) * (D / 64u) + (tiisg * NPT) / 64u;
             const float ksc = (float)k_scale[sidx];
@@ -2623,7 +2653,25 @@ kernel void kernel_qwen4_attn_mm(
             const uint key = tid >> 3, seg = tid & 7u;
             const int p = kpos[key];
             const uint64_t row = ((uint64_t)max(p, 0) * Hkv + kvh) * D;
-            if (args.fp8) {
+            if (args.fp8 == 2u) {
+                /* 4-bit KV: this thread's 32 elems are 4 words of 8 nibbles */
+                const uint64_t sidx = ((uint64_t)max(p, 0) * Hkv + kvh) * (D / 64u) + (seg >> 1);
+                const float ksc = p >= 0 ? (float)k_scale[sidx] : 0.0f;
+                const float vsc = p >= 0 ? (float)v_scale[sidx] : 0.0f;
+                device const uint *kw = reinterpret_cast<device const uint *>(k_cache_fp8) + (row >> 3) + seg * 4u;
+                device const uint *vw = reinterpret_cast<device const uint *>(v_cache_fp8) + (row >> 3) + seg * 4u;
+                threadgroup half *kd = Ks + key * D + seg * 32u;
+                threadgroup half *vd = Vs + key * D + seg * 32u;
+#pragma unroll
+                for (uint w = 0; w < 4u; w++) {
+                    const uint ka = p >= 0 ? kw[w] : 0x88888888u, va = p >= 0 ? vw[w] : 0x88888888u;
+#pragma unroll
+                    for (uint b = 0; b < 8u; b++) {
+                        kd[w * 8u + b] = (half)((float)((int)((ka >> (4u * b)) & 15u) - 8) * ksc);
+                        vd[w * 8u + b] = (half)((float)((int)((va >> (4u * b)) & 15u) - 8) * vsc);
+                    }
+                }
+            } else if (args.fp8) {
                 /* this thread's 32 elems [seg*32..+31] share one 64-block seg>>1 */
                 const uint64_t sidx = ((uint64_t)max(p, 0) * Hkv + kvh) * (D / 64u) + (seg >> 1);
                 const float ksc = p >= 0 ? (float)k_scale[sidx] : 0.0f;
