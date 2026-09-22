@@ -92,3 +92,29 @@ prompt (124,141 tokens, code at the start, question at the end).
   could read it in bulk.
 - Resident unc31 already fits at 124K with FP8 + chunk 2048 (peak 55.62 GiB), so
   streaming is not needed for fit at this context; it buys ~7 GiB of headroom.
+
+## Prefill fix (b704550): GEMMs stay on non-streamed layers
+
+Root cause of the slow streaming prefill and of the streaming/resident output
+difference: `qwen4_graph_moe` disabled the prefill expert GEMMs (T > 64) on every
+layer whenever `--ssd-streaming` was on, so resident and pinned layers also ran
+the per-token row kernels. Streaming with zero streamed layers (K=48) was 116
+t/s against 555 resident on a 16K prompt, and chunk 4096 was no faster than
+2048, so the cost was per token, not per chunk or per read. The gate is now per
+layer, using the span planner's predicate.
+
+unc31, 124K needle (124,141 tokens), FP8 KV, MTP, 12 streamed layers @ 6GB:
+
+| build | chunk | prefill t/s | 124K prefill time | gen t/s | peak GiB | output |
+|---|---:|---:|---:|---:|---:|---|
+| resident | 2048 | 587.6 | ~211 s | 34.20 | 55.62 | reference |
+| streaming, before fix | 2048 | 106-108 | ~1160 s | 23.9-25.7 | 48.4 | == resident |
+| streaming, after fix | 2048 | 230.4 | ~540 s | 26.10 | 48.36 | == resident |
+| streaming, after fix | 4096 | 229.0 | ~542 s | 24.58 | 49.83 | == resident |
+
+Prefill goes from 18% to 39% of resident. Chunk 4096 buys nothing and costs
+1.5 GiB. The remaining gap is the 12 streamed layers, which still use the row
+kernels in prefill because no GEMM reads through the expert address table yet.
+
+16K prompt, same model: 0 streamed 522 t/s, 6 streamed 303, 12 streamed 233
+(resident 555); every output matched resident.
