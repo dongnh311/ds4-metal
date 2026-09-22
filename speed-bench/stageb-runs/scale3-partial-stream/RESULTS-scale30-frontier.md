@@ -269,3 +269,32 @@ is byte-identical across variants within each mode:
 
 Resident with MTP at 8K is 38.20, so the main config is now at ~92%. What is
 left is mostly the submit/wake-up latency of the per-layer drain.
+
+## SCALE-3A: decode gates instead of the per-layer drain (opt-in)
+
+`DS4_QWEN4_STREAM_GATE=1` keeps the whole token encoded ahead. At each streamed
+layer a publish kernel copies the selected ids to a mailbox (each word tagged
+with the gate's sequence number) and the batch is committed; the next batch
+opens with `kernel_dsv4_tp_poll_release` (the TP poll kernel) spinning on a
+fresh shared-memory region. A service thread reads the mailbox as soon as the
+lines reach memory, loads the cache, writes the layer's address table and
+releases the poll. No command buffer is waited on inside the token. Gates
+start once the cache has all its slabs; experts the cache cannot hold go to a
+gate-owned 120 MiB fallback buffer (never used in these runs).
+
+A/B, unc31, 12 streamed @ 6GB, FP8, 8K, 600 tokens, ABCD/DCBA, output
+byte-identical in every run:
+
+| path | gen t/s, MTP | gen t/s, no MTP |
+|---|---:|---:|
+| drain (after the flush + scan fixes) | 35.21 | 28.40 |
+| gate | 36.33 (+3.2%) | 29.86 (+5.1%) |
+
+With MTP the main config goes 34.15 -> 36.33 over today's three changes (95%
+of resident 38.20). The gate's service time is now the critical path: 150-200
+µs per gate, of which the cache resolve is 100-150 µs and is dominated by
+reading missed experts (the service thread waits on the pread pool; `sample`
+puts 86% of resolve there), and the release stores ~54 µs (the GPU sees the
+release within the first ~10 µs of them). Splitting the miss reads into 128
+KB chunks across the pool made it slower (resolve 99 -> 122 µs) and was
+dropped.

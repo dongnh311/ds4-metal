@@ -3205,6 +3205,20 @@ kernel void kernel_qwen4_moe_down(
     }
 }
 
+// SCALE-3A decode gate: copies a streamed layer's selected expert ids to the
+// gate mailbox, each word tagged with the gate's sequence number in its high
+// half. The host service thread reads the mailbox as soon as the command
+// buffer's lines reach memory and can tell a fresh word from a stale one by the
+// tag, without waiting for the buffer's completion status.
+kernel void kernel_qwen4_stream_gate_publish(
+        device const int32_t *selected,
+        device uint          *mailbox,
+        constant uint        &n,
+        constant uint        &tag,
+        uint tid [[thread_position_in_grid]]) {
+    if (tid < n) mailbox[tid] = ((uint)selected[tid] & 0xffffu) | (tag << 16);
+}
+
 /* SCALE-2 streaming variants: identical math to kernel_qwen4_moe_mid/down, but
  * routed expert weights are addressed through a per-expert GPU-address table
  * (gate_addrs/up_addrs/down_addrs, indexed by global expert id; 0 = not
