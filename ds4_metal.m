@@ -16335,6 +16335,166 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protec
                                                       down_inner);
 }
 
+/*
+ * SCALE-3.1: load every missing expert of one qwen4 layer in one parallel pread
+ * batch. get_protected reads the three tensors of one expert and waits before
+ * starting the next, so a prefill chunk that touches most of a layer's experts
+ * runs at queue depth <= 3 (~0.7 GB/s measured on a 124K prompt). Here hits are
+ * handled as in get_protected, then every miss takes its buffers with the whole
+ * union protected from eviction, one pread_tasks call reads all of them on the
+ * pool, and only then are they installed, so an entry never becomes valid before
+ * its bytes are read. force_reuse counts the buffers already handed out in this
+ * batch, so the cache evicts one entry per miss as the sequential path does
+ * instead of allocating past its budget.
+ */
+static int ds4_gpu_stream_expert_cache_load_batch(
+        const void    *model_map,
+        uint64_t       model_size,
+        uint32_t       layer,
+        const int32_t *ids,
+        uint32_t       n_ids,
+        uint32_t       n_total_expert,
+        uint64_t       gate_offset,
+        uint64_t       up_offset,
+        uint64_t       down_offset,
+        uint64_t       gate_expert_bytes,
+        uint64_t       down_expert_bytes,
+        ds4_gpu_stream_expert_cache_entry **entries) {
+    if (!g_ssd_streaming_mode || !ids || !entries || n_ids == 0 ||
+        n_ids > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
+        layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        !ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
+                                                      down_expert_bytes) ||
+        ds4_gpu_stream_expert_cache_effective_cap(layer,
+                                                  n_total_expert,
+                                                  n_ids) == 0) {
+        return 0;
+    }
+
+    uint32_t miss[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    uint32_t n_miss = 0;
+    for (uint32_t i = 0; i < n_ids; i++) {
+        if (ids[i] < 0 ||
+            (uint32_t)ids[i] >= n_total_expert ||
+            (uint32_t)ids[i] >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
+            return 0;
+        }
+        const uint64_t eid = (uint32_t)ids[i];
+        ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][eid];
+        if (ds4_gpu_stream_expert_cache_entry_matches(e,
+                                                      model_map,
+                                                      model_size,
+                                                      gate_offset + eid * gate_expert_bytes,
+                                                      up_offset + eid * gate_expert_bytes,
+                                                      down_offset + eid * down_expert_bytes,
+                                                      gate_expert_bytes,
+                                                      down_expert_bytes)) {
+            e->last_used = ++g_stream_expert_cache_clock;
+            e->use_count++;
+            g_stream_expert_cache_hits++;
+            g_stream_expert_cache_layer_hits[layer]++;
+            entries[i] = e;
+        } else {
+            entries[i] = NULL;
+            miss[n_miss++] = i;
+        }
+    }
+    if (n_miss == 0) return 1;
+
+    __strong id<MTLBuffer> gate_bufs[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    __strong id<MTLBuffer> up_bufs[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    __strong id<MTLBuffer> down_bufs[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    NSUInteger gate_inner[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    NSUInteger up_inner[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    NSUInteger down_inner[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    ds4_gpu_stream_expert_pread_task *tasks =
+        (ds4_gpu_stream_expert_pread_task *)calloc((size_t)n_miss * 3u, sizeof(*tasks));
+    if (!tasks) return 0;
+
+    const uint32_t cache_budget = ds4_gpu_stream_expert_cache_configured_budget();
+    int ok = 1;
+    for (uint32_t k = 0; ok && k < n_miss; k++) {
+        const uint64_t eid = (uint32_t)ids[miss[k]];
+        const int force_reuse = cache_budget != 0 &&
+            (uint64_t)g_stream_expert_cache_entry_count + k >= cache_budget;
+        if (!ds4_gpu_stream_expert_cache_prepare_load_buffers(layer,
+                                                              (uint32_t)eid,
+                                                              layer,
+                                                              ids,
+                                                              n_ids,
+                                                              gate_expert_bytes,
+                                                              down_expert_bytes,
+                                                              force_reuse,
+                                                              &gate_bufs[k],
+                                                              &up_bufs[k],
+                                                              &down_bufs[k],
+                                                              &gate_inner[k],
+                                                              &up_inner[k],
+                                                              &down_inner[k]) ||
+            !gate_bufs[k] || !up_bufs[k] || !down_bufs[k]) {
+            ok = 0;
+            break;
+        }
+        uint8_t *gate_dst = (uint8_t *)[gate_bufs[k] contents] + gate_inner[k];
+        uint8_t *up_dst = (uint8_t *)[up_bufs[k] contents] + up_inner[k];
+        uint8_t *down_dst = (uint8_t *)[down_bufs[k] contents] + down_inner[k];
+        tasks[3u * k + 0u] = (ds4_gpu_stream_expert_pread_task) {
+            .offset = gate_offset + eid * gate_expert_bytes,
+            .len = gate_expert_bytes,
+            .dst = gate_dst,
+        };
+        tasks[3u * k + 1u] = (ds4_gpu_stream_expert_pread_task) {
+            .offset = up_offset + eid * gate_expert_bytes,
+            .len = gate_expert_bytes,
+            .dst = up_dst,
+        };
+        tasks[3u * k + 2u] = (ds4_gpu_stream_expert_pread_task) {
+            .offset = down_offset + eid * down_expert_bytes,
+            .len = down_expert_bytes,
+            .dst = down_dst,
+        };
+    }
+
+    uint64_t read_bytes = 0;
+    double read_ms = 0.0;
+    if (ok) ok = ds4_gpu_stream_expert_pread_tasks(tasks, n_miss * 3u, &read_bytes, &read_ms);
+    free(tasks);
+    if (ok) {
+        ds4_gpu_stream_expert_cache_note_pread(layer, read_bytes, read_ms);
+        if (getenv("DS4_METAL_STREAMING_EXPERT_PREAD_PROFILE") != NULL) {
+            fprintf(stderr,
+                    "ds4: Metal streaming expert batch pread layer=%u experts=%u tensors=%u "
+                    "threads=%u bytes=%.2f GiB wall=%.3f ms\n",
+                    layer,
+                    n_miss,
+                    n_miss * 3u,
+                    ds4_gpu_stream_expert_pread_thread_count(n_miss * 3u),
+                    ds4_gpu_gib(read_bytes),
+                    read_ms);
+        }
+    }
+    for (uint32_t k = 0; ok && k < n_miss; k++) {
+        const uint64_t eid = (uint32_t)ids[miss[k]];
+        entries[miss[k]] = ds4_gpu_stream_expert_cache_install_loaded(model_map,
+                                                                      model_size,
+                                                                      layer,
+                                                                      (uint32_t)eid,
+                                                                      gate_offset + eid * gate_expert_bytes,
+                                                                      up_offset + eid * gate_expert_bytes,
+                                                                      down_offset + eid * down_expert_bytes,
+                                                                      gate_expert_bytes,
+                                                                      down_expert_bytes,
+                                                                      gate_bufs[k],
+                                                                      up_bufs[k],
+                                                                      down_bufs[k],
+                                                                      gate_inner[k],
+                                                                      up_inner[k],
+                                                                      down_inner[k]);
+        if (!entries[miss[k]]) ok = 0;
+    }
+    return ok;
+}
+
 static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get(
         const void *model_map,
         uint64_t    model_size,
@@ -49834,12 +49994,27 @@ int ds4_gpu_qwen4_moe_stream_layer(
 
     int ok = 1;
     g_glm_stream_expert_addr_table_building++;   /* shared build gate (file-private, not GLM-specific) */
+    /* SCALE-3.1: read all misses of the layer in one parallel batch.
+     * DS4_QWEN4_STREAM_BATCH_LOAD=0 restores the per-expert reads for A/B. */
+    static int batch_load = -1;
+    if (batch_load < 0) {
+        const char *bl = getenv("DS4_QWEN4_STREAM_BATCH_LOAD");
+        batch_load = !(bl && bl[0] == '0');
+    }
+    ds4_gpu_stream_expert_cache_entry *batch_entries[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    if (batch_load &&
+        !ds4_gpu_stream_expert_cache_load_batch(model_map, model_size, layer, unique_ids, n_unique,
+                                                n_total_expert, gate_offset, up_offset, down_offset,
+                                                gate_expert_bytes, down_expert_bytes, batch_entries)) {
+        if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: batch load (n=%u)\n", layer, n_unique);
+        ok = 0;
+    }
     for (uint32_t i = 0; ok && i < n_unique; i++) {
         const uint64_t eid = (uint32_t)unique_ids[i];
         const uint64_t ga = gate_offset + eid * gate_expert_bytes;
         const uint64_t ua = up_offset   + eid * gate_expert_bytes;
         const uint64_t da = down_offset + eid * down_expert_bytes;
-        ds4_gpu_stream_expert_cache_entry *e =
+        ds4_gpu_stream_expert_cache_entry *e = batch_load ? batch_entries[i] :
             ds4_gpu_stream_expert_cache_get_protected(model_map, model_size, layer,
                 (uint32_t)unique_ids[i], n_total_expert, n_unique, ga, ua, da,
                 gate_expert_bytes, down_expert_bytes, unique_ids, n_unique);
