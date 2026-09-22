@@ -17,8 +17,10 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <mach-o/dyld.h>
 #include <objc/runtime.h>
 
@@ -1559,10 +1561,75 @@ static int ds4_gpu_stream_expert_cache_wait_inflight(const char *label);
 static double g_qsa_prof_gpu_ms[DS4_QSA_PROF_SLOTS];
 static const char kQsaSlotKey;
 
+/* Gate round-trip timing (DS4_QWEN4_STREAM_TIMING): the batch that ends in a
+ * gate's publish is tagged with its sequence number; at the token-end wait its
+ * GPU end time is compared with when the service thread saw the mailbox and
+ * released the first poll, in the same host time base. */
+static const char kQgateSeqKey = 0;
+static double g_qgate_seen_host[16], g_qgate_rel_host[16];
+static double g_qgate_rt_vis_ms, g_qgate_rt_gap_ms, g_qgate_rt_wait_ms;
+static uint64_t g_qgate_rt_n;
+static double ds4_gpu_host_seconds(void) {
+    static mach_timebase_info_data_t tb;
+    if (tb.denom == 0) mach_timebase_info(&tb);
+    return (double)mach_absolute_time() * (double)tb.numer / (double)tb.denom * 1e-9;
+}
+
+/* DS4_METAL_GPU_IDLE=1: for each waited group of command buffers (the pending
+ * ones plus the one being finished), GPU busy time vs first-start..last-end. */
+static int g_gpu_idle_prof = -1;
+static double g_gpu_idle_min_start, g_gpu_idle_max_end, g_gpu_idle_busy;
+static uint32_t g_gpu_idle_n_cbs;
+static double g_gpu_idle_acc_wall, g_gpu_idle_acc_busy;
+static uint64_t g_gpu_idle_groups, g_gpu_idle_acc_cbs;
+
+static void ds4_gpu_idle_note_cb(id<MTLCommandBuffer> cb) {
+    const double st = cb.GPUStartTime, en = cb.GPUEndTime;
+    if (en <= st) return;
+    if (g_gpu_idle_n_cbs == 0 || st < g_gpu_idle_min_start) g_gpu_idle_min_start = st;
+    if (g_gpu_idle_n_cbs == 0 || en > g_gpu_idle_max_end) g_gpu_idle_max_end = en;
+    g_gpu_idle_busy += en - st;
+    g_gpu_idle_n_cbs++;
+}
+
+static void ds4_gpu_idle_end_group(void) {
+    if (g_gpu_idle_n_cbs >= 2) {
+        g_gpu_idle_acc_wall += (g_gpu_idle_max_end - g_gpu_idle_min_start) * 1e3;
+        g_gpu_idle_acc_busy += g_gpu_idle_busy * 1e3;
+        g_gpu_idle_acc_cbs += g_gpu_idle_n_cbs;
+        g_gpu_idle_groups++;
+        if (g_gpu_idle_groups % 200u == 0u) {
+            fprintf(stderr, "ds4: gpu idle: %llu groups, %.1f cbs/group, wall %.3f ms, busy %.3f ms, idle %.3f ms (%.1f%%)\n",
+                    (unsigned long long)g_gpu_idle_groups,
+                    (double)g_gpu_idle_acc_cbs / (double)g_gpu_idle_groups,
+                    g_gpu_idle_acc_wall / (double)g_gpu_idle_groups,
+                    g_gpu_idle_acc_busy / (double)g_gpu_idle_groups,
+                    (g_gpu_idle_acc_wall - g_gpu_idle_acc_busy) / (double)g_gpu_idle_groups,
+                    100.0 * (g_gpu_idle_acc_wall - g_gpu_idle_acc_busy) / g_gpu_idle_acc_wall);
+        }
+    }
+    g_gpu_idle_n_cbs = 0;
+    g_gpu_idle_busy = 0.0;
+}
+
 static int ds4_gpu_wait_pending_command_buffers(const char *label) {
     int ok = 1;
+    if (g_gpu_idle_prof < 0) g_gpu_idle_prof = getenv("DS4_METAL_GPU_IDLE") != NULL;
+    id<MTLCommandBuffer> gate_cb = nil;
+    uint32_t gate_ring = 0;
     for (id<MTLCommandBuffer> pending in g_pending_cbs) {
         if (!ds4_gpu_wait_command_buffer(pending, label)) ok = 0;
+        if (g_gpu_idle_prof) ds4_gpu_idle_note_cb(pending);
+        if (gate_cb) {
+            /* pending opens with the gate's first poll */
+            g_qgate_rt_vis_ms += (g_qgate_seen_host[gate_ring] - gate_cb.GPUEndTime) * 1e3;
+            g_qgate_rt_gap_ms += (pending.GPUStartTime - gate_cb.GPUEndTime) * 1e3;
+            g_qgate_rt_wait_ms += (g_qgate_rel_host[gate_ring] - pending.GPUStartTime) * 1e3;
+            g_qgate_rt_n++;
+            gate_cb = nil;
+        }
+        NSNumber *gseq = objc_getAssociatedObject(pending, &kQgateSeqKey);
+        if (gseq) { gate_cb = pending; gate_ring = (uint32_t)(gseq.unsignedLongLongValue % 16u); }
         NSNumber *slot = objc_getAssociatedObject(pending, &kQsaSlotKey);
         if (slot) {
             const int s = slot.intValue;
@@ -1589,6 +1656,10 @@ static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, con
     if (!ds4_gpu_wait_command_buffer(cb, label)) {
         ok = 0;
         ds4_gpu_invalidate_zero_prefix_prefill_block_maps();
+    }
+    if (g_gpu_idle_prof > 0) {
+        ds4_gpu_idle_note_cb(cb);
+        ds4_gpu_idle_end_group();
     }
     if (getenv("DS4_METAL_CB_TIMES")) {
         const double t_done = ds4_gpu_now_ms();
@@ -13445,7 +13516,21 @@ static int ds4_gpu_stream_expert_pread_into(
     return 1;
 }
 
+/* Expert reads sit on the decode's critical path. A reader thread inherits
+ * its creator's QoS, so under a background launchd job or `taskpolicy -b`
+ * every miss would pay the throttled IO tier (antirez/ds4 #570). Pin the
+ * readers to user-initiated QoS and the important IO tier;
+ * DS4_METAL_DISABLE_STREAMING_EXPERT_PREAD_QOS keeps the inherited ones. */
+static void ds4_gpu_stream_expert_pread_thread_qos(void) {
+    static int disabled = -1;
+    if (disabled < 0) disabled = getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_PREAD_QOS") != NULL;
+    if (disabled) return;
+    (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+    (void)setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_IMPORTANT);
+}
+
 static void *ds4_gpu_stream_expert_pread_worker(void *arg) {
+    ds4_gpu_stream_expert_pread_thread_qos();
     ds4_gpu_stream_expert_pread_worker_args *wa =
         (ds4_gpu_stream_expert_pread_worker_args *)arg;
     for (uint32_t i = wa->worker_index; i < wa->n_tasks; i += wa->n_workers) {
@@ -13481,6 +13566,7 @@ static int ds4_gpu_stream_expert_pread_pool_enabled(void) {
 static void *ds4_gpu_stream_expert_pread_pool_worker(void *arg) {
     const uint32_t worker_index = (uint32_t)(uintptr_t)arg;
     uint64_t seen_generation = 0;
+    ds4_gpu_stream_expert_pread_thread_qos();
 
     for (;;) {
         pthread_mutex_lock(&g_stream_expert_pread_pool_mutex);
@@ -14344,6 +14430,18 @@ void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
         g_stream_expert_cache_decode_tokens;
 }
 
+/* Tokens between halvings of the route hotness the eviction ranks by
+ * (DS4_METAL_STREAMING_EXPERT_HOTNESS_DECAY overrides the default 16). */
+static uint64_t ds4_gpu_stream_expert_hotness_decay_tokens(void) {
+    static uint64_t v = 0;
+    if (v == 0) {
+        const char *e = getenv("DS4_METAL_STREAMING_EXPERT_HOTNESS_DECAY");
+        const unsigned long long x = e ? strtoull(e, NULL, 10) : 0ull;
+        v = x >= 1ull && x <= (1ull << 20) ? (uint64_t)x : (uint64_t)DS4_METAL_STREAM_EXPERT_HOTNESS_DECAY_TOKENS;
+    }
+    return v;
+}
+
 static void ds4_gpu_stream_expert_cache_maybe_decay_route_hotness(void) {
     if (g_stream_expert_cache_decode_tokens == 0) return;
     if (g_stream_expert_cache_hotness_decay_token == 0) {
@@ -14353,10 +14451,10 @@ static void ds4_gpu_stream_expert_cache_maybe_decay_route_hotness(void) {
     }
     while (g_stream_expert_cache_decode_tokens -
            g_stream_expert_cache_hotness_decay_token >=
-           DS4_METAL_STREAM_EXPERT_HOTNESS_DECAY_TOKENS) {
+           ds4_gpu_stream_expert_hotness_decay_tokens()) {
         ds4_gpu_stream_expert_cache_decay_route_hotness();
         g_stream_expert_cache_hotness_decay_token +=
-            DS4_METAL_STREAM_EXPERT_HOTNESS_DECAY_TOKENS;
+            ds4_gpu_stream_expert_hotness_decay_tokens();
     }
 }
 
@@ -14440,16 +14538,21 @@ static int ds4_gpu_stream_compact_addr_requested(void) {
 }
 
 static int ds4_gpu_stream_expert_addr_table_requested(void) {
-    return g_ssd_streaming_mode &&
-           (getenv("DS4_METAL_ENABLE_STREAMING_EXPERT_ADDR_TABLE") != NULL ||
-            getenv("DS4_METAL_ENABLE_STREAMING_EXPERT_HIT_VALIDATOR") != NULL ||
-            getenv("DS4_METAL_ENABLE_STREAMING_EXPERT_MASKED_ADDR") != NULL ||
-            g_stream_prefill_batch_selected_addr_building ||
+    /* Called for every slot write; the environment is read once. */
+    static int env_on = -1, env_off = -1;
+    if (env_on < 0) {
+        env_on = getenv("DS4_METAL_ENABLE_STREAMING_EXPERT_ADDR_TABLE") != NULL ||
+                 getenv("DS4_METAL_ENABLE_STREAMING_EXPERT_HIT_VALIDATOR") != NULL ||
+                 getenv("DS4_METAL_ENABLE_STREAMING_EXPERT_MASKED_ADDR") != NULL ||
+                 (getenv("DS4_METAL_ENABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") != NULL &&
+                  getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") == NULL);
+        env_off = getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE") != NULL;
+    }
+    return g_ssd_streaming_mode && !env_off &&
+           (g_stream_prefill_batch_selected_addr_building ||
             g_glm_stream_expert_addr_table_building ||
-            (getenv("DS4_METAL_ENABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") != NULL &&
-             getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") == NULL) ||
-            ds4_gpu_stream_expert_split_requested()) &&
-           getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE") == NULL;
+            env_on ||
+            ds4_gpu_stream_expert_split_requested());
 }
 
 static int ds4_gpu_stream_expert_addr_table_kernel_requested(void) {
@@ -48587,7 +48690,7 @@ typedef struct {
     uint32_t n_tokens, n_slots, in_dim, out_rows, weight_type, row_bytes;
     uint64_t expert_bytes;
     uint32_t has_shared, shared_type, shared_row_bytes, n_total_expert;
-    uint32_t list_cap, pad0;
+    uint32_t list_cap, phase;   /* phase: *_addr kernels only (see qwen4_moe_addr_skip) */
 } qwen4_moe_args;
 
 static bool qwen4_moe_mv_specialize(uint32_t type) {
@@ -50228,6 +50331,8 @@ static int qwen4_stream_resolve(const void *model_map, uint64_t model_size, uint
 #define QGATE_POLL_LINES 8192u      /* kernel_dsv4_tp_poll_release region: ~600 ms before timeout */
 #define QGATE_POLL_LINE_BYTES 128u
 #define QGATE_QUEUE 256u
+#define QGATE_MAX_EXPERT 512u       /* split gates: expert ids per layer the pass-2 tables cover */
+#define QGATE_PENDING_WORDS (QGATE_MAX_EXPERT / 32u)
 
 typedef struct {
     uint64_t seq;
@@ -50236,12 +50341,16 @@ typedef struct {
     uint64_t gate_offset, up_offset, down_offset;
     uint64_t gate_expert_bytes, down_expert_bytes;
     uint32_t layer, n_sel, n_total_expert, n_slabs;
+    int split;                                 /* two passes: cached experts, then misses */
 } qgate_req;
 
 static id<MTLBuffer> g_qgate_mailbox;          /* QGATE_RING x QGATE_MAX_IDS words */
 static id<MTLBuffer> g_qgate_region;           /* QGATE_RING poll regions */
 static id<MTLBuffer> g_qgate_status;           /* QGATE_RING x 2 words written by the poll */
 static id<MTLBuffer> g_qgate_fallback;         /* QGATE_MAX_IDS expert slots */
+static id<MTLBuffer> g_qgate_pending;          /* QGATE_RING x QGATE_PENDING_WORDS missed-expert bitmasks */
+static id<MTLBuffer> g_qgate_misstab;          /* QGATE_RING x 3 x QGATE_MAX_EXPERT pass-2 addresses */
+static uint8_t g_qgate_ring_split[QGATE_RING]; /* gate in this ring slot encoded a second poll */
 static uint64_t g_qgate_fallback_slot_bytes;
 static uint64_t g_qgate_seq;
 static uint64_t g_qgate_last_seq;              /* last gate encoded (main thread) */
@@ -50255,6 +50364,13 @@ static volatile int g_qgate_failed;            /* latched by the service thread 
 static int g_qgate_failed_reported;
 static uint64_t g_qgate_stat_gates, g_qgate_stat_fallback;
 static double g_qgate_stat_wait_ms, g_qgate_stat_service_ms, g_qgate_stat_resolve_ms, g_qgate_stat_release_ms;
+static uint64_t g_qgate_stat_split_gates, g_qgate_stat_split_miss_gates;
+static double g_qgate_stat_split_first_ms;   /* arrival -> first release, split gates */
+static double g_qgate_stat_split_classify_ms; /* arrival -> first release starts */
+static uint64_t g_qgate_stat_poll_n[3], g_qgate_stat_poll_waited[3];
+static double g_qgate_stat_poll_line[3];     /* sum of the line each poll found its release at */
+static uint8_t g_qgate_ring_missed[QGATE_RING]; /* split gate in this ring slot had misses */
+static double g_qgate_stat_miss_load_ms, g_qgate_stat_miss_count; /* split gates with misses */
 
 static int qgate_requested(void) {
     static int v = -1;
@@ -50265,8 +50381,74 @@ static int qgate_requested(void) {
     return v;
 }
 
+/*
+ * Split gates (on by default; DS4_QWEN4_STREAM_SPLIT=0 keeps one pass): the
+ * service thread releases the layer as soon as it knows which selected
+ * experts are cached, the GPU runs those (and the shared expert) while the
+ * misses are read, and a second poll in the same command buffer waits for
+ * them. The misses' addresses go to a per-gate
+ * table rather than the layer's: a running command buffer keeps the stale L2
+ * copy of any line it already read, and the first pass reads the layer table.
+ * The pass-2 table and the pending mask of a ring slot are only read after the
+ * poll that follows their write. Down writes one partial per (row, slot) and
+ * the reduce adds the slots in order, so the output is byte-identical.
+ */
+static int qgate_split_requested(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_QWEN4_STREAM_SPLIT");
+        v = !(e && e[0] == '0');
+    }
+    return v;
+}
+
+/* Writes the release value into lines [j0, j1) of a poll region. The poll
+ * probes lines front to back and a waiting GPU is rarely past the first few
+ * hundred, so releases write a head first and the rest of the region (needed
+ * only by a poll that has waited very long) after any other urgent work. */
+#define QGATE_RELEASE_HEAD 2048u
+static void qgate_release_lines(uint32_t region_index, uint32_t value, uint32_t j0, uint32_t j1) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    volatile uint32_t *region = (volatile uint32_t *)[g_qgate_region contents] +
+        (size_t)region_index * QGATE_POLL_LINES * (QGATE_POLL_LINE_BYTES / 4u);
+    for (uint32_t j = j0; j < j1; j++) {
+        __atomic_store_n(&region[j * (QGATE_POLL_LINE_BYTES / 4u)], value, __ATOMIC_RELAXED);
+    }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
+static void qgate_release(uint32_t region_index, uint32_t value) {
+    qgate_release_lines(region_index, value, 0, QGATE_POLL_LINES);
+}
+
+static int qgate_status_timed_out(uint32_t region_index) {
+    const uint32_t *st = (const uint32_t *)[g_qgate_status contents];
+    return __atomic_load_n(&st[region_index * 2u], __ATOMIC_ACQUIRE) == 0xffffffffu;
+}
+
+/* Pass-2 address table of a ring slot: gate, up, down rows of QGATE_MAX_EXPERT. */
+static uint64_t *qgate_misstab(uint32_t ring) {
+    return (uint64_t *)[g_qgate_misstab contents] + (size_t)ring * 3u * QGATE_MAX_EXPERT;
+}
+
+static int qgate_misstab_set(uint32_t ring, uint32_t expert,
+                             id<MTLBuffer> gb, NSUInteger gi, id<MTLBuffer> ub, NSUInteger ui,
+                             id<MTLBuffer> db, NSUInteger di) {
+    if (expert >= QGATE_MAX_EXPERT) return 0;
+    uint64_t *t = qgate_misstab(ring);
+    const uint64_t g = ds4_gpu_buffer_address(gb, gi);
+    const uint64_t u = ds4_gpu_buffer_address(ub, ui);
+    const uint64_t d = ds4_gpu_buffer_address(db, di);
+    if (!g || !u || !d) return 0;
+    t[expert] = g;
+    t[QGATE_MAX_EXPERT + expert] = u;
+    t[2u * QGATE_MAX_EXPERT + expert] = d;
+    return 1;
+}
+
 /* Reads the unique experts that could not stay in the cache into the fallback
- * buffer and points the address table there. */
+ * buffer and points the address table there (the gate's pass-2 table when
+ * split, else the layer's). */
 static int qgate_fallback(const qgate_req *r, const int32_t *ids, uint32_t n) {
     if (!g_qgate_fallback || n > QGATE_MAX_IDS ||
         g_qgate_fallback_slot_bytes < r->gate_expert_bytes * 2ull + r->down_expert_bytes) {
@@ -50288,13 +50470,17 @@ static int qgate_fallback(const qgate_req *r, const int32_t *ids, uint32_t n) {
     uint64_t read_bytes = 0;
     double read_ms = 0.0;
     if (!ds4_gpu_stream_expert_pread_tasks(tasks, 3u * n, &read_bytes, &read_ms)) return 0;
+    const uint32_t ring = (uint32_t)(r->seq % QGATE_RING);
     for (uint32_t i = 0; i < n; i++) {
         const NSUInteger off = (NSUInteger)((uint64_t)i * g_qgate_fallback_slot_bytes);
-        if (!ds4_gpu_stream_expert_cache_set_addr_slot_raw(r->layer, (uint32_t)ids[i],
+        const int set = r->split ?
+            qgate_misstab_set(ring, (uint32_t)ids[i],
                 g_qgate_fallback, off, g_qgate_fallback, off + (NSUInteger)r->gate_expert_bytes,
-                g_qgate_fallback, off + (NSUInteger)(2u * r->gate_expert_bytes))) {
-            return 0;
-        }
+                g_qgate_fallback, off + (NSUInteger)(2u * r->gate_expert_bytes)) :
+            ds4_gpu_stream_expert_cache_set_addr_slot_raw(r->layer, (uint32_t)ids[i],
+                g_qgate_fallback, off, g_qgate_fallback, off + (NSUInteger)r->gate_expert_bytes,
+                g_qgate_fallback, off + (NSUInteger)(2u * r->gate_expert_bytes));
+        if (!set) return 0;
     }
     return 1;
 }
@@ -50332,6 +50518,7 @@ static void qgate_service(const qgate_req *r) {
         }
     }
     const double t1 = ds4_gpu_now_ms();
+    g_qgate_seen_host[ring] = ds4_gpu_host_seconds();
     int32_t unique_ids[QGATE_MAX_IDS];
     uint32_t n_unique = 0;
     uint8_t seen[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
@@ -50343,15 +50530,86 @@ static void qgate_service(const qgate_req *r) {
         if (!seen[e]) { seen[e] = 1; unique_ids[n_unique++] = (int32_t)e; }
     }
     const double tr0 = ds4_gpu_now_ms();
-    if (ok) {
+    int released_a = 0;
+    double ta = 0.0;
+    uint32_t n_miss = 0;
+    uint8_t is_miss[QGATE_MAX_IDS];
+    if (ok && r->split) {
+        /* Release the cached experts before any read: pending marks the rest. */
+        uint32_t *pend = (uint32_t *)[g_qgate_pending contents] + (size_t)ring * QGATE_PENDING_WORDS;
+        uint32_t mask[QGATE_PENDING_WORDS];
+        memset(mask, 0, sizeof(mask));
+        for (uint32_t i = 0; i < n_unique; i++) {
+            const uint64_t eid = (uint32_t)unique_ids[i];
+            const ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[r->layer][eid];
+            const int hit = ds4_gpu_stream_expert_cache_entry_matches(e, r->model_map, r->model_size,
+                                r->gate_offset + eid * r->gate_expert_bytes,
+                                r->up_offset + eid * r->gate_expert_bytes,
+                                r->down_offset + eid * r->down_expert_bytes,
+                                r->gate_expert_bytes, r->down_expert_bytes) &&
+                            qgate_entry_resident(e, r->n_slabs);
+            is_miss[i] = (uint8_t)!hit;
+            if (!hit) { mask[eid >> 5] |= 1u << (eid & 31u); n_miss++; }
+        }
+        for (uint32_t w = 0; w < QGATE_PENDING_WORDS; w++) pend[w] = mask[w];
+        g_qgate_ring_missed[ring] = (uint8_t)(n_miss != 0);
+        g_qgate_stat_split_classify_ms += ds4_gpu_now_ms() - t1;
+        g_qgate_rel_host[ring] = ds4_gpu_host_seconds();
+        qgate_release_lines(ring, (uint32_t)r->seq, 0, QGATE_RELEASE_HEAD);
+        released_a = 1;
+        ta = ds4_gpu_now_ms();
+        if (n_miss == 0) {
+            /* Nothing to read: release the second poll too, then keep the
+             * cache's bookkeeping (hotness, recency, pruning) off the path. */
+            qgate_release_lines(QGATE_RING + ring, (uint32_t)r->seq, 0, QGATE_RELEASE_HEAD);
+            qgate_release_lines(ring, (uint32_t)r->seq, QGATE_RELEASE_HEAD, QGATE_POLL_LINES);
+            qgate_release_lines(QGATE_RING + ring, (uint32_t)r->seq, QGATE_RELEASE_HEAD, QGATE_POLL_LINES);
+        }
+    }
+    if (ok && (!r->split || n_miss != 0)) {
         ds4_gpu_stream_expert_cache_entry *entries[QGATE_MAX_IDS];
-        const int resolved = qwen4_stream_resolve(r->model_map, r->model_size, r->layer, unique_ids, n_unique,
-                                                  r->n_total_expert, r->gate_offset, r->up_offset, r->down_offset,
-                                                  r->gate_expert_bytes, r->down_expert_bytes, entries);
+        int resolved;
+        if (r->split) {
+            /* Read the misses now; hotness, recency and pruning wait until the
+             * second poll is released. */
+            g_glm_stream_expert_addr_table_building++;
+            resolved = ds4_gpu_stream_expert_cache_load_batch(r->model_map, r->model_size, r->layer,
+                           unique_ids, n_unique, r->n_total_expert, r->gate_offset, r->up_offset,
+                           r->down_offset, r->gate_expert_bytes, r->down_expert_bytes, NULL, NULL, entries);
+            g_glm_stream_expert_addr_table_building--;
+        } else {
+            resolved = qwen4_stream_resolve(r->model_map, r->model_size, r->layer, unique_ids, n_unique,
+                                            r->n_total_expert, r->gate_offset, r->up_offset, r->down_offset,
+                                            r->gate_expert_bytes, r->down_expert_bytes, entries);
+        }
         int32_t fb_ids[QGATE_MAX_IDS];
         uint32_t n_fb = 0;
         for (uint32_t i = 0; i < n_unique; i++) {
-            if (!resolved || !qgate_entry_resident(entries[i], r->n_slabs)) fb_ids[n_fb++] = unique_ids[i];
+            if (r->split) {
+                /* A released (cached) expert needs nothing more. */
+                if (!is_miss[i]) continue;
+                ds4_gpu_stream_expert_cache_entry *e = resolved ? entries[i] : NULL;
+                if (!e || !qgate_entry_resident(e, r->n_slabs) ||
+                    !qgate_misstab_set(ring, (uint32_t)unique_ids[i], e->gate_buffer, e->gate_inner,
+                                       e->up_buffer, e->up_inner, e->down_buffer, e->down_inner)) {
+                    fb_ids[n_fb++] = unique_ids[i];
+                }
+            } else if (!resolved || !qgate_entry_resident(entries[i], r->n_slabs)) {
+                fb_ids[n_fb++] = unique_ids[i];
+            }
+        }
+        if (r->split) {
+            /* Only a missed expert can land in the fallback: every cached one
+             * was released already and stays protected by this gate's ids. */
+            for (uint32_t k = 0; k < n_fb; k++) {
+                uint32_t j = 0;
+                while (j < n_unique && unique_ids[j] != fb_ids[k]) j++;
+                if (j == n_unique || !is_miss[j]) {
+                    fprintf(stderr, "ds4: qwen4 split gate layer %u: released expert %d lost its slot\n",
+                            r->layer, fb_ids[k]);
+                    ok = 0;
+                }
+            }
         }
         if (n_fb) {
             g_qgate_stat_fallback += n_fb;
@@ -50360,7 +50618,7 @@ static void qgate_service(const qgate_req *r) {
                 ok = 0;
             }
         }
-    } else if (!g_qgate_failed) {
+    } else if (!ok && !g_qgate_failed) {
         fprintf(stderr, "ds4: qwen4 stream gate layer %u: invalid selected ids\n", r->layer);
     }
     if (!ok) g_qgate_failed = 1;
@@ -50370,7 +50628,18 @@ static void qgate_service(const qgate_req *r) {
     if (r->seq > 1u) {
         const uint32_t prev = (uint32_t)((r->seq - 1u) % QGATE_RING);
         const uint32_t *st = (const uint32_t *)[g_qgate_status contents];
-        if (__atomic_load_n(&st[prev * 2u], __ATOMIC_ACQUIRE) == 0xffffffffu) {
+        for (uint32_t k = 0; k < (g_qgate_ring_split[prev] ? 2u : 1u); k++) {
+            const uint32_t line = __atomic_load_n(&st[(k * QGATE_RING + prev) * 2u], __ATOMIC_ACQUIRE);
+            /* slot 1: second polls of gates without misses, 2: with misses */
+            const uint32_t slot = k == 0 ? 0u : (g_qgate_ring_missed[prev] ? 2u : 1u);
+            if (line != 0xffffffffu) {
+                g_qgate_stat_poll_n[slot]++;
+                g_qgate_stat_poll_line[slot] += (double)line;
+                if (line >= 32u) g_qgate_stat_poll_waited[slot]++;
+            }
+        }
+        if (qgate_status_timed_out(prev) ||
+            (g_qgate_ring_split[prev] && qgate_status_timed_out(QGATE_RING + prev))) {
             fprintf(stderr, "ds4: qwen4 stream gate %llu poll timed out\n", (unsigned long long)(r->seq - 1u));
             g_qgate_failed = 1;
         }
@@ -50379,15 +50648,37 @@ static void qgate_service(const qgate_req *r) {
      * next end_commands. */
     const double tl0 = ds4_gpu_now_ms();
     g_qgate_stat_resolve_ms += tl0 - tr0;
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    volatile uint32_t *region = (volatile uint32_t *)[g_qgate_region contents] +
-        (size_t)ring * QGATE_POLL_LINES * (QGATE_POLL_LINE_BYTES / 4u);
-    const uint32_t v = (uint32_t)r->seq;
-    for (uint32_t j = 0; j < QGATE_POLL_LINES; j++) {
-        __atomic_store_n(&region[j * (QGATE_POLL_LINE_BYTES / 4u)], v, __ATOMIC_RELAXED);
+    if (!released_a) {
+        g_qgate_rel_host[ring] = ds4_gpu_host_seconds();
+        qgate_release(ring, (uint32_t)r->seq);
     }
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (r->split && !released_a) qgate_release(QGATE_RING + ring, (uint32_t)r->seq);
+    if (r->split && released_a && n_miss != 0) {
+        g_qgate_stat_miss_load_ms += ds4_gpu_now_ms() - ta;
+        g_qgate_stat_miss_count += (double)n_miss;
+        qgate_release_lines(QGATE_RING + ring, (uint32_t)r->seq, 0, QGATE_RELEASE_HEAD);
+        qgate_release_lines(ring, (uint32_t)r->seq, QGATE_RELEASE_HEAD, QGATE_POLL_LINES);
+        qgate_release_lines(QGATE_RING + ring, (uint32_t)r->seq, QGATE_RELEASE_HEAD, QGATE_POLL_LINES);
+    }
     g_qgate_stat_release_ms += ds4_gpu_now_ms() - tl0;
+    if (r->split && ok && !g_qgate_failed) {
+        /* The cache's bookkeeping for this gate, after both releases. A gate
+         * without misses counts its hits here (load_batch finds every id). */
+        ds4_gpu_stream_expert_cache_entry *entries[QGATE_MAX_IDS];
+        if (n_miss == 0) {
+            (void)ds4_gpu_stream_expert_cache_load_batch(r->model_map, r->model_size, r->layer,
+                      unique_ids, n_unique, r->n_total_expert, r->gate_offset, r->up_offset,
+                      r->down_offset, r->gate_expert_bytes, r->down_expert_bytes, NULL, NULL, entries);
+        }
+        ds4_gpu_stream_expert_cache_note_selected_hotness(r->layer, unique_ids, n_unique);
+        ds4_gpu_stream_expert_cache_prune_layer(r->layer, r->n_total_expert, n_unique, unique_ids, n_unique);
+        ds4_gpu_stream_expert_cache_prune_global(r->layer, unique_ids, n_unique);
+    }
+    if (r->split) {
+        g_qgate_stat_split_gates++;
+        if (n_miss) g_qgate_stat_split_miss_gates++;
+        if (released_a) g_qgate_stat_split_first_ms += ta - t1;
+    }
     g_qgate_stat_gates++;
     g_qgate_stat_wait_ms += t1 - t0;
     g_qgate_stat_service_ms += ds4_gpu_now_ms() - t1;
@@ -50399,6 +50690,32 @@ static void qgate_service(const qgate_req *r) {
                 g_qgate_stat_release_ms / (double)g_qgate_stat_gates * 1000.0,
                 g_qgate_stat_wait_ms / (double)g_qgate_stat_gates * 1000.0,
                 (unsigned long long)g_qgate_stat_fallback);
+        if (g_qgate_stat_split_gates) {
+            if (g_qgate_stat_split_miss_gates)
+                fprintf(stderr, "ds4: qwen4 split gates with misses: %.2f misses, first -> second release %.1f us\n",
+                        g_qgate_stat_miss_count / (double)g_qgate_stat_split_miss_gates,
+                        g_qgate_stat_miss_load_ms / (double)g_qgate_stat_split_miss_gates * 1000.0);
+            fprintf(stderr, "ds4: qwen4 split gates %llu: first release starts %.1f us, done %.1f us after arrival, %.1f%% with misses\n",
+                    (unsigned long long)g_qgate_stat_split_gates,
+                    g_qgate_stat_split_classify_ms / (double)g_qgate_stat_split_gates * 1000.0,
+                    g_qgate_stat_split_first_ms / (double)g_qgate_stat_split_gates * 1000.0,
+                    100.0 * (double)g_qgate_stat_split_miss_gates / (double)g_qgate_stat_split_gates);
+        }
+        if (g_qgate_rt_n) {
+            fprintf(stderr, "ds4: qwen4 gate round trip: publish batch end -> mailbox seen %.1f us, "
+                    "batch gap %.1f us, poll start -> release %.1f us (n=%llu)\n",
+                    g_qgate_rt_vis_ms / (double)g_qgate_rt_n * 1000.0,
+                    g_qgate_rt_gap_ms / (double)g_qgate_rt_n * 1000.0,
+                    g_qgate_rt_wait_ms / (double)g_qgate_rt_n * 1000.0,
+                    (unsigned long long)g_qgate_rt_n);
+        }
+        for (uint32_t k = 0; k < 3u; k++) {
+            if (!g_qgate_stat_poll_n[k]) continue;
+            fprintf(stderr, "ds4: qwen4 gate poll %s: mean release line %.1f, %.1f%% past the first round\n",
+                    k == 0 ? "A" : k == 1 ? "B (no misses)" : "B (misses)",
+                    g_qgate_stat_poll_line[k] / (double)g_qgate_stat_poll_n[k],
+                    100.0 * (double)g_qgate_stat_poll_waited[k] / (double)g_qgate_stat_poll_n[k]);
+        }
     }
 }
 
@@ -50429,13 +50746,19 @@ static int qgate_setup(uint64_t slot_bytes) {
     g_qgate_fallback_slot_bytes = round_up_u64(slot_bytes, page ? page : 4096u);
     g_qgate_mailbox = [g_device newBufferWithLength:(NSUInteger)QGATE_RING * QGATE_MAX_IDS * sizeof(uint32_t)
                                             options:MTLResourceStorageModeShared];
-    g_qgate_region = [g_device newBufferWithLength:(NSUInteger)QGATE_RING * QGATE_POLL_LINES * QGATE_POLL_LINE_BYTES
+    /* Two poll regions per ring slot: [0, RING) first passes, [RING, 2 RING) second. */
+    g_qgate_region = [g_device newBufferWithLength:(NSUInteger)2u * QGATE_RING * QGATE_POLL_LINES * QGATE_POLL_LINE_BYTES
                                            options:MTLResourceStorageModeShared];
-    g_qgate_status = [g_device newBufferWithLength:(NSUInteger)QGATE_RING * 2u * sizeof(uint32_t)
+    g_qgate_status = [g_device newBufferWithLength:(NSUInteger)2u * QGATE_RING * 2u * sizeof(uint32_t)
                                            options:MTLResourceStorageModeShared];
+    g_qgate_pending = [g_device newBufferWithLength:(NSUInteger)QGATE_RING * QGATE_PENDING_WORDS * sizeof(uint32_t)
+                                            options:MTLResourceStorageModeShared];
+    g_qgate_misstab = [g_device newBufferWithLength:(NSUInteger)QGATE_RING * 3u * QGATE_MAX_EXPERT * sizeof(uint64_t)
+                                            options:MTLResourceStorageModeShared];
     g_qgate_fallback = [g_device newBufferWithLength:(NSUInteger)(QGATE_MAX_IDS * g_qgate_fallback_slot_bytes)
                                              options:MTLResourceStorageModeShared];
     if (!g_qgate_mailbox || !g_qgate_region || !g_qgate_status || !g_qgate_fallback ||
+        !g_qgate_pending || !g_qgate_misstab ||
         !ds4_gpu_get_pipeline("kernel_qwen4_stream_gate_publish") ||
         !ds4_gpu_get_pipeline("kernel_dsv4_tp_poll_release")) {
         fprintf(stderr, "ds4: qwen4 stream gates unavailable; keeping the per-layer drain\n");
@@ -50450,6 +50773,10 @@ static int qgate_setup(uint64_t slot_bytes) {
     memset([g_qgate_mailbox contents], 0, [g_qgate_mailbox length]);
     memset([g_qgate_region contents], 0, [g_qgate_region length]);
     memset([g_qgate_status contents], 0, [g_qgate_status length]);
+    memset([g_qgate_pending contents], 0, [g_qgate_pending length]);
+    memset([g_qgate_misstab contents], 0, [g_qgate_misstab length]);
+    g_qgate_pending.label = @"ds4_qwen4_gate_pending";
+    g_qgate_misstab.label = @"ds4_qwen4_gate_pass2_addrs";
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
@@ -50472,8 +50799,9 @@ static int qgate_setup(uint64_t slot_bytes) {
 static int qgate_check_after_wait(void) {
     if (!g_qgate_thread_running) return 1;
     if (g_qgate_last_seq != 0 && !g_qgate_failed) {
-        const uint32_t *st = (const uint32_t *)[g_qgate_status contents];
-        if (st[(uint32_t)(g_qgate_last_seq % QGATE_RING) * 2u] == 0xffffffffu) {
+        const uint32_t last = (uint32_t)(g_qgate_last_seq % QGATE_RING);
+        if (qgate_status_timed_out(last) ||
+            (g_qgate_ring_split[last] && qgate_status_timed_out(QGATE_RING + last))) {
             fprintf(stderr, "ds4: qwen4 stream gate %llu poll timed out\n", (unsigned long long)g_qgate_last_seq);
             g_qgate_failed = 1;
         }
@@ -50494,7 +50822,7 @@ static int qgate_encode(const ds4_gpu_tensor *selected, const void *model_map, u
                         uint32_t layer, uint32_t n_sel, uint32_t n_total_expert,
                         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
                         uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
-                        qwen4_bind *res, uint32_t *n_res) {
+                        qwen4_bind *res, uint32_t *n_res, uint64_t *seq_out, int *split_out) {
     if (!qgate_requested() || g_qgate_failed || !g_batch_cb || n_sel == 0 || n_sel > QGATE_MAX_IDS) return 0;
     const uint32_t budget = ds4_gpu_stream_expert_cache_configured_budget();
     if (!ds4_gpu_stream_expert_slab_enabled() || g_stream_expert_cache_slab_count == 0 ||
@@ -50526,6 +50854,8 @@ static int qgate_encode(const ds4_gpu_tensor *selected, const void *model_map, u
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(QGATE_MAX_IDS, 1, 1)];
         ds4_gpu_end_compute_encoder(g_batch_cb, enc);
     }
+    if (getenv("DS4_QWEN4_STREAM_TIMING"))
+        objc_setAssociatedObject(g_batch_cb, &kQgateSeqKey, @(seq), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     /* Committing is what writes the mailbox back to memory. */
     if (!ds4_gpu_flush_commands()) return 0;
     @autoreleasepool {
@@ -50541,6 +50871,8 @@ static int qgate_encode(const ds4_gpu_tensor *selected, const void *model_map, u
         ds4_gpu_close_batch_encoder();
     }
     const uint32_t n_slabs = g_stream_expert_cache_slab_count;
+    const int split = qgate_split_requested() && n_total_expert <= QGATE_MAX_EXPERT;
+    g_qgate_ring_split[ring] = (uint8_t)split;
     pthread_mutex_lock(&g_qgate_mutex);
     const uint32_t tail = (g_qgate_queue_head + g_qgate_queue_count) % QGATE_QUEUE;
     g_qgate_queue[tail] = (qgate_req) {
@@ -50548,6 +50880,7 @@ static int qgate_encode(const ds4_gpu_tensor *selected, const void *model_map, u
         .gate_offset = gate_offset, .up_offset = up_offset, .down_offset = down_offset,
         .gate_expert_bytes = gate_expert_bytes, .down_expert_bytes = down_expert_bytes,
         .layer = layer, .n_sel = n_sel, .n_total_expert = n_total_expert, .n_slabs = n_slabs,
+        .split = split,
     };
     g_qgate_queue_count++;
     pthread_cond_signal(&g_qgate_cond);
@@ -50558,7 +50891,28 @@ static int qgate_encode(const ds4_gpu_tensor *selected, const void *model_map, u
     for (uint32_t s = 0; s < n_slabs; s++) { res[n].buf = g_stream_expert_cache_slabs[s]; res[n].off = 0; n++; }
     res[n].buf = g_qgate_fallback; res[n].off = 0; n++;
     *n_res = n;
+    *seq_out = seq;
+    *split_out = split;
     return 1;
+}
+
+/* The second poll of a split gate, after its first-pass expert kernels in the
+ * same command buffer. Its region has not been read by this buffer. */
+static void qgate_encode_second(uint64_t seq) {
+    const uint32_t ring = (uint32_t)(seq % QGATE_RING);
+    const uint32_t value = (uint32_t)seq;
+    const uint32_t nlines = QGATE_POLL_LINES;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
+        [enc setComputePipelineState:ds4_gpu_get_pipeline("kernel_dsv4_tp_poll_release")];
+        [enc setBuffer:g_qgate_region offset:(NSUInteger)(QGATE_RING + ring) * QGATE_POLL_LINES * QGATE_POLL_LINE_BYTES atIndex:0];
+        [enc setBytes:&value length:sizeof(value) atIndex:1];
+        [enc setBytes:&nlines length:sizeof(nlines) atIndex:2];
+        [enc setBuffer:g_qgate_status offset:(NSUInteger)(QGATE_RING + ring) * 2u * sizeof(uint32_t) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(g_batch_cb, enc);
+        ds4_gpu_close_batch_encoder();
+    }
 }
 
 int ds4_gpu_qwen4_moe_stream_layer(
@@ -50611,9 +50965,11 @@ int ds4_gpu_qwen4_moe_stream_layer(
     qwen4_bind mid_res[2u * DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
     qwen4_bind down_res[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
     uint32_t n_mid_res = 0, n_down_res = 0;
+    uint64_t gate_seq = 0;
+    int split = 0;
     const int gated = qgate_encode(selected, model_map, model_size, layer, n_sel_total, n_total_expert,
                                    gate_offset, up_offset, down_offset, gate_expert_bytes, down_expert_bytes,
-                                   mid_res, &n_mid_res);
+                                   mid_res, &n_mid_res, &gate_seq, &split);
     if (gated) {
         /* qwen4_bind holds an ARC reference: copy by assignment, not memcpy. */
         for (uint32_t i = 0; i < n_mid_res; i++) down_res[i] = mid_res[i];
@@ -50670,59 +51026,79 @@ int ds4_gpu_qwen4_moe_stream_layer(
     const uint32_t n_out = n_slots + (has_shared ? 1u : 0u);
     const uint64_t sh_mid_bytes = (uint64_t)sh_mid_row_bytes * ff_dim;
     if (has_shared && sh_mid_row_bytes == 0) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: sh_mid_row_bytes 0 (shtype=%u)\n", layer, shared_mid_type); return 0; }
-    {
-        qwen4_moe_args a = { n_tokens, n_slots, in_dim, ff_dim, gate_type, gate_row_bytes,
-                             gate_expert_bytes, has_shared ? 1u : 0u, has_shared ? shared_mid_type : 0u,
-                             sh_mid_row_bytes, n_total_expert, 0u, 0u };
-        qwen4_bind b[7];
-        b[0].buf = gate_addr_buf; b[0].off = 0;
-        b[1].buf = up_addr_buf;   b[1].off = 0;
-        if (!qwen4_bind_tensor(&b[2], selected, (uint64_t)n_tokens * n_slots * sizeof(int32_t), "moe selected") ||
-            !qwen4_bind_tensor(&b[3], x, (uint64_t)n_tokens * in_dim * sizeof(float), "moe input") ||
-            !qwen4_bind_tensor(&b[4], mid, (uint64_t)n_tokens * n_out * ff_dim * sizeof(float), "moe mid")) {
-            if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: mid tensor bind\n", layer);
-            return 0;
+    /* A split gate runs the cached experts first (phase 1) and the misses
+     * after its second poll (phase 2, from the gate's pass-2 table). */
+    for (int pass = 0; pass < (split ? 2 : 1); pass++) {
+        const uint32_t phase = split ? (uint32_t)pass + 1u : 0u;
+        const uint32_t gring = (uint32_t)(gate_seq % QGATE_RING);
+        id<MTLBuffer> gtab = gate_addr_buf, utab = up_addr_buf, dtab = down_addr_buf;
+        NSUInteger goff = 0, uoff = 0, doff = 0;
+        if (pass == 1) {
+            qgate_encode_second(gate_seq);
+            gtab = utab = dtab = g_qgate_misstab;
+            goff = (NSUInteger)gring * 3u * QGATE_MAX_EXPERT * sizeof(uint64_t);
+            uoff = goff + (NSUInteger)QGATE_MAX_EXPERT * sizeof(uint64_t);
+            doff = uoff + (NSUInteger)QGATE_MAX_EXPERT * sizeof(uint64_t);
         }
-        if (has_shared) {
-            if (!qwen4_bind_weight(&b[5], model_map, model_size, shared_gate_offset, sh_mid_bytes, "shared gate") ||
-                !qwen4_bind_weight(&b[6], model_map, model_size, shared_up_offset, sh_mid_bytes, "shared up")) {
-                if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: shared gate/up bind (off=%llu bytes=%llu)\n", layer, (unsigned long long)shared_gate_offset, (unsigned long long)sh_mid_bytes);
+        qwen4_bind pend;
+        pend.buf = split ? g_qgate_pending : gate_addr_buf;
+        pend.off = split ? (NSUInteger)gring * QGATE_PENDING_WORDS * sizeof(uint32_t) : 0;
+        {
+            qwen4_moe_args a = { n_tokens, n_slots, in_dim, ff_dim, gate_type, gate_row_bytes,
+                                 gate_expert_bytes, has_shared ? 1u : 0u, has_shared ? shared_mid_type : 0u,
+                                 sh_mid_row_bytes, n_total_expert, 0u, phase };
+            qwen4_bind b[8];
+            b[0].buf = gtab; b[0].off = goff;
+            b[1].buf = utab; b[1].off = uoff;
+            b[7] = pend;
+            if (!qwen4_bind_tensor(&b[2], selected, (uint64_t)n_tokens * n_slots * sizeof(int32_t), "moe selected") ||
+                !qwen4_bind_tensor(&b[3], x, (uint64_t)n_tokens * in_dim * sizeof(float), "moe input") ||
+                !qwen4_bind_tensor(&b[4], mid, (uint64_t)n_tokens * n_out * ff_dim * sizeof(float), "moe mid")) {
+                if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: mid tensor bind\n", layer);
                 return 0;
             }
-        } else { b[5] = b[0]; b[6] = b[1]; }
-        const uint32_t nsg = 4u, nr = 2u, rows_per_tg = nr * nsg;
-        if (!qwen4_dispatch_resident(QWEN4_K_MOE_MID_ADDR, &a, sizeof(a), b, 7,
-                            MTLSizeMake((ff_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
-                            MTLSizeMake(32u * nsg, 1, 1), 0, mid_res, n_mid_res)) {
-            if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: mid dispatch\n", layer);
-            return 0;
+            if (has_shared) {
+                if (!qwen4_bind_weight(&b[5], model_map, model_size, shared_gate_offset, sh_mid_bytes, "shared gate") ||
+                    !qwen4_bind_weight(&b[6], model_map, model_size, shared_up_offset, sh_mid_bytes, "shared up")) {
+                    if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: shared gate/up bind (off=%llu bytes=%llu)\n", layer, (unsigned long long)shared_gate_offset, (unsigned long long)sh_mid_bytes);
+                    return 0;
+                }
+            } else { b[5] = b[0]; b[6] = b[1]; }
+            const uint32_t nsg = 4u, nr = 2u, rows_per_tg = nr * nsg;
+            if (!qwen4_dispatch_resident(QWEN4_K_MOE_MID_ADDR, &a, sizeof(a), b, 8,
+                                MTLSizeMake((ff_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
+                                MTLSizeMake(32u * nsg, 1, 1), 0, mid_res, n_mid_res)) {
+                if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: mid dispatch\n", layer);
+                return 0;
+            }
         }
-    }
-    /* ---- dispatch down (Q2_K/Q4_K) via address table ---- */
-    {
-        const uint32_t sh_down_row_bytes = has_shared ? qwen4_expert_row_bytes(shared_down_type, ff_dim) : 0u;
-        const uint64_t sh_down_bytes = (uint64_t)sh_down_row_bytes * out_dim;
-        if (has_shared && sh_down_row_bytes == 0) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: sh_down_row_bytes 0\n", layer); return 0; }
-        qwen4_moe_args a = { n_tokens, n_slots, ff_dim, out_dim, down_type, down_row_bytes,
-                             down_expert_bytes, has_shared ? 1u : 0u, has_shared ? shared_down_type : 0u,
-                             sh_down_row_bytes, n_total_expert, 0u, 0u };
-        qwen4_bind b[5];
-        b[0].buf = down_addr_buf; b[0].off = 0;
-        if (!qwen4_bind_tensor(&b[1], selected, (uint64_t)n_tokens * n_slots * sizeof(int32_t), "moe selected") ||
-            !qwen4_bind_tensor(&b[2], mid, (uint64_t)n_tokens * n_out * ff_dim * sizeof(float), "moe mid") ||
-            !qwen4_bind_tensor(&b[3], part, (uint64_t)n_tokens * n_out * out_dim * sizeof(float), "moe partial")) {
-            if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: down tensor bind\n", layer);
-            return 0;
-        }
-        if (has_shared) {
-            if (!qwen4_bind_weight(&b[4], model_map, model_size, shared_down_offset, sh_down_bytes, "shared down")) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: shared down bind (off=%llu)\n", layer, (unsigned long long)shared_down_offset); return 0; }
-        } else { b[4] = b[0]; }
-        const uint32_t nsg = 4u, nr = 2u, rows_per_tg = nr * nsg;
-        if (!qwen4_dispatch_resident(QWEN4_K_MOE_DOWN_ADDR, &a, sizeof(a), b, 5,
-                            MTLSizeMake((out_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
-                            MTLSizeMake(32u * nsg, 1, 1), 0, down_res, n_down_res)) {
-            if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: down dispatch\n", layer);
-            return 0;
+        /* ---- dispatch down (Q2_K/Q4_K) via address table ---- */
+        {
+            const uint32_t sh_down_row_bytes = has_shared ? qwen4_expert_row_bytes(shared_down_type, ff_dim) : 0u;
+            const uint64_t sh_down_bytes = (uint64_t)sh_down_row_bytes * out_dim;
+            if (has_shared && sh_down_row_bytes == 0) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: sh_down_row_bytes 0\n", layer); return 0; }
+            qwen4_moe_args a = { n_tokens, n_slots, ff_dim, out_dim, down_type, down_row_bytes,
+                                 down_expert_bytes, has_shared ? 1u : 0u, has_shared ? shared_down_type : 0u,
+                                 sh_down_row_bytes, n_total_expert, 0u, phase };
+            qwen4_bind b[6];
+            b[0].buf = dtab; b[0].off = doff;
+            b[5] = pend;
+            if (!qwen4_bind_tensor(&b[1], selected, (uint64_t)n_tokens * n_slots * sizeof(int32_t), "moe selected") ||
+                !qwen4_bind_tensor(&b[2], mid, (uint64_t)n_tokens * n_out * ff_dim * sizeof(float), "moe mid") ||
+                !qwen4_bind_tensor(&b[3], part, (uint64_t)n_tokens * n_out * out_dim * sizeof(float), "moe partial")) {
+                if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: down tensor bind\n", layer);
+                return 0;
+            }
+            if (has_shared) {
+                if (!qwen4_bind_weight(&b[4], model_map, model_size, shared_down_offset, sh_down_bytes, "shared down")) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: shared down bind (off=%llu)\n", layer, (unsigned long long)shared_down_offset); return 0; }
+            } else { b[4] = b[0]; }
+            const uint32_t nsg = 4u, nr = 2u, rows_per_tg = nr * nsg;
+            if (!qwen4_dispatch_resident(QWEN4_K_MOE_DOWN_ADDR, &a, sizeof(a), b, 6,
+                                MTLSizeMake((out_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
+                                MTLSizeMake(32u * nsg, 1, 1), 0, down_res, n_down_res)) {
+                if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: down dispatch\n", layer);
+                return 0;
+            }
         }
     }
     /* Submit the expert dispatches now so the GPU runs them while the host

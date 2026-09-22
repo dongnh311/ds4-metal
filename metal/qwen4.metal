@@ -2807,7 +2807,7 @@ struct ds4_metal_args_qwen4_moe {
     uint32_t shared_row_bytes;
     uint32_t n_total_expert;
     uint32_t list_cap;     /* grouped kernels: row stride of the per-expert pair lists */
-    uint32_t pad0;
+    uint32_t phase;        /* *_addr kernels: 0 every pair, 1 all but pending, 2 pending only */
 };
 
 /* dot of one quantized expert row with x, lanes split as in the K3 kernels:
@@ -3312,6 +3312,18 @@ kernel void kernel_qwen4_stream_gate_publish(
     if (tid < n) mailbox[tid] = ((uint)selected[tid] & 0xffffu) | (tag << 16);
 }
 
+/* Split gates run a streamed layer's experts in two passes: the cached ones
+ * (phase 1, with the shared slot) while the service thread reads the misses,
+ * then the misses (phase 2) from a per-gate address table. `pending` is the
+ * gate's bitmask of missed expert ids. Each pair is computed by exactly one
+ * pass with unchanged arithmetic, and the reduce adds the slots in order. */
+static inline bool qwen4_moe_addr_skip(uint phase, bool shared, int32_t expert,
+                                       device const uint *pending) {
+    if (phase == 0u) return false;
+    const bool pend = !shared && ((pending[(uint)expert >> 5] >> ((uint)expert & 31u)) & 1u) != 0u;
+    return phase == 1u ? pend : !pend;
+}
+
 /* SCALE-2 streaming variants: identical math to kernel_qwen4_moe_mid/down, but
  * routed expert weights are addressed through a per-expert GPU-address table
  * (gate_addrs/up_addrs/down_addrs, indexed by global expert id; 0 = not
@@ -3328,6 +3340,7 @@ kernel void kernel_qwen4_moe_mid_addr(
         device float         *mid,          /* [T][n_slots+has_shared][out_rows] */
         device const char    *sh_gate,
         device const char    *sh_up,
+        device const uint    *pending,      /* phase != 0: missed expert bitmask */
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]],
@@ -3345,6 +3358,7 @@ kernel void kernel_qwen4_moe_mid_addr(
     const uint type = shared ? st : wt;
     const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
     const int32_t expert = shared ? -1 : selected[(uint64_t)tok * args.n_slots + slot];
+    if (qwen4_moe_addr_skip(args.phase, shared, expert, pending)) return;
     const uint64_t gaddr = shared ? 0 : gate_addrs[(uint)expert];
     const uint64_t uaddr = shared ? 0 : up_addrs[(uint)expert];
     const bool absent = !shared && (gaddr == 0 || uaddr == 0);
@@ -3367,6 +3381,7 @@ kernel void kernel_qwen4_moe_down_addr(
         device const float   *mid,          /* [T][n_slots+has_shared][in_dim] */
         device float         *part,         /* [T][n_slots+has_shared][out_rows] */
         device const char    *sh_down,
+        device const uint    *pending,      /* phase != 0: missed expert bitmask */
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]],
@@ -3384,6 +3399,7 @@ kernel void kernel_qwen4_moe_down_addr(
     const uint type = shared ? st : wt;
     const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
     const int32_t expert = shared ? -1 : selected[(uint64_t)tok * args.n_slots + slot];
+    if (qwen4_moe_addr_skip(args.phase, shared, expert, pending)) return;
     const uint64_t daddr = shared ? 0 : down_addrs[(uint)expert];
     const bool absent = !shared && daddr == 0;
     device const char *db = shared ? sh_down : reinterpret_cast<device const char *>(daddr);
