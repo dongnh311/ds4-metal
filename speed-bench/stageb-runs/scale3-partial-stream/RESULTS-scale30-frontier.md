@@ -551,3 +551,105 @@ the limit at 28.3 t/s), with swap unchanged. 40 t/s is reached at short
 context only when resident; at 256K the attention over ~248K keys caps even
 resident decode at ~36 t/s. Wired figures are system-wide (~3.2 GiB machine
 baseline); the GPU wired limit is `iogpu.wired_limit_mb` = 57344.
+
+## Split gates: the cached experts run while the misses are read
+
+A gate used to hold the GPU for its whole service: the mailbox arrives, the
+service thread resolves every selected expert (reading the misses from the
+SSD) and only then releases the poll. Split gates (on by default;
+`DS4_QWEN4_STREAM_SPLIT=0` keeps one pass) release as soon as the gate's
+experts have been classified against the cache — 0.5 us after the mailbox —
+and the GPU runs the cached experts and the shared one (phase 1) while the
+misses are read; a second poll in the same command buffer waits for those
+(phase 2). The `*_addr` kernels take a phase and the gate's bitmask of missed
+experts, and skip the pairs the other pass owns.
+
+Phase 2 reads the missed experts' addresses from a **per-gate** table, not the
+layer's: a running command buffer keeps the stale L2 copy of any line it has
+already read, and phase 1 reads the layer table. The pending mask and the
+pass-2 table of a ring slot are only read after the poll that follows their
+write. Down still writes one partial per (row, slot) and the reduce adds the
+slots in order, so every pair is computed exactly once with unchanged
+arithmetic: 8K Vietnamese and English, a full 256K context, a server session
+and `--batched-session 2` all match the unsplit gates and the resident path
+byte for byte.
+
+Releases now write the first 2048 lines of a poll region and the tails after
+the other release, and the cache bookkeeping (hotness, recency, pruning) runs
+after both releases instead of before them.
+
+8K, 1200 tokens, 12 streamed layers @ 6GB, decode t/s and GPU busy per step:
+
+| build | gen t/s | GPU busy/step | poll A release line | poll B |
+|---|---:|---:|---:|---|
+| resident | 40.8-40.9 | 41.7 ms | - | - |
+| gates, one pass | 37.7 | 43.2-45.3 ms | 1170-1340 | - |
+| gates, split | 38.8 | 41.9-43.7 ms | 640-660 | line 0 without misses |
+
+## Where the streaming overhead sits now
+
+`DS4_QWEN4_STREAM_TIMING` reports the round trip against the publish batch's
+GPU end time, and `DS4_METAL_GPU_IDLE` the GPU busy time per waited group:
+
+| part | per gate | per step (12 gates) |
+|---|---:|---:|
+| publish batch end -> service thread sees the mailbox | 12.3 us | |
+| batch gap (the commit itself) | 0.5 us | |
+| poll A start -> release | 12.4 us | ~0.2 ms |
+| publish + commit + the extra pass-2 dispatch | ~22 us | ~0.27 ms |
+| poll B, gates with misses (55% of gates, 1.94 misses each) | ~60 us avg | ~0.7 ms |
+
+The GPU is never idle *between* command buffers (0.0-0.3%); the cost is the
+poll spinning inside them. Dropping both polls (a timing-only experiment with
+wrong output) saves 130 us per gate, so the polls, not the command-buffer
+boundaries, are what streaming still pays. A miss gate reads 1.94 x 1.86 MiB
+in ~355 us, about 10 GB/s, so the reads are at the SSD's ceiling rather than
+waiting on latency.
+
+## Expert-cache aging (on by default)
+
+The qwen4 gate path never advanced the cache's aging clock, so victims were
+ranked by route hotness accumulated since the process started. The service
+thread now ticks it once per decode step: 8K, 1200 tokens, 12 streamed @ 6GB
+takes 7570 misses instead of 8634 (hit rate 0.925 -> 0.935) with the same
+output. `DS4_METAL_STREAMING_EXPERT_EVICT_LRU=1` (recency only) lands on the
+same 7570, `DS4_QWEN4_STREAM_AGING=0` restores the old ranking.
+
+## Router lookahead prefetch (opt-in, off)
+
+`DS4_QWEN4_STREAM_LOOKAHEAD=K` copies a gate's router input to a shared slot;
+the service thread runs the *next* streamed layer's router on it (Accelerate
+sgemv, off the critical path) and reads the K experts per row it predicts and
+the cache lacks. K=6 reads 0.70 experts per gate of which 0.47 are used (67%
+accurate), demand misses per miss-gate fall 1.94 -> 1.67 and the second poll
+waits on 28.9% of them instead of 36.3%. The extra reads cost what the shorter
+waits save: paired 800-token runs put K=6 at 1.007 of K=0 (median 0.99), so it
+stays off. antirez/ds4 #849 reports the same on DeepSeek until the packed
+expert layout of #848 frees SSD bandwidth.
+
+## Where K=36 stands against resident
+
+The box drifts while these run (about 10% over half an hour, with a disk
+cleaner competing for IO), so every comparison below is either paired
+(alternating 800-token runs, per-pair ratio) or interpolated between two
+resident runs that bracket the series.
+
+| config | share of resident | peak wired at 8K |
+|---|---:|---:|
+| 12 streamed (K=36) @ 6GB | 0.952-0.963 | 47.3 GiB |
+| 12 streamed (K=36) @ 8GB | 0.967-0.977 | 49.4 GiB |
+| 8 streamed (K=40) @ 4GB | 0.955 | 49.1 GiB |
+| resident | 1.000 | 53.2 GiB |
+
+Warm `ds4-server`, first round of a series (the machine's best state):
+
+| config | Vietnamese | counting (EN) | code | peak wired |
+|---|---:|---:|---:|---:|
+| resident | 40.2-40.6 | 44.5 | 37.7 | 53.2 GiB |
+| K=36 @ 8GB | 38.4 | 41.6 | 34.9 | 49.4 GiB |
+| K=36 @ 6GB | 36.9-38.6 | 40.3-41.3 | 33.9 | 47.3 GiB |
+
+K=36 went from ~93% of resident to ~96-98% tonight. The counting workload
+(high MTP acceptance) clears 40 t/s streamed; Vietnamese prose does not yet:
+it needs the last ~3%, which is the miss waits (1.7%), poll A (0.6%) and the
+fixed per-gate cost (0.6%).
