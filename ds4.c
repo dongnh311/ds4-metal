@@ -8445,6 +8445,26 @@ static bool glm_stream_decode_expert_cache_ready(
  * undersized expert caches fall back to direct model-range reads. Include
  * those expert tensors so cache-hit prefill extension and decode are covered.
  */
+/* SCALE-3.0: DS4_QWEN4_STREAM_FULL_LAYERS=K keeps the first K routed layers
+ * fully resident under --ssd-streaming and streams only the rest. It is the
+ * per-layer form of DS4_QWEN4_DISABLE_STREAM_EXPERT_CACHE: pinned layers read
+ * experts through mapped model views, the same path as off-class mixed-precision
+ * layers. Every streamed layer pays one host sync per token, so K trades
+ * resident RAM against that cost. */
+static bool qwen4_stream_layer_pinned_resident(uint32_t il) {
+    static int full_layers = -1;
+    if (full_layers < 0) {
+        const char *e = getenv("DS4_QWEN4_STREAM_FULL_LAYERS");
+        full_layers = e && e[0] ? atoi(e) : 0;
+        if (full_layers < 0) full_layers = 0;
+        if (full_layers > 0) {
+            fprintf(stderr, "ds4: qwen4 SSD streaming keeps the first %d routed layers resident\n",
+                    full_layers);
+        }
+    }
+    return il < (uint32_t)full_layers;
+}
+
 /* SCALE-2: a qwen4 decode layer is eligible for the streaming expert-address
  * cache when gate/up are IQ2_XXS, down is Q2_K or Q4_K, and its per-expert byte
  * size matches the majority (uniform) slab class. Minority/mixed layers stay
@@ -8457,7 +8477,8 @@ static DS4_MAYBE_UNUSED bool qwen4_stream_expert_cache_addr_layout_supported(
         !w || !l || il >= DS4_N_LAYER ||
         !l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps ||
         DS4_N_EXPERT_USED == 0 || DS4_N_EXPERT < 128 ||
-        getenv("DS4_QWEN4_DISABLE_STREAM_EXPERT_CACHE") != NULL) {
+        getenv("DS4_QWEN4_DISABLE_STREAM_EXPERT_CACHE") != NULL ||
+        qwen4_stream_layer_pinned_resident(il)) {
         return false;
     }
     if (l->ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
@@ -59137,6 +59158,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
         if (stream_dbg) fprintf(stderr, "ds4: moe L%u T=%u stream_en=%d gate=%u down=%u\n", il, T, ds4_gpu_ssd_streaming_enabled(), l->ffn_gate_exps?l->ffn_gate_exps->type:999u, l->ffn_down_exps?l->ffn_down_exps->type:999u);
         if (ds4_gpu_ssd_streaming_enabled() &&
             getenv("DS4_QWEN4_DISABLE_STREAM_EXPERT_CACHE") == NULL &&
+            !qwen4_stream_layer_pinned_resident(il) &&
             l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps &&
             l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
             l->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
