@@ -890,7 +890,7 @@ static NSUInteger g_attn_out_group_ids_bytes;
 static int g_initialized;
 static int g_quality_mode;
 static int g_mpp_invalid_env_reported;
-#define DS4_METAL_MAX_ROUTED_EXPERT_USED 8
+#define DS4_METAL_MAX_ROUTED_EXPERT_USED 16  /* qwen4 uses 10 (was 8 for GLM/V4) */
 static int32_t g_routed_moe_selected_override[DS4_METAL_MAX_ROUTED_EXPERT_USED];
 static uint32_t g_routed_moe_selected_override_n;
 static int g_moe_selected_trace_record_initialized;
@@ -939,7 +939,7 @@ static uint32_t g_model_view_count;
 
 enum {
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER = 80,
-    DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT = 384,
+    DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT = 512,  /* qwen4 has 512 experts (was 384) */
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED = DS4_METAL_MAX_ROUTED_EXPERT_USED,
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES =
         DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER *
@@ -4641,6 +4641,13 @@ void ds4_gpu_set_ssd_streaming(bool enabled) {
 
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
     g_glm_streaming_prefill_full_layer_runtime = enabled ? 1 : 0;
+}
+
+/* SCALE-2: expose the runtime streaming switch so the qwen4 graph can route
+ * its MoE through the streaming expert cache (per-expert addresses) instead of
+ * the fully-resident whole-region path. */
+bool ds4_gpu_ssd_streaming_enabled(void) {
+    return g_ssd_streaming_mode != 0;
 }
 
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
@@ -48159,6 +48166,8 @@ enum {
     QWEN4_K_MOE_MID_Q4K_NR1,
     QWEN4_K_MOE_DOWN,
     QWEN4_K_MOE_DOWN_MXFP4_PF,
+    QWEN4_K_MOE_MID_ADDR,
+    QWEN4_K_MOE_DOWN_ADDR,
     QWEN4_K_MOE_MID_Q4K_GROUPED,
     QWEN4_K_MOE_DOWN_MXFP4_GROUPED,
     QWEN4_K_MOE_REDUCE,
@@ -48265,6 +48274,8 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_moe_mid_q4k_nr1",
     "kernel_qwen4_moe_down",
     "kernel_qwen4_moe_down_mxfp4_pf",
+    "kernel_qwen4_moe_mid_addr",
+    "kernel_qwen4_moe_down_addr",
     "kernel_qwen4_moe_mid_q4k_grouped",
     "kernel_qwen4_moe_down_mxfp4_grouped",
     "kernel_qwen4_moe_reduce",
@@ -49727,6 +49738,170 @@ int ds4_gpu_qwen4_moe_down_tensor(
     return qwen4_dispatch(prefetch ? QWEN4_K_MOE_DOWN_MXFP4_PF : QWEN4_K_MOE_DOWN, &args, sizeof(args), b, 5,
                           MTLSizeMake((out_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
                           MTLSizeMake(32u * nsg, 1, 1), 0);
+}
+
+/* SCALE-2: run one qwen4 decode-layer MoE (mid+down) through the streaming
+ * expert cache. Builds a per-expert GPU-address table for the layer's selected
+ * routed experts (peek/pread-miss/set_addr_slot, synchronous), then dispatches
+ * the *_addr kernels. Shared expert stays resident (its own offsets). Returns 1
+ * on success, 0 on any failure (caller falls back to the resident path). Only
+ * called for addr-eligible layers (IQ2_XXS gate/up + Q2_K/Q4_K down, uniform). */
+int ds4_gpu_qwen4_moe_stream_layer(
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *part,
+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
+        const void *model_map, uint64_t model_size, uint32_t layer,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t gate_type, uint32_t down_type,
+        uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t in_dim, uint32_t ff_dim, uint32_t out_dim,
+        uint64_t shared_gate_offset, uint64_t shared_up_offset,
+        uint64_t shared_down_offset, uint32_t shared_mid_type, uint32_t shared_down_type) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
+        n_slots == 0 || n_slots > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED ||
+        n_tokens == 0) {
+        if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: bounds (n_slots=%u n_tok=%u nte=%u)\n", layer, n_slots, n_tokens, n_total_expert);
+        return 0;
+    }
+    /* Expert slab sizes must match the resident path byte-for-byte. Mid rows are
+     * in_dim long; down rows are ff_dim rounded up to a 256 multiple for the
+     * K-quants (matches ds4_gpu_qwen4_moe_down_tensor). */
+    const uint32_t gate_row_bytes = qwen4_expert_row_bytes(gate_type, in_dim);
+    const uint32_t down_dim = (down_type == 10u || down_type == 12u) ?
+        (ff_dim + 255u) / 256u * 256u : ff_dim;
+    const uint32_t down_row_bytes = qwen4_expert_row_bytes(down_type, down_dim);
+    if (gate_row_bytes == 0 || down_row_bytes == 0) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: row_bytes g=%u d=%u\n", layer, gate_row_bytes, down_row_bytes); return 0; }
+    const uint64_t gate_expert_bytes = (uint64_t)gate_row_bytes * ff_dim;   /* gate == up */
+    const uint64_t down_expert_bytes = (uint64_t)down_row_bytes * out_dim;
+    if (!ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes, down_expert_bytes) ||
+        ds4_gpu_stream_expert_cache_configured_budget() < n_slots ||
+        ds4_gpu_stream_expert_cache_effective_cap(layer, n_total_expert, n_slots) == 0) {
+        if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: note_size/budget/cap (gb=%llu db=%llu budget=%u)\n", layer, (unsigned long long)gate_expert_bytes, (unsigned long long)down_expert_bytes, ds4_gpu_stream_expert_cache_configured_budget());
+        return 0;
+    }
+
+    /* Build the UNION of experts selected across all T rows: verify (T>1) and
+     * prefill touch many tokens, and the *_addr kernel indexes gate/up/down
+     * address tables by global expert id, so every selected expert (across all
+     * tokens) needs a resident cache slot before dispatch. */
+    const uint32_t n_sel_total = n_tokens * n_slots;
+    int32_t *all_ids = (int32_t *)malloc((size_t)n_sel_total * sizeof(int32_t));
+    if (!all_ids) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: malloc\n", layer); return 0; }
+    const int had_batch = g_batch_cb != nil;
+    if (had_batch && ds4_gpu_end_commands() == 0) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: end_commands\n", layer); free(all_ids); return 0; }
+    if (ds4_gpu_tensor_read(selected, 0, all_ids,
+                            (uint64_t)n_sel_total * sizeof(int32_t)) == 0) {
+        if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: tensor_read (nsel=%u)\n", layer, n_sel_total);
+        if (had_batch) (void)ds4_gpu_begin_commands();
+        free(all_ids); return 0;
+    }
+    uint8_t seen[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    memset(seen, 0, sizeof(seen));
+    int32_t unique_ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    uint32_t n_unique = 0;
+    int valid = 1;
+    for (uint32_t i = 0; i < n_sel_total; i++) {
+        const int32_t e = all_ids[i];
+        if (e < 0 || (uint32_t)e >= n_total_expert) { valid = 0; break; }
+        if (!seen[e]) { seen[e] = 1; unique_ids[n_unique++] = e; }
+    }
+    free(all_ids);
+    if (!valid || n_unique == 0) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: valid=%d n_unique=%u\n", layer, valid, n_unique); if (had_batch) (void)ds4_gpu_begin_commands(); return 0; }
+    ds4_gpu_stream_expert_cache_note_selected_hotness(layer, unique_ids, n_unique);
+
+    int ok = 1;
+    g_glm_stream_expert_addr_table_building++;   /* shared build gate (file-private, not GLM-specific) */
+    for (uint32_t i = 0; ok && i < n_unique; i++) {
+        const uint64_t eid = (uint32_t)unique_ids[i];
+        const uint64_t ga = gate_offset + eid * gate_expert_bytes;
+        const uint64_t ua = up_offset   + eid * gate_expert_bytes;
+        const uint64_t da = down_offset + eid * down_expert_bytes;
+        ds4_gpu_stream_expert_cache_entry *e =
+            ds4_gpu_stream_expert_cache_get_protected(model_map, model_size, layer,
+                (uint32_t)unique_ids[i], n_total_expert, n_unique, ga, ua, da,
+                gate_expert_bytes, down_expert_bytes, unique_ids, n_unique);
+        if (!e || !ds4_gpu_stream_expert_cache_set_addr_slot(layer, (uint32_t)unique_ids[i],
+                    e->gate_buffer, e->gate_inner, e->up_buffer, e->up_inner,
+                    e->down_buffer, e->down_inner)) {
+            if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: %s eid=%d (i=%u/%u)\n", layer, e?"set_addr_slot":"get_protected", unique_ids[i], i, n_unique);
+            ok = 0;
+        }
+    }
+    id<MTLBuffer> gate_addr_buf = nil, up_addr_buf = nil, down_addr_buf = nil;
+    if (ok && !ds4_gpu_stream_expert_cache_addr_buffers(layer, &gate_addr_buf,
+                                                        &up_addr_buf, &down_addr_buf)) {
+        if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: addr_buffers\n", layer);
+        ok = 0;
+    }
+    g_glm_stream_expert_addr_table_building--;
+    if (had_batch && ds4_gpu_begin_commands() == 0) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: begin_commands (ok was %d)\n", layer, ok); ok = 0; }
+    if (!ok) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: build ok=0\n", layer); return 0; }
+    ds4_gpu_stream_expert_cache_prune_layer(layer, n_total_expert, n_unique, unique_ids, n_unique);
+    ds4_gpu_stream_expert_cache_prune_global(layer, unique_ids, n_unique);
+
+    /* ---- dispatch mid (gate/up, IQ2_XXS) via address table ---- */
+    const bool has_shared = shared_mid_type != UINT32_MAX;
+    const uint32_t sh_mid_row_bytes = has_shared ? qwen4_expert_row_bytes(shared_mid_type, in_dim) : 0u;
+    const uint32_t n_out = n_slots + (has_shared ? 1u : 0u);
+    const uint64_t sh_mid_bytes = (uint64_t)sh_mid_row_bytes * ff_dim;
+    if (has_shared && sh_mid_row_bytes == 0) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: sh_mid_row_bytes 0 (shtype=%u)\n", layer, shared_mid_type); return 0; }
+    {
+        qwen4_moe_args a = { n_tokens, n_slots, in_dim, ff_dim, gate_type, gate_row_bytes,
+                             gate_expert_bytes, has_shared ? 1u : 0u, has_shared ? shared_mid_type : 0u,
+                             sh_mid_row_bytes, n_total_expert, 0u, 0u };
+        qwen4_bind b[7];
+        b[0].buf = gate_addr_buf; b[0].off = 0;
+        b[1].buf = up_addr_buf;   b[1].off = 0;
+        if (!qwen4_bind_tensor(&b[2], selected, (uint64_t)n_tokens * n_slots * sizeof(int32_t), "moe selected") ||
+            !qwen4_bind_tensor(&b[3], x, (uint64_t)n_tokens * in_dim * sizeof(float), "moe input") ||
+            !qwen4_bind_tensor(&b[4], mid, (uint64_t)n_tokens * n_out * ff_dim * sizeof(float), "moe mid")) {
+            if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: mid tensor bind\n", layer);
+            return 0;
+        }
+        if (has_shared) {
+            if (!qwen4_bind_weight(&b[5], model_map, model_size, shared_gate_offset, sh_mid_bytes, "shared gate") ||
+                !qwen4_bind_weight(&b[6], model_map, model_size, shared_up_offset, sh_mid_bytes, "shared up")) {
+                if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: shared gate/up bind (off=%llu bytes=%llu)\n", layer, (unsigned long long)shared_gate_offset, (unsigned long long)sh_mid_bytes);
+                return 0;
+            }
+        } else { b[5] = b[0]; b[6] = b[1]; }
+        const uint32_t nsg = 4u, nr = 2u, rows_per_tg = nr * nsg;
+        if (!qwen4_dispatch(QWEN4_K_MOE_MID_ADDR, &a, sizeof(a), b, 7,
+                            MTLSizeMake((ff_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
+                            MTLSizeMake(32u * nsg, 1, 1), 0)) {
+            if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: mid dispatch\n", layer);
+            return 0;
+        }
+    }
+    /* ---- dispatch down (Q2_K/Q4_K) via address table ---- */
+    {
+        const uint32_t sh_down_row_bytes = has_shared ? qwen4_expert_row_bytes(shared_down_type, ff_dim) : 0u;
+        const uint64_t sh_down_bytes = (uint64_t)sh_down_row_bytes * out_dim;
+        if (has_shared && sh_down_row_bytes == 0) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: sh_down_row_bytes 0\n", layer); return 0; }
+        qwen4_moe_args a = { n_tokens, n_slots, ff_dim, out_dim, down_type, down_row_bytes,
+                             down_expert_bytes, has_shared ? 1u : 0u, has_shared ? shared_down_type : 0u,
+                             sh_down_row_bytes, n_total_expert, 0u, 0u };
+        qwen4_bind b[5];
+        b[0].buf = down_addr_buf; b[0].off = 0;
+        if (!qwen4_bind_tensor(&b[1], selected, (uint64_t)n_tokens * n_slots * sizeof(int32_t), "moe selected") ||
+            !qwen4_bind_tensor(&b[2], mid, (uint64_t)n_tokens * n_out * ff_dim * sizeof(float), "moe mid") ||
+            !qwen4_bind_tensor(&b[3], part, (uint64_t)n_tokens * n_out * out_dim * sizeof(float), "moe partial")) {
+            if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: down tensor bind\n", layer);
+            return 0;
+        }
+        if (has_shared) {
+            if (!qwen4_bind_weight(&b[4], model_map, model_size, shared_down_offset, sh_down_bytes, "shared down")) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: shared down bind (off=%llu)\n", layer, (unsigned long long)shared_down_offset); return 0; }
+        } else { b[4] = b[0]; }
+        const uint32_t nsg = 4u, nr = 2u, rows_per_tg = nr * nsg;
+        if (!qwen4_dispatch(QWEN4_K_MOE_DOWN_ADDR, &a, sizeof(a), b, 5,
+                            MTLSizeMake((out_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
+                            MTLSizeMake(32u * nsg, 1, 1), 0)) {
+            if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: down dispatch\n", layer);
+            return 0;
+        }
+    }
+    return 1;
 }
 
 /* Decode batch over its distinct experts (kernel_qwen4_moe_mid_q4k_grouped):

@@ -3205,6 +3205,90 @@ kernel void kernel_qwen4_moe_down(
     }
 }
 
+/* SCALE-2 streaming variants: identical math to kernel_qwen4_moe_mid/down, but
+ * routed expert weights are addressed through a per-expert GPU-address table
+ * (gate_addrs/up_addrs/down_addrs, indexed by global expert id; 0 = not
+ * resident) supplied by the streaming expert cache, instead of one wired region
+ * indexed by expert*expert_bytes. Bit-exact vs the resident path by
+ * construction (same file bytes via pread, same dequant + accumulation). The
+ * shared-expert slot stays resident and keeps its own base pointer. */
+kernel void kernel_qwen4_moe_mid_addr(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const uint64_t *gate_addrs,  /* [n_total_expert] */
+        device const uint64_t *up_addrs,    /* [n_total_expert] */
+        device const int32_t *selected,     /* [T][n_slots] */
+        device const float   *x,            /* [T][in_dim] */
+        device float         *mid,          /* [T][n_slots+has_shared][out_rows] */
+        device const char    *sh_gate,
+        device const char    *sh_up,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint slot = tgpig.y;
+    const uint tok = tgpig.z;
+    const uint n_out = args.n_slots + args.has_shared;
+    const uint nr = 2u;                 /* SCALE-2a: fixed dispatch (nsg=4, nr=2), no function constants */
+    const uint dim = args.in_dim;
+    const uint wt = args.weight_type;
+    const uint st = args.shared_type;
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * nr;
+    if (row0 >= args.out_rows || slot >= n_out || tok >= args.n_tokens) return;
+    const bool shared = slot == args.n_slots;
+    const uint type = shared ? st : wt;
+    const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
+    const int32_t expert = shared ? -1 : selected[(uint64_t)tok * args.n_slots + slot];
+    const uint64_t gaddr = shared ? 0 : gate_addrs[(uint)expert];
+    const uint64_t uaddr = shared ? 0 : up_addrs[(uint)expert];
+    const bool absent = !shared && (gaddr == 0 || uaddr == 0);
+    device const char *gb = shared ? sh_gate : reinterpret_cast<device const char *>(gaddr);
+    device const char *ub = shared ? sh_up   : reinterpret_cast<device const char *>(uaddr);
+    device const float *xt = x + (uint64_t)tok * args.in_dim;
+    for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
+        if (absent) { if (tiisg == 0) mid[((uint64_t)tok * n_out + slot) * args.out_rows + r] = 0.0f; continue; }
+        const uint64_t off = (uint64_t)r * row_bytes;
+        const float g = qwen4_row_dot(gb + off, xt, type, dim, tiisg);
+        const float u = qwen4_row_dot(ub + off, xt, type, dim, tiisg);
+        if (tiisg == 0) mid[((uint64_t)tok * n_out + slot) * args.out_rows + r] = qwen4_silu(g) * u;
+    }
+}
+
+kernel void kernel_qwen4_moe_down_addr(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const uint64_t *down_addrs,  /* [n_total_expert] */
+        device const int32_t *selected,     /* [T][n_slots] */
+        device const float   *mid,          /* [T][n_slots+has_shared][in_dim] */
+        device float         *part,         /* [T][n_slots+has_shared][out_rows] */
+        device const char    *sh_down,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint slot = tgpig.y;
+    const uint tok = tgpig.z;
+    const uint n_out = args.n_slots + args.has_shared;
+    const uint nr = 2u;                 /* SCALE-2a: fixed dispatch (nsg=4, nr=2), no function constants */
+    const uint dim = args.in_dim;
+    const uint wt = args.weight_type;
+    const uint st = args.shared_type;
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * nr;
+    if (row0 >= args.out_rows || slot >= n_out || tok >= args.n_tokens) return;
+    const bool shared = slot == args.n_slots;
+    const uint type = shared ? st : wt;
+    const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
+    const int32_t expert = shared ? -1 : selected[(uint64_t)tok * args.n_slots + slot];
+    const uint64_t daddr = shared ? 0 : down_addrs[(uint)expert];
+    const bool absent = !shared && daddr == 0;
+    device const char *db = shared ? sh_down : reinterpret_cast<device const char *>(daddr);
+    const uint64_t pair = (uint64_t)tok * n_out + slot;
+    device const float *m = mid + pair * args.in_dim;
+    for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
+        if (absent) { if (tiisg == 0) part[pair * args.out_rows + r] = 0.0f; continue; }
+        const float v = qwen4_row_dot(db + (uint64_t)r * row_bytes, m, type, dim, tiisg);
+        if (tiisg == 0) part[pair * args.out_rows + r] = v;
+    }
+}
+
 /* MXFP4 routed down rows with four blocks per lane requested before the
  * accumulation chain.  The shipped qwen4_row_dot loop for type 39 compiles
  * to s = t0*y0 + t1*y1 + t2*y16 + t3*y17 (left to right), acc += s*d; that

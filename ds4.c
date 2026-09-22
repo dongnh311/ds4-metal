@@ -8445,6 +8445,32 @@ static bool glm_stream_decode_expert_cache_ready(
  * undersized expert caches fall back to direct model-range reads. Include
  * those expert tensors so cache-hit prefill extension and decode are covered.
  */
+/* SCALE-2: a qwen4 decode layer is eligible for the streaming expert-address
+ * cache when gate/up are IQ2_XXS, down is Q2_K or Q4_K, and its per-expert byte
+ * size matches the majority (uniform) slab class. Minority/mixed layers stay
+ * resident (served by the full-blob path). */
+static DS4_MAYBE_UNUSED bool qwen4_stream_expert_cache_addr_layout_supported(
+        const ds4_weights       *w,
+        const ds4_layer_weights *l,
+        uint32_t                 il) {
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_QWEN4_EXP ||
+        !w || !l || il >= DS4_N_LAYER ||
+        !l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps ||
+        DS4_N_EXPERT_USED == 0 || DS4_N_EXPERT < 128 ||
+        getenv("DS4_QWEN4_DISABLE_STREAM_EXPERT_CACHE") != NULL) {
+        return false;
+    }
+    if (l->ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
+        l->ffn_up_exps->type != DS4_TENSOR_IQ2_XXS) {
+        return false;
+    }
+    if (l->ffn_down_exps->type != DS4_TENSOR_Q2_K &&
+        l->ffn_down_exps->type != DS4_TENSOR_Q4_K) {
+        return false;
+    }
+    return weights_streaming_layer_experts_uniform(w, il);
+}
+
 static void model_map_span_vec_include_layer_decode(
         ds4_model_map_span_vec *spans,
         const ds4_weights      *w,
@@ -8454,6 +8480,8 @@ static void model_map_span_vec_include_layer_decode(
     if (!weights_streaming_layer_experts_uniform(w, il) ||
         (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
          !glm_stream_decode_experts_are_streamed(w, l, il)) ||
+        (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4_EXP &&
+         !qwen4_stream_expert_cache_addr_layout_supported(w, l, il)) ||
         glm_stream_resident_decode_layer_enabled(l, il)) {
         model_map_span_vec_include_one(spans, l->ffn_gate_exps);
         model_map_span_vec_include_one(spans, l->ffn_up_exps);
@@ -8465,6 +8493,13 @@ static bool weights_model_map_decode_static_supported(const ds4_weights *w) {
     if (!w) return false;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return g_glm_streaming_runtime_static_map_enabled;
+    }
+    /* SCALE-2: qwen4 mixed-precision models are supported: the span enumerator
+     * (model_map_span_vec_include_layer_decode) already maps the resident core
+     * plus any non-eligible/bypass expert layers as views, while addr-eligible
+     * layers' experts are excluded and served by the streaming cache. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4_EXP) {
+        return true;
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
@@ -58984,7 +59019,7 @@ static bool qwen4_moe_profile_boundary(bool enabled, double *last, double *elaps
     return glm_graph_begin_commands_if_needed();
 }
 
-static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t T) {
+static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t il, uint32_t T) {
     const bool profile = T > 8u && getenv("DS4_QWEN4_MOE_PROFILE") != NULL;
     double elapsed[7] = {0}, last = 0;
     if (!qwen4_moe_profile_boundary(profile, &last, &elapsed[0])) return false;
@@ -59012,7 +59047,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
 #else
     const uint32_t mm_min = 8u;
 #endif
-    const bool mm = T > mm_min &&
+    const bool mm = T > mm_min && !ds4_gpu_ssd_streaming_enabled() &&
         (DS4_N_EMBD % 64u) == 0 && (DS4_N_FF_EXP % 64u) == 0 &&
         qwen4_expert_type_has_mm(l->ffn_gate_exps->type) &&
         l->ffn_up_exps->type == l->ffn_gate_exps->type &&
@@ -59077,7 +59112,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
      * chose it instead of once per row, each row's arithmetic unchanged.
      * DS4_QWEN4_MOE_NO_GROUP=1 keeps the per-row kernels for A/B. */
 #ifdef DS4_HAS_QWEN4_METAL
-    const bool grouped = shared_dense && l->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+    const bool grouped = shared_dense && !ds4_gpu_ssd_streaming_enabled() && l->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
         l->ffn_up_exps->type == DS4_TENSOR_Q4_K && l->ffn_down_exps->type == DS4_TENSOR_MXFP4 &&
         getenv("DS4_QWEN4_MOE_NO_GROUP") == NULL;
     if (ok && grouped) {
@@ -59094,18 +59129,44 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     } else
 #endif
     if (ok) {
-        ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
-                                          l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,
-                                          DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
-                                          shared_dense ? 0u : l->ffn_gate_shexp->abs_offset,
-                                          shared_dense ? 0u : l->ffn_up_shexp->abs_offset,
-                                          shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type) != 0;
-        mts_seal(MTS_MID);
-        if (ok) ok = ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, l->ffn_down_exps->abs_offset,
-                                           l->ffn_down_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED, DS4_N_FF_EXP,
-                                           DS4_N_EMBD, shared_dense ? 0u : l->ffn_down_shexp->abs_offset,
-                                           shared_dense ? UINT32_MAX : l->ffn_down_shexp->type) != 0;
-        mts_seal(MTS_DOWN);
+        /* SCALE-2: route the mid+down through the streaming expert cache when
+         * enabled and this layer's expert quants are addr-eligible. On any
+         * runtime miss (budget/class mismatch) fall back to the resident path. */
+        int streamed = 0;
+        const int stream_dbg = getenv("DS4_QWEN4_STREAM_DEBUG") != NULL;
+        if (stream_dbg) fprintf(stderr, "ds4: moe L%u T=%u stream_en=%d gate=%u down=%u\n", il, T, ds4_gpu_ssd_streaming_enabled(), l->ffn_gate_exps?l->ffn_gate_exps->type:999u, l->ffn_down_exps?l->ffn_down_exps->type:999u);
+        if (ds4_gpu_ssd_streaming_enabled() &&
+            l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps &&
+            l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+            l->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+            (l->ffn_down_exps->type == DS4_TENSOR_Q2_K ||
+             l->ffn_down_exps->type == DS4_TENSOR_Q4_K)) {
+            streamed = ds4_gpu_qwen4_moe_stream_layer(
+                g->mid, g->part, g->mixed, g->selected, m->map, m->size, il,
+                l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset, l->ffn_down_exps->abs_offset,
+                l->ffn_gate_exps->type, l->ffn_down_exps->type,
+                DS4_N_EXPERT, T, DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD,
+                shared_dense ? 0u : l->ffn_gate_shexp->abs_offset,
+                shared_dense ? 0u : l->ffn_up_shexp->abs_offset,
+                shared_dense ? 0u : l->ffn_down_shexp->abs_offset,
+                shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type,
+                shared_dense ? UINT32_MAX : l->ffn_down_shexp->type);
+            if (stream_dbg) fprintf(stderr, "ds4: moe L%u streamed=%d\n", il, streamed);
+        }
+        if (!streamed) {
+            ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
+                                              l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,
+                                              DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
+                                              shared_dense ? 0u : l->ffn_gate_shexp->abs_offset,
+                                              shared_dense ? 0u : l->ffn_up_shexp->abs_offset,
+                                              shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type) != 0;
+            mts_seal(MTS_MID);
+            if (ok) ok = ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, l->ffn_down_exps->abs_offset,
+                                               l->ffn_down_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED, DS4_N_FF_EXP,
+                                               DS4_N_EMBD, shared_dense ? 0u : l->ffn_down_shexp->abs_offset,
+                                               shared_dense ? UINT32_MAX : l->ffn_down_shexp->type) != 0;
+            mts_seal(MTS_DOWN);
+        }
     }
     if (ok) {
         ok = ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, g->sh_gate_logit,
@@ -59267,7 +59328,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         }
         QWEN4_PROF(4);
         stg_seal(STG_HCFFN);
-        if (ok) ok = qwen4_graph_moe(g, m, l, T);   /* the reduce folds the combine in */
+        if (ok) ok = qwen4_graph_moe(g, m, l, il, T);   /* the reduce folds the combine in */
         if (ok && T == 1u) qwen4_router_capture(g, il);
         if (ok && g->dump_prompt_rows)
             metal_graph_debug_dump_tensor("qwen_router", g->router,
@@ -59546,7 +59607,7 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
     if (ok) ok = qwen4_graph_attention(g, m, l, il, idx, T);
     if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, E, hc) != 0;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
-    if (ok) ok = qwen4_graph_moe(g, m, l, T);
+    if (ok) ok = qwen4_graph_moe(g, m, l, il, T);
     ds4_gpu_tensor *last = NULL;
     const char *argmax_env = getenv("DS4_QWEN4_MTP_GPU_ARGMAX");
     const bool gpu_argmax = want_logits && draft_out && !logits_out &&
@@ -59638,7 +59699,7 @@ static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *
     if (ok) ok = qwen4_graph_attention(g, m, l, il, idx, 1);
     if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, 1, E, hc) != 0;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, 1);
-    if (ok) ok = qwen4_graph_moe(g, m, l, 1);
+    if (ok) ok = qwen4_graph_moe(g, m, l, il, 1);
     /* the chained draft only needs its argmax; DS4_QWEN4_MTP_DRAFT_ROWS can
      * score the frequent-token prefix exactly like the first draft's head */
     const uint32_t chain_head_rows = qwen4_mtp_draft_rows();
@@ -71080,10 +71141,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (!backend_ok || opt->tp.role != DS4_TP_NONE || opt->cuda_tensor_parallel ||
             (gpu_cfg && gpu_cfg->n_gpus > 1) ||
             opt->distributed.role != DS4_DISTRIBUTED_NONE || load_slice ||
-            e->ssd_streaming || opt->dspark || e->power_percent != 100 ||
+            opt->dspark || e->power_percent != 100 ||
             (opt->mtp_path && opt->mtp_path[0])) {
+            /* SCALE-2: SSD streaming (routed-expert paging) is now supported for
+             * qwen4; it is served by the family-agnostic streaming expert cache
+             * and gated further downstream to Metal via ds4_backend_supports_ssd_streaming. */
             fprintf(stderr, "ds4: Qwen3.8 requires Metal or single-GPU CUDA (or --cpu --first-token-test); "
-                            "tensor parallelism, pipeline execution, SSD streaming, DSpark, "
+                            "tensor parallelism, pipeline execution, DSpark, "
                             "external MTP models and power throttling are not supported\n");
             ds4_engine_close(e);
             *out = NULL;
@@ -71988,7 +72052,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                       weights_have_output_head(&e->weights)));
             ds4_model_map_span_vec spans;
             bool spans_ok = false;
-            if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+            if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4_EXP && !load_slice) {
+                /* SCALE-2: map core + non-eligible bypass experts + output as
+                 * initial views (runtime spans include routed tensors for
+                 * cache-incompatible layers) so prefill and decode can bind them;
+                 * addr-eligible experts are excluded and served by the cache. */
+                spans_ok = weights_model_map_decode_runtime_spans(&e->weights, true, true, &spans);
+            } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
                 spans_ok = weights_model_map_decode_static_spans(&e->weights, true, true, &spans);
             } else if (load_slice) {
                 if (e->ssd_streaming_static_decode_map) {
@@ -79347,7 +79417,7 @@ static bool qwen4_graph_encode_native_session_batch(ds4_decode_item *items, int 
         if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down,
                                         l->hc_ffn_up, l->hc_ffn_inject, T);
         QWEN4_BATCH_PROF(5);
-        if (ok) ok = qwen4_graph_moe(g, m, l, T);
+        if (ok) ok = qwen4_graph_moe(g, m, l, il, T);
         QWEN4_BATCH_PROF(6);
     }
     /* The output matrix is the single largest weight read of a decode step,
@@ -79554,7 +79624,7 @@ static bool qwen4_graph_encode_native_session_batch_ragged(const qwen4_batch_mem
         }
         if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, DS4_N_EMBD, DS4_N_HC) != 0;
         if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
-        if (ok) ok = qwen4_graph_moe(g, m, l, T);
+        if (ok) ok = qwen4_graph_moe(g, m, l, il, T);
     }
     if (ok) ok = qwen4_graph_hc_mix(g, m, w->output_hc_norm, w->output_hc_down, w->output_hc_up, NULL, T) &&
                  qwen4_gemv(g->batch_logits, m, w->output, g->mixed, T);
@@ -79636,7 +79706,7 @@ static bool qwen4_batch_mtp_drafts(qwen4_batch_member *mem, int count, const uin
                  qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, N);
     if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, N, E, hc) != 0;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, N);
-    if (ok) ok = qwen4_graph_moe(g, m, l, N);
+    if (ok) ok = qwen4_graph_moe(g, m, l, il, N);
     /* every session's last committed row, gathered for one pass of the head
      * mixer into the batch's head rows */
     for (int i = 0; ok && i < count; i++) {
