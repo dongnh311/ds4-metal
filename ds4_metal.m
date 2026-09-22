@@ -49801,6 +49801,9 @@ int ds4_gpu_qwen4_moe_stream_layer(
     int32_t *all_ids = (int32_t *)malloc((size_t)n_sel_total * sizeof(int32_t));
     if (!all_ids) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: malloc\n", layer); return 0; }
     const int had_batch = g_batch_cb != nil;
+    static double g_qws_drain_ms=0, g_qws_load_ms=0, g_qws_disp_ms=0; static uint64_t g_qws_calls=0; static int g_qws_t=-1;
+    if (g_qws_t<0) g_qws_t = getenv("DS4_QWEN4_STREAM_TIMING")!=NULL;
+    const double _t0 = g_qws_t ? ds4_gpu_now_ms() : 0.0;
     if (had_batch && ds4_gpu_end_commands() == 0) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: end_commands\n", layer); free(all_ids); return 0; }
     if (ds4_gpu_tensor_read(selected, 0, all_ids,
                             (uint64_t)n_sel_total * sizeof(int32_t)) == 0) {
@@ -49820,6 +49823,8 @@ int ds4_gpu_qwen4_moe_stream_layer(
     }
     free(all_ids);
     if (!valid || n_unique == 0) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: valid=%d n_unique=%u\n", layer, valid, n_unique); if (had_batch) (void)ds4_gpu_begin_commands(); return 0; }
+    if (g_qws_t) g_qws_drain_ms += ds4_gpu_now_ms() - _t0;
+    const double _t1 = g_qws_t ? ds4_gpu_now_ms() : 0.0;
     ds4_gpu_stream_expert_cache_note_selected_hotness(layer, unique_ids, n_unique);
 
     /* Cache slab buffers referenced by raw gpuAddress in the addr kernels must be
@@ -49860,6 +49865,8 @@ int ds4_gpu_qwen4_moe_stream_layer(
     if (!ok) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: build ok=0\n", layer); return 0; }
     ds4_gpu_stream_expert_cache_prune_layer(layer, n_total_expert, n_unique, unique_ids, n_unique);
     ds4_gpu_stream_expert_cache_prune_global(layer, unique_ids, n_unique);
+    if (g_qws_t) g_qws_load_ms += ds4_gpu_now_ms() - _t1;
+    const double _t2 = g_qws_t ? ds4_gpu_now_ms() : 0.0;
 
     /* ---- dispatch mid (gate/up, IQ2_XXS) via address table ---- */
     const bool has_shared = shared_mid_type != UINT32_MAX;
@@ -49921,6 +49928,12 @@ int ds4_gpu_qwen4_moe_stream_layer(
             if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: down dispatch\n", layer);
             return 0;
         }
+    }
+    if (g_qws_t) {
+        g_qws_disp_ms += ds4_gpu_now_ms() - _t2;
+        if ((++g_qws_calls % 480u) == 0u)
+            fprintf(stderr, "ds4: qwen4 stream timing (per %llu moe-layer calls): drain=%.1fms load=%.1fms dispatch=%.1fms\n",
+                    (unsigned long long)g_qws_calls, g_qws_drain_ms, g_qws_load_ms, g_qws_disp_ms);
     }
     return 1;
 }
