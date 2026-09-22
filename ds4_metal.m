@@ -50220,7 +50220,7 @@ static int qwen4_stream_resolve(const void *model_map, uint64_t model_size, uint
  * created after encode would not be resident. An expert the cache cannot hold
  * is read into a gate-owned fallback buffer instead.
  *
- * DS4_QWEN4_STREAM_GATE=1 enables it (off by default).
+ * On by default; DS4_QWEN4_STREAM_GATE=0 keeps the per-layer drain.
  */
 #define QGATE_RING 16u              /* mailbox slots and poll regions cycled per gate */
 #define QGATE_MAX_IDS 64u           /* selected ids per gate (T * n_slots) */
@@ -50259,7 +50259,7 @@ static int qgate_requested(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("DS4_QWEN4_STREAM_GATE");
-        v = e && e[0] && e[0] != '0';
+        v = !(e && e[0] == '0');
     }
     return v;
 }

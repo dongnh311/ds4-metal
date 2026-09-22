@@ -366,3 +366,27 @@ the id prefix, for ~178 MiB of gathered head rows.
 fake-quantizes K/V to that many bits before the FP8 store, and
 `DS4_PPL_PREFIX=N` makes `--perplexity-file` prefill N tokens before scoring, to
 measure long-context KV quality before building a packed low-bit cache.
+
+## Gates on by default: long context and server validation
+
+unc31, FP8, 6GB cache. Gate vs drain (flush on):
+
+| ctx | gen t/s drain | gen t/s gate | output | notes |
+|---|---:|---:|---|---|
+| 128K (124K prompt, K=36) | 27.07 | 32.27 (+19%) | identical sha | needle HIT, +0.19 GiB peak |
+| 256K (248K prompt, K=32), decode from one restored checkpoint | - | - | identical sha across drain no-flush, drain flush and gate | correct count 1..82 in all three |
+
+The 256K comparison decodes from a single `ds4-server` disk checkpoint (one
+prefill, then a restart per path), so every path starts from the same state;
+the restore reproduces the prefilling run byte for byte (247,808 tokens loaded
+in 516 ms). Server session test (`ds4-server`, ctx 65536, disk KV cache):
+Vietnamese two-turn chat, code, two concurrent requests and a 16K-token prompt
+give byte-identical replies with gates off and on; after a restart the 16K
+prompt restores 14,336 tokens from its checkpoint (13.1 s vs 51.5 s) with the
+same reply. `DS4_QWEN4_STREAM_GATE=0` keeps the per-layer drain.
+
+Harness note: the runtime compiles `./metal` at startup. Several 256K CLI runs
+this afternoon used a binary built before the `attn_prep` argument struct grew
+(`ik_ring`, `kv_simq`), so their kernels read past the arguments; those runs
+(nondeterministic first tokens, a broken count) are void. Runs now use a
+snapshot of the binary and `metal/` taken together.
