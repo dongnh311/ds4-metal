@@ -527,3 +527,27 @@ Against FP8 without eviction (492 / 32.44 t/s, 50.02 GiB peak), the 4-bit
 cache prefills 27% faster at this depth, where attention reads dominate and
 each key now costs half the bytes, and peaks 1.6 GiB lower; that is also above
 the resident FP8 baseline (562.6 t/s at 248K). A 248K prompt takes ~6.6 min.
+
+## Resident vs streamed with the 4-bit cache: where 40 t/s is
+
+Same build and defaults (4-bit KV, MTP + 64K draft vocabulary). 8K, 400 tokens:
+
+| config | gen t/s VI | gen t/s EN | MTP accept VI/EN | peak wired |
+|---|---:|---:|---:|---:|
+| resident (no `--ssd-streaming`) | 40.06 | 40.93 | 70.8 / 76.3% | 53.03 GiB |
+| 6 streamed (K=42), 3GB cache | 38.00 | 39.67 | same | 49.67 GiB |
+| 12 streamed (K=36), 6GB cache | 35.05 | 35.23 | same | 46.85 GiB |
+
+Full 256K (248,161-token prompt, 600 tokens):
+
+| config | prefill t/s | gen t/s | peak wired | output |
+|---|---:|---:|---:|---|
+| resident | 658.7 | 35.86 | 55.43 GiB | needle HIT; identical to the streamed run |
+| 12 streamed (K=36) | 626.0 | 33.71 | 48.45 GiB | needle HIT |
+
+Resident unc31 now fits a full 256K context (the 4-bit cache and the indexer
+key ring together free ~3 GiB against the FP8 resident run, which peaked near
+the limit at 28.3 t/s), with swap unchanged. 40 t/s is reached at short
+context only when resident; at 256K the attention over ~248K keys caps even
+resident decode at ~36 t/s. Wired figures are system-wide (~3.2 GiB machine
+baseline); the GPU wired limit is `iogpu.wired_limit_mb` = 57344.
