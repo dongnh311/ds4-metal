@@ -65,3 +65,30 @@ Every streaming run of a model is byte-identical to every other (PROD
 so the knob does not change output. Streaming output differs from resident
 output on this prompt for both models, in the parent as well; that divergence
 predates this change. A `1GB` cache fails at prefill in the parent too.
+
+## unc31, 12 streamed layers @ 6GB, with MTP: 8K vs 124K real context
+
+`--mtp --mtp-timing`, greedy, `DS4_QWEN4_PLE_PREFETCH_FULL=0`. 124K rows use
+`DS4_QWEN4_KV_FP8=1 --prefill-chunk 2048 --ctx 131072` and the `needle.txt`
+prompt (124,141 tokens, code at the start, question at the end).
+
+| ctx | mode | peak wired | decode wired | prefill t/s | gen t/s | MTP accept | needle |
+|---:|---|---:|---:|---:|---:|---:|---|
+| 8K | resident | 56.40 | 56.29 | (short prompt) | 38.20 | 70.9% | - |
+| 8K | 12 @ 6GB | 49.40 | 49.18 | (short prompt) | 34.46 (90%) | 73.8% | - |
+| 124K | resident | 55.62 | 54.94 | 587.6 | 34.20 | 82.9% | HIT |
+| 124K | 12 @ 6GB | 48.41 | 45.56 | 106.2 (18%) | 23.88 (70%) | 85.0% | HIT |
+
+- MTP does not hurt streaming at 8K (90% with MTP vs 87% without).
+- At 124K the two runs produce byte-identical output; both answer the needle.
+- Decode keeps only 70% at 124K (overhead ~12.7 ms/token vs ~2.8 ms at 8K).
+  Not isolated; this run did not set `DS4_QWEN4_STREAM_TIMING`.
+- Prefill is the blocker: 124K takes ~1169 s streamed vs ~211 s resident.
+  The extra ~958 s over ~61 chunks x 12 layers is ~1.3 s per layer per chunk to
+  load roughly the whole layer (~950 MiB, a 2048-token chunk touches nearly all
+  512 experts), i.e. ~0.7 GB/s effective, far below sequential SSD bandwidth.
+  That points at per-expert reads, not the SSD. Each layer's gate/up/down
+  experts are contiguous tensors, so a chunk whose union covers most of a layer
+  could read it in bulk.
+- Resident unc31 already fits at 124K with FP8 + chunk 2048 (peak 55.62 GiB), so
+  streaming is not needed for fit at this context; it buys ~7 GiB of headroom.
