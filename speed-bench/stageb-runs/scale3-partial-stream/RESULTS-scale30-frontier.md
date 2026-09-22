@@ -653,3 +653,36 @@ K=36 went from ~93% of resident to ~96-98% tonight. The counting workload
 (high MTP acceptance) clears 40 t/s streamed; Vietnamese prose does not yet:
 it needs the last ~3%, which is the miss waits (1.7%), poll A (0.6%) and the
 fixed per-gate cost (0.6%).
+
+## Two more levers, measured and rejected
+
+**Staged miss reads** (`DS4_QWEN4_STREAM_STAGE_MISS=1`): read the missed
+experts' gate and up slices, release the misses' mid, then read their down
+behind a third poll — the ordering half of antirez/ds4 #1083. It loses here:
+the two reads serialise where one batch had them in parallel, so the down
+slices land later than the whole expert used to. 8K, 800 tokens, 12 streamed
+@ 6GB: first -> second release 390 -> 593 us, 38.57 -> 35.99 t/s. A miss gate
+reads 3.6-4.2 MiB at about 10 GB/s, which is the SSD's ceiling rather than a
+latency the ordering could hide; the packed expert layout of #848 is the piece
+that would change that, and it is why #849's prefetch pays there and not here.
+
+**A larger cache at a full 256K**: 8GB instead of 6GB peaks at 51.60 GiB
+(against 48.54) and decodes 31.63 t/s against 32.51, so 6GB stays the setting
+at 256K. At 8K the same 8GB is worth +1.4% (paired), which is where its extra
+2 GiB belongs.
+
+## Shipping state (scale3, 2026-09-23)
+
+Default for a streamed qwen4 layer: split gates, cache aging on, lookahead and
+staged reads off. Validation of the shipping build, all byte-identical to the
+resident path and to the previous build: 8K Vietnamese (38.99 t/s) and English
+(42.50), a full 256K context (32.39 t/s, peak 49.58 GiB, needle HIT), a server
+session, and `--batched-session 2` with two concurrent requests.
+
+| context | config | decode t/s | peak wired |
+|---|---|---:|---:|
+| 8K | resident | 40.2-41.0 | 53.2 GiB |
+| 8K | K=36 @ 8GB | ~39.5 (0.97 of resident) | 49.4 GiB |
+| 8K | K=36 @ 6GB | ~38.9 (0.96 of resident) | 47.3 GiB |
+| 256K | K=36 @ 6GB | 32.4-32.5 | 48.5-49.6 GiB |
+| 256K | resident | 35.9 | 55.4 GiB |
