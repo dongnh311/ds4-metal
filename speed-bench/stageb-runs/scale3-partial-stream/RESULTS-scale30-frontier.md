@@ -390,3 +390,45 @@ this afternoon used a binary built before the `attn_prep` argument struct grew
 (`ik_ring`, `kv_simq`), so their kernels read past the arguments; those runs
 (nondeterministic first tokens, a broken count) are void. Runs now use a
 snapshot of the binary and `metal/` taken together.
+
+## KV low-bit research: long-context quality
+
+Teacher-forced NLL of 800 tokens scored after a 64,237-token prefix of real
+Wikipedia text (`DS4_PPL_PREFIX`), unc31 main config. "fresh" continues with a
+new article; "repeat" re-states the document's first article (long-range
+retrieval). `simq` fake-quantizes K/V per 64-block (absmax scale) before the FP8
+store; `r` adds a 64-point Hadamard rotation.
+
+| KV | EN fresh | repeat | VI fresh |
+|---|---:|---:|---:|
+| BF16 | 1.0777 | 0.0173 | - |
+| FP8 (deployed) | 1.0882 | 0.0163 | 1.9258 |
+| 4-bit | 1.0993 (+1.1% ppl vs FP8) | 0.0181 | - |
+| 4-bit, rotated | 1.1036 (+1.6%) | 0.0194 | 1.9318 (+0.6%) |
+| 3-bit | 1.1278 (+4.0%) | 0.0218 | - |
+| 3-bit, rotated | 1.1309 (+4.4%) | 0.0218 | 1.9420 (+1.6%) |
+
+Long-range retrieval survives every format (repeat NLL stays ~0.02). Fresh-text
+prediction pays: 4-bit costs about what FP8 already costs over BF16 (+1%), 3-bit
+four times that. The Hadamard rotation does not help at this block size. A
+packed 4-bit cache would cut the raw K/V from ~3.1 to ~1.6 GiB at 256K; 3-bit
+would save only ~0.4 GiB more for four times the loss. Not built yet.
+
+## 256K with gates and the ring: 12 streamed layers fit again
+
+Binary and `metal/` from one snapshot, 248K-token prompt, FP8 KV, 6GB cache,
+MTP, `DS4_QWEN4_PLE_EVICT_TOKENS=1024`:
+
+| streamed | path | gen t/s | prefill t/s | peak wired | expert cache | output |
+|---:|---|---:|---:|---:|---|---|
+| 16 (K=32) | gate | 31.33 | 276 | 46.19 GiB | locked | counts 1..155 |
+| 16 (K=32) | drain | 31.58 | 298 | 46.05 GiB | locked | identical sha |
+| 12 (K=36) | gate | 32.50 | 332 | 50.01 GiB | locked | identical sha |
+| 12 (K=36), morning, no ring | drain | 26.70 | 386 | 52.2 GiB | capped to 120 experts | - |
+
+With the raw indexer keys in a ring, 12 streamed layers keep a fully locked
+expert cache at a full 256K context, so the K=36 setting now works at every
+context size (the K=32 fallback for 256K is no longer needed). On this counting
+output (97% MTP acceptance, few new experts) gate and drain decode at the same
+rate. `DS4_QWEN4_PLE_EVICT_TOKENS=1024` costs long-context prefill: the same
+248K prefill ran at 435-446 t/s without it.
