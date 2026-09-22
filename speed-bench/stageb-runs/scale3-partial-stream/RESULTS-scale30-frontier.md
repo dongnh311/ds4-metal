@@ -514,3 +514,16 @@ after ~100 tokens and stay coherent. Single-session decode is unchanged and
 deterministic (same reply with gates on or off, ring on or off, streamed or
 resident); `DS4_QWEN4_SESSION_BATCH=0` makes concurrent requests reproduce
 it exactly.
+
+Default config at a full 256K context (4-bit KV default, 12 streamed layers,
+6GB cache, gates, ring, MTP with the 64K draft vocabulary, no PLE eviction;
+248,161-token prompt, 600 tokens, one run):
+
+| prefill t/s | gen t/s | MTP accept | peak wired | decode wired | swap | output |
+|---:|---:|---:|---:|---:|---|---|
+| 626.0 | 33.71 | 79.5% | 48.45 GiB | 48.34 GiB | unchanged | needle HIT, count in order; identical to the earlier 4-bit 256K run |
+
+Against FP8 without eviction (492 / 32.44 t/s, 50.02 GiB peak), the 4-bit
+cache prefills 27% faster at this depth, where attention reads dominate and
+each key now costs half the bytes, and peaks 1.6 GiB lower; that is also above
+the resident FP8 baseline (562.6 t/s at 248K). A 248K prompt takes ~6.6 min.
