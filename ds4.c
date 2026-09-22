@@ -59136,6 +59136,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
         const int stream_dbg = getenv("DS4_QWEN4_STREAM_DEBUG") != NULL;
         if (stream_dbg) fprintf(stderr, "ds4: moe L%u T=%u stream_en=%d gate=%u down=%u\n", il, T, ds4_gpu_ssd_streaming_enabled(), l->ffn_gate_exps?l->ffn_gate_exps->type:999u, l->ffn_down_exps?l->ffn_down_exps->type:999u);
         if (ds4_gpu_ssd_streaming_enabled() &&
+            getenv("DS4_QWEN4_DISABLE_STREAM_EXPERT_CACHE") == NULL &&
             l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps &&
             l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
             l->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&

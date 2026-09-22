@@ -12885,6 +12885,14 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
         const uint64_t view_end = view_start + g_model_views[i].bytes;
         if (offset >= view_start && end <= view_end) {
             *inner_offset = offset - view_start;
+            if (getenv("DS4_QWEN4_STREAM_DEBUG")) {
+                const uint8_t *via = (const uint8_t *)[g_model_views[i].buffer contents] + (*inner_offset);
+                const uint8_t *raw = (const uint8_t *)model_map + offset;
+                if (memcmp(via, raw, len < 64 ? (size_t)len : 64) != 0) {
+                    static int nrep = 0;
+                    if (nrep++ < 8) fprintf(stderr, "ds4: VIEW MISMATCH off=%.3fGiB len=%llu view=%u contents=%p raw=%p\n", ds4_gpu_gib(offset), (unsigned long long)len, i, (void*)via, (void*)raw);
+                }
+            }
             return g_model_views[i].buffer;
         }
     }
@@ -48481,10 +48489,14 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
         }
         if (tg_mem) [enc setThreadgroupMemoryLength:tg_mem atIndex:0];
         if (n_resident) {
-            id<MTLResource> res[QWEN4_ATTN_ROWS_MAX * 9u];
-            if (n_resident > sizeof(res) / sizeof(res[0])) return 0;
-            for (uint32_t i = 0; i < n_resident; i++) res[i] = resident[i].buf;
-            [enc useResources:res count:n_resident usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+            /* Batched so callers (e.g. the streaming expert cache addr path) can
+             * make an arbitrary number of slab buffers resident, not just a fixed cap. */
+            for (uint32_t base = 0; base < n_resident; base += 64u) {
+                id<MTLResource> res[64];
+                uint32_t n = n_resident - base < 64u ? n_resident - base : 64u;
+                for (uint32_t i = 0; i < n; i++) res[i] = resident[base + i].buf;
+                [enc useResources:res count:n usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+            }
         }
         [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -49810,6 +49822,11 @@ int ds4_gpu_qwen4_moe_stream_layer(
     if (!valid || n_unique == 0) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: valid=%d n_unique=%u\n", layer, valid, n_unique); if (had_batch) (void)ds4_gpu_begin_commands(); return 0; }
     ds4_gpu_stream_expert_cache_note_selected_hotness(layer, unique_ids, n_unique);
 
+    /* Cache slab buffers referenced by raw gpuAddress in the addr kernels must be
+     * made resident (useResource) for the dispatch, since they are not bound. */
+    qwen4_bind mid_res[2u * DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    qwen4_bind down_res[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+
     int ok = 1;
     g_glm_stream_expert_addr_table_building++;   /* shared build gate (file-private, not GLM-specific) */
     for (uint32_t i = 0; ok && i < n_unique; i++) {
@@ -49826,6 +49843,10 @@ int ds4_gpu_qwen4_moe_stream_layer(
                     e->down_buffer, e->down_inner)) {
             if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: %s eid=%d (i=%u/%u)\n", layer, e?"set_addr_slot":"get_protected", unique_ids[i], i, n_unique);
             ok = 0;
+        } else {
+            mid_res[2u * i].buf = e->gate_buffer;  mid_res[2u * i].off = 0;
+            mid_res[2u * i + 1u].buf = e->up_buffer; mid_res[2u * i + 1u].off = 0;
+            down_res[i].buf = e->down_buffer;      down_res[i].off = 0;
         }
     }
     id<MTLBuffer> gate_addr_buf = nil, up_addr_buf = nil, down_addr_buf = nil;
@@ -49867,9 +49888,9 @@ int ds4_gpu_qwen4_moe_stream_layer(
             }
         } else { b[5] = b[0]; b[6] = b[1]; }
         const uint32_t nsg = 4u, nr = 2u, rows_per_tg = nr * nsg;
-        if (!qwen4_dispatch(QWEN4_K_MOE_MID_ADDR, &a, sizeof(a), b, 7,
+        if (!qwen4_dispatch_resident(QWEN4_K_MOE_MID_ADDR, &a, sizeof(a), b, 7,
                             MTLSizeMake((ff_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
-                            MTLSizeMake(32u * nsg, 1, 1), 0)) {
+                            MTLSizeMake(32u * nsg, 1, 1), 0, mid_res, 2u * n_unique)) {
             if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: mid dispatch\n", layer);
             return 0;
         }
@@ -49894,9 +49915,9 @@ int ds4_gpu_qwen4_moe_stream_layer(
             if (!qwen4_bind_weight(&b[4], model_map, model_size, shared_down_offset, sh_down_bytes, "shared down")) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: shared down bind (off=%llu)\n", layer, (unsigned long long)shared_down_offset); return 0; }
         } else { b[4] = b[0]; }
         const uint32_t nsg = 4u, nr = 2u, rows_per_tg = nr * nsg;
-        if (!qwen4_dispatch(QWEN4_K_MOE_DOWN_ADDR, &a, sizeof(a), b, 5,
+        if (!qwen4_dispatch_resident(QWEN4_K_MOE_DOWN_ADDR, &a, sizeof(a), b, 5,
                             MTLSizeMake((out_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
-                            MTLSizeMake(32u * nsg, 1, 1), 0)) {
+                            MTLSizeMake(32u * nsg, 1, 1), 0, down_res, n_unique)) {
             if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: down dispatch\n", layer);
             return 0;
         }
