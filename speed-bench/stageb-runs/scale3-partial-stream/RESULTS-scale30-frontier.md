@@ -325,3 +325,44 @@ Vietnamese tokens sit at high ids, so any prefix collapses its acceptance. Do
 not use the prefix knob for multilingual serving; a frequency-built
 `DS4_QWEN4_MTP_DRAFT_VOCAB` list covering the served languages is the only
 form of this idea that could pay.
+
+## Raw indexer key ring (bit-exact, on by default)
+
+The QSA raw indexer keys (`layer_ik_cache`, float32, 128 per token per full
+attention layer) are read only to pool a block's key when its last token
+arrives, and a forward of T tokens reads back at most ratio - 1 = 3 keys before
+its first position. They now live in a ring of `cap_tokens + 2 * ratio` rows
+(rounded to 64) indexed by `pos % ring` instead of `ctx` rows; session payloads
+keep their layout (rows older than the ring go out as zeros and are skipped on
+load, complete blocks travel as block keys). `DS4_QWEN4_IK_RING=0` keeps every
+row. Saves 12 x 512 B per token of context: 0.19 GiB at 32K, 0.75 GiB at 128K,
+1.5 GiB at 256K.
+
+| ctx | output vs full cache | KV estimate (raw + compressed) | decode-phase wired |
+|---|---|---|---|
+| 32K (16K prompt) | identical sha | 1.04 -> 0.85 GiB | - |
+| 128K (124K prompt) | identical sha | 4.12 -> 3.37 GiB | 46.96 -> 46.17 GiB |
+
+## FR-Spec draft vocabulary for VI + EN + code
+
+`gguf-tools/frspec_vocab.py` ranks tokens by frequency over weighted corpora
+(Vietnamese and English Wikipedia, local code, Python) and writes an id list for
+`DS4_QWEN4_MTP_DRAFT_VOCAB`. The 64K list covers 100% / 99.4% / 97.0% of our
+model's own Vietnamese / English / code outputs. Gates on, 8K, 500 tokens, two
+runs each (gen t/s, first-draft acceptance):
+
+| prompt | full head | 49K list | 64K list |
+|---|---:|---:|---:|
+| Vietnamese | 35.5 (71.0%) | 36.9 (70.4%) | 36.7 (71.0%) |
+| English prose | 35.3 (68.3%) | 36.8 (67.7%) | 36.9 (68.3%) |
+| code | 36.1 (72.7%) | 36.5 (67.1%) | 37.5 (70.3%) |
+
+The 64K list is +3.4% to +4.6% on all three without the Vietnamese collapse of
+the id prefix, for ~178 MiB of gathered head rows.
+
+## KV low-bit research knobs
+
+`DS4_QWEN4_KV_SIMQ=3|4` (append `r` for a 64-point Hadamard rotation per block)
+fake-quantizes K/V to that many bits before the FP8 store, and
+`DS4_PPL_PREFIX=N` makes `--perplexity-file` prefill N tokens before scoring, to
+measure long-context KV quality before building a packed low-bit cache.

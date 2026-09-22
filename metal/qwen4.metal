@@ -1264,7 +1264,43 @@ struct ds4_metal_args_qwen4_attn_prep {
     uint32_t fp8;              /* 1: write E4M3 bytes + per-64-block scale to *_fp8/*_scale */
     float    rope_mscale;      /* YaRN magnitude scale on cos/sin (1 without) */
     float    rope_freq[32];    /* per-pair inverse frequencies (YaRN-adjusted) */
+    uint32_t ik_ring;          /* raw indexer key rows kept (pos % ik_ring); 0: one per position */
+    uint32_t kv_simq;          /* research: fake-quantize K/V to (kv_simq & 15) bits before the FP8
+                                * store; bit 8 rotates each 64-block by a Hadamard first */
 };
+
+/* SCALE-3 KV research: quantize-dequantize this lane's 8 values of a 64-wide
+ * block (8 lanes x 8) to `bits` signed levels with a per-block absmax scale,
+ * optionally inside a 64-point Walsh-Hadamard rotation (8-point in-lane times
+ * 8-point across the block's lanes, orthonormal). The result is what a packed
+ * low-bit cache would return, so the FP8 store after it measures that quality. */
+static inline void qwen4_wht8_lane(thread float *x) {
+    for (uint h = 1; h < 8; h <<= 1)
+        for (uint i = 0; i < 8; i++)
+            if ((i & h) == 0) { const float a = x[i], b = x[i + h]; x[i] = a + b; x[i + h] = a - b; }
+}
+static inline void qwen4_wht64_block(thread float *x, ushort tiisg) {
+    qwen4_wht8_lane(x);
+    for (ushort o = 1; o < 8; o <<= 1) {
+        for (uint i = 0; i < 8; i++) {
+            const float p = simd_shuffle_xor(x[i], o);
+            x[i] = (tiisg & o) ? (p - x[i]) : (x[i] + p);
+        }
+    }
+    for (uint i = 0; i < 8; i++) x[i] *= 0.125f;
+}
+static inline void qwen4_kv_simq(thread float *x, uint mode, ushort tiisg) {
+    const uint bits = mode & 15u;
+    const bool rot = (mode & 256u) != 0u;
+    if (rot) qwen4_wht64_block(x, tiisg);
+    float a = 0.0f;
+    for (uint i = 0; i < 8; i++) a = max(a, abs(x[i]));
+    for (ushort o = 1; o < 8; o <<= 1) a = max(a, simd_shuffle_xor(a, o));
+    const float L = (float)((1u << (bits - 1u)) - 1u);
+    const float s = a > 0.0f ? a / L : 1.0f;
+    for (uint i = 0; i < 8; i++) x[i] = clamp(rint(x[i] / s), -L, L) * s;
+    if (rot) qwen4_wht64_block(x, tiisg);
+}
 
 /* Interleaved multimodal NeoX rope: pair i takes the (t, h, w) position
  * component i % 3.  Text tokens carry one position in all three lanes. */
@@ -1367,10 +1403,16 @@ static inline void qwen4_attn_prep_slot(
              * reference): block blk=tiisg>>3 spans this lane's 8 elems over 8
              * lanes; reduce block absmax across those 8 lanes. */
             const uint blk = tiisg >> 3;
+            float kx[8], vx[8];
+            for (uint i = 0; i < npt; i++) { kx[i] = row[tiisg * npt + i]; vx[i] = vs[tiisg * npt + i]; }
+            if (args.kv_simq != 0u && npt == 8u) {
+                qwen4_kv_simq(kx, args.kv_simq, tiisg);
+                qwen4_kv_simq(vx, args.kv_simq, tiisg);
+            }
             float ka = 0.0f, va = 0.0f;
             for (uint i = 0; i < npt; i++) {
-                ka = max(ka, abs(row[tiisg * npt + i]));
-                va = max(va, abs(vs[tiisg * npt + i]));
+                ka = max(ka, abs(kx[i]));
+                va = max(va, abs(vx[i]));
             }
             for (ushort o = 1; o < 8; o <<= 1) {
                 ka = max(ka, simd_shuffle_xor(ka, o));
@@ -1383,8 +1425,8 @@ static inline void qwen4_attn_prep_slot(
             device uchar *dkf = k_cache_fp8 + ((uint64_t)pos * Hkv + h) * D;
             device uchar *dvf = v_cache_fp8 + ((uint64_t)pos * Hkv + h) * D;
             for (uint i = 0; i < npt; i++) {
-                dkf[tiisg * npt + i] = dsv4_e4m3fn_encode(clamp(row[tiisg * npt + i] / ks,  -448.0f, 448.0f));
-                dvf[tiisg * npt + i] = dsv4_e4m3fn_encode(clamp(vs[tiisg * npt + i]  / vsc, -448.0f, 448.0f));
+                dkf[tiisg * npt + i] = dsv4_e4m3fn_encode(clamp(kx[i] / ks,  -448.0f, 448.0f));
+                dvf[tiisg * npt + i] = dsv4_e4m3fn_encode(clamp(vx[i] / vsc, -448.0f, 448.0f));
             }
             if ((tiisg & 7u) == 0u) {
                 k_scale[((uint64_t)pos * Hkv + h) * (D / 64u) + blk] = (half)ks;
@@ -1424,7 +1466,7 @@ static inline void qwen4_attn_prep_slot(
     {
         const uint npt = Di / 32;
         device const float *src = ik + (uint64_t)tok * Di;
-        device float *dst = ik_cache + (uint64_t)pos * Di;
+        device float *dst = ik_cache + (uint64_t)(args.ik_ring ? pos % args.ik_ring : pos) * Di;
         for (uint i = 0; i < npt; i++) dst[tiisg * npt + i] = src[tiisg * npt + i];
     }
 }
@@ -1503,7 +1545,7 @@ struct ds4_metal_args_qwen4_idx_block {
     uint32_t n_rot;
     float    rope_base;
     float    eps;
-    uint32_t pad0;
+    uint32_t ik_ring;     /* raw indexer key rows kept (pos % ik_ring); 0: one per position */
     float    rope_mscale;
     float    rope_freq[32];
 };
@@ -1520,7 +1562,10 @@ static inline void qwen4_idx_block_key_one(
     float tmp[64];
     for (uint i = 0; i < npt; i++) {
         float acc = 0.0f;
-        for (uint t = 0; t < args.ratio; t++) acc += ik_cache[((uint64_t)b * args.ratio + t) * Di + tiisg * npt + i];
+        for (uint t = 0; t < args.ratio; t++) {
+            const uint key = b * args.ratio + t;
+            acc += ik_cache[(uint64_t)(args.ik_ring ? key % args.ik_ring : key) * Di + tiisg * npt + i];
+        }
         v[i] = acc / (float)args.ratio;
     }
     float ss = 0.0f;
