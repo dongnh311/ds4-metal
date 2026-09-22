@@ -118,3 +118,34 @@ kernels in prefill because no GEMM reads through the expert address table yet.
 
 16K prompt, same model: 0 streamed 522 t/s, 6 streamed 303, 12 streamed 233
 (resident 555); every output matched resident.
+
+## Expert staging (SCALE-3.2): GEMM prefill for streamed layers, and a working fallback
+
+`ds4_gpu_qwen4_stream_stage_layer` loads the experts one dispatch needs into a
+buffer laid out like the layer's gate/up/down tensors, and `qwen4_bind_weight`
+redirects binds of exactly those tensors to it while it is active. The unchanged
+GEMM and row kernels then run on streamed layers. Staged prefill is on by
+default (`DS4_QWEN4_STREAM_STAGE_PREFILL=0` disables it); the fallback always
+stages when a cache load fails for a streamed layer.
+
+unc31, 124K needle, FP8 KV, MTP, 12 streamed layers @ 6GB, chunk 2048:
+
+| build | prefill t/s | 124K prefill time | gen t/s | peak GiB | output |
+|---|---:|---:|---:|---:|---|
+| resident | 587.6 | ~211 s | 34.20 | 55.62 | reference |
+| streaming, original | 106.2 | ~1170 s | 23.88 | 48.41 | == resident |
+| per-layer GEMM gate (b704550) | 230.4 | ~540 s | 26.10 | 48.36 | == resident |
+| + expert staging | 541.3 | ~230 s | 23.69 | 48.18 | == resident |
+
+16K prompt: 12 streamed 455 t/s (82% of resident 555), 6 streamed 474 t/s;
+staging off 214 t/s. All outputs matched resident. The staging buffer is 0.93
+GiB (Q4_K layer) or 0.71 GiB (PROD Q2_K layer); measured peak rose only ~0.24
+GiB at 16K and not at all at 124K, since prefill no longer fills cache slots.
+
+Fallback: the two configs that used to fail at prefill with "not covered by
+mapped model views" now run and match resident output: PROD with a `1GB`
+cache (budget reads as 1 slot; gen 31.4 t/s) and unc31 K=47 with 6GB (mlock
+fails; peak 57.4 GiB, a mis-sized cache for one streamed layer).
+
+Decode at 124K stays at ~70% of resident (23.7 vs 34.2); it is untouched by
+these changes and its cause is still not isolated.

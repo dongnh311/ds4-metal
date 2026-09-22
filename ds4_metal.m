@@ -48274,8 +48274,37 @@ static bool qwen4_bind_tensor(qwen4_bind *b, const ds4_gpu_tensor *t, uint64_t m
     return true;
 }
 
+/*
+ * SCALE-3.2: expert staging for streamed qwen4 layers. A streamed layer has no
+ * mapped model view for its routed experts, so the resident kernels cannot read
+ * them. ds4_gpu_qwen4_stream_stage_layer loads the experts one dispatch needs
+ * into a buffer laid out like the layer's gate/up/down tensors (expert e at
+ * e * expert_bytes), and while it is active qwen4_bind_weight redirects binds of
+ * exactly those three tensors to it. The unchanged GEMM and row kernels then run
+ * on streamed layers: prefill gets the tiled GEMMs, and a failed cache load gets
+ * a fallback that reads the right bytes instead of an uncovered model range.
+ */
+static struct {
+    int active;
+    const void *map;
+    uint64_t off[3];       /* gate, up, down tensor offsets in the model */
+    uint64_t bytes[3];     /* full tensor bytes */
+    NSUInteger region[3];  /* where each tensor starts inside buf */
+    id<MTLBuffer> buf;
+    uint64_t cap;
+} g_qwen4_stage;
+
 static bool qwen4_bind_weight(qwen4_bind *b, const void *map, uint64_t size,
                               uint64_t offset, uint64_t bytes, const char *what) {
+    if (g_qwen4_stage.active && map == g_qwen4_stage.map) {
+        for (int i = 0; i < 3; i++) {
+            if (offset == g_qwen4_stage.off[i] && bytes <= g_qwen4_stage.bytes[i]) {
+                b->buf = g_qwen4_stage.buf;
+                b->off = g_qwen4_stage.region[i];
+                return true;
+            }
+        }
+    }
     uint64_t inner = 0;
     if (!map || offset > size || bytes > size - offset) {
         fprintf(stderr, "ds4: Qwen3.8 %s range is outside the mapped model\n", what);
@@ -49918,6 +49947,120 @@ int ds4_gpu_qwen4_moe_down_tensor(
  * the *_addr kernels. Shared expert stays resident (its own offsets). Returns 1
  * on success, 0 on any failure (caller falls back to the resident path). Only
  * called for addr-eligible layers (IQ2_XXS gate/up + Q2_K/Q4_K down, uniform). */
+void ds4_gpu_qwen4_stream_stage_clear(void) {
+    g_qwen4_stage.active = 0;
+}
+
+/* Stage the routed experts selected by `selected` (n_tokens x n_slots) for one
+ * streamed layer; see g_qwen4_stage. It drains pending GPU work first, both to
+ * read `selected` and because the previous staged dispatch may still read the
+ * buffer. Consecutive expert ids are read as one run per tensor. */
+int ds4_gpu_qwen4_stream_stage_layer(
+        const void *model_map, uint64_t model_size, uint32_t layer,
+        const ds4_gpu_tensor *selected, uint32_t n_tokens, uint32_t n_slots,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t gate_type, uint32_t down_type,
+        uint32_t n_expert, uint32_t in_dim, uint32_t ff_dim, uint32_t out_dim) {
+    g_qwen4_stage.active = 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!model_map || !selected || n_tokens == 0 || n_slots == 0 ||
+        n_expert == 0 || n_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
+        return 0;
+    }
+    const uint32_t gate_row_bytes = qwen4_expert_row_bytes(gate_type, in_dim);
+    const uint32_t down_dim = (down_type == 10u || down_type == 12u) ?
+        (ff_dim + 255u) / 256u * 256u : ff_dim;
+    const uint32_t down_row_bytes = qwen4_expert_row_bytes(down_type, down_dim);
+    if (gate_row_bytes == 0 || down_row_bytes == 0) return 0;
+    const uint64_t gate_expert_bytes = (uint64_t)gate_row_bytes * ff_dim;   /* gate == up */
+    const uint64_t down_expert_bytes = (uint64_t)down_row_bytes * out_dim;
+    const uint64_t gate_bytes = gate_expert_bytes * n_expert;
+    const uint64_t down_bytes = down_expert_bytes * n_expert;
+    const uint64_t need = 2u * gate_bytes + down_bytes;
+    if (gate_offset > model_size || gate_bytes > model_size - gate_offset ||
+        up_offset > model_size || gate_bytes > model_size - up_offset ||
+        down_offset > model_size || down_bytes > model_size - down_offset) {
+        return 0;
+    }
+    if (!g_qwen4_stage.buf || g_qwen4_stage.cap < need) {
+        g_qwen4_stage.buf = nil;
+        g_qwen4_stage.buf = [g_device newBufferWithLength:(NSUInteger)need
+                                                  options:MTLResourceStorageModeShared];
+        if (!g_qwen4_stage.buf) {
+            g_qwen4_stage.cap = 0;
+            fprintf(stderr, "ds4: qwen4 expert staging buffer allocation failed (%.2f GiB)\n",
+                    ds4_gpu_gib(need));
+            return 0;
+        }
+        g_qwen4_stage.cap = need;
+        fprintf(stderr, "ds4: qwen4 expert staging buffer %.2f GiB for streamed layers\n",
+                ds4_gpu_gib(need));
+    }
+
+    const uint32_t n_sel = n_tokens * n_slots;
+    int32_t *ids = (int32_t *)malloc((size_t)n_sel * sizeof(int32_t));
+    if (!ids) return 0;
+    const int had_batch = g_batch_cb != nil;
+    if (had_batch && ds4_gpu_end_commands() == 0) {
+        free(ids);
+        return 0;
+    }
+    int ok = ds4_gpu_tensor_read(selected, 0, ids, (uint64_t)n_sel * sizeof(int32_t)) != 0;
+    uint8_t used[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    memset(used, 0, sizeof(used));
+    for (uint32_t i = 0; ok && i < n_sel; i++) {
+        if (ids[i] < 0 || (uint32_t)ids[i] >= n_expert) ok = 0;
+        else used[ids[i]] = 1;
+    }
+    free(ids);
+
+    ds4_gpu_stream_expert_pread_task *tasks = NULL;
+    uint32_t n_tasks = 0;
+    uint64_t read_bytes = 0;
+    double read_ms = 0.0;
+    if (ok) {
+        tasks = (ds4_gpu_stream_expert_pread_task *)calloc((size_t)n_expert * 3u, sizeof(*tasks));
+        if (!tasks) ok = 0;
+    }
+    uint8_t *base = ok ? (uint8_t *)[g_qwen4_stage.buf contents] : NULL;
+    const uint64_t src[3] = { gate_offset, up_offset, down_offset };
+    const uint64_t eb[3] = { gate_expert_bytes, gate_expert_bytes, down_expert_bytes };
+    const uint64_t region[3] = { 0, gate_bytes, 2u * gate_bytes };
+    for (uint32_t e = 0; ok && e < n_expert; ) {
+        if (!used[e]) { e++; continue; }
+        uint32_t end = e + 1u;
+        while (end < n_expert && used[end]) end++;
+        for (int t = 0; t < 3; t++) {
+            tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
+                .offset = src[t] + (uint64_t)e * eb[t],
+                .len = (uint64_t)(end - e) * eb[t],
+                .dst = base + region[t] + (uint64_t)e * eb[t],
+            };
+        }
+        e = end;
+    }
+    if (ok && n_tasks) ok = ds4_gpu_stream_expert_pread_tasks(tasks, n_tasks, &read_bytes, &read_ms);
+    free(tasks);
+    if (ok && getenv("DS4_METAL_STREAMING_EXPERT_PREAD_PROFILE") != NULL) {
+        fprintf(stderr, "ds4: qwen4 stage layer=%u tokens=%u runs=%u bytes=%.2f GiB wall=%.3f ms\n",
+                layer, n_tokens, n_tasks / 3u, ds4_gpu_gib(read_bytes), read_ms);
+    }
+    if (ok) {
+        g_qwen4_stage.map = model_map;
+        for (int t = 0; t < 3; t++) {
+            g_qwen4_stage.off[t] = src[t];
+            g_qwen4_stage.bytes[t] = t == 2 ? down_bytes : gate_bytes;
+            g_qwen4_stage.region[t] = (NSUInteger)region[t];
+        }
+        g_qwen4_stage.active = 1;
+    }
+    if (had_batch && ds4_gpu_begin_commands() == 0) {
+        g_qwen4_stage.active = 0;
+        ok = 0;
+    }
+    return ok;
+}
+
 int ds4_gpu_qwen4_moe_stream_layer(
         ds4_gpu_tensor *mid, ds4_gpu_tensor *part,
         const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,

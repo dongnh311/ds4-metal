@@ -8465,6 +8465,15 @@ static bool qwen4_stream_layer_pinned_resident(uint32_t il) {
     return il < (uint32_t)full_layers;
 }
 
+static bool qwen4_stream_stage_prefill_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("DS4_QWEN4_STREAM_STAGE_PREFILL");
+        enabled = !(e && e[0] == '0');
+    }
+    return enabled != 0;
+}
+
 /* SCALE-2: a qwen4 decode layer is eligible for the streaming expert-address
  * cache when gate/up are IQ2_XXS, down is Q2_K or Q4_K, and its per-expert byte
  * size matches the majority (uniform) slab class. Minority/mixed layers stay
@@ -59075,13 +59084,24 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
      * tiled GEMMs like resident prefill instead of the per-token row kernels. */
     const bool experts_streamed = ds4_gpu_ssd_streaming_enabled() &&
         qwen4_stream_expert_cache_addr_layout_supported(w, l, il);
-    const bool mm = T > mm_min && !experts_streamed &&
+    const bool mm_shape = T > mm_min &&
         (DS4_N_EMBD % 64u) == 0 && (DS4_N_FF_EXP % 64u) == 0 &&
         qwen4_expert_type_has_mm(l->ffn_gate_exps->type) &&
         l->ffn_up_exps->type == l->ffn_gate_exps->type &&
         qwen4_expert_type_has_mm(l->ffn_down_exps->type) &&
         qwen4_graph_dense_ok(l->ffn_gate_shexp) && qwen4_graph_dense_ok(l->ffn_up_shexp) &&
         qwen4_graph_dense_ok(l->ffn_down_shexp);
+    /* A streamed layer takes the GEMMs as well once its selected experts are
+     * staged (DS4_QWEN4_STREAM_STAGE_PREFILL=0 keeps the per-token stream path). */
+    bool staged = false;
+    if (ok && mm_shape && experts_streamed && qwen4_stream_stage_prefill_enabled()) {
+        staged = ds4_gpu_qwen4_stream_stage_layer(m->map, m->size, il, g->selected, T, DS4_N_EXPERT_USED,
+                                                  l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                                                  l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type,
+                                                  l->ffn_down_exps->type, DS4_N_EXPERT, DS4_N_EMBD,
+                                                  DS4_N_FF_EXP, DS4_N_EMBD) != 0;
+    }
+    const bool mm = mm_shape && (!experts_streamed || staged);
     if (mm) {
         if (ok) {
             ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, DS4_N_EXPERT_USED,
@@ -59116,6 +59136,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                 g->pos, T, (int)l->ffn_gate_exps->name.len, l->ffn_gate_exps->name.ptr, ok ? 1 : 0,
                 elapsed[0] * 1e3, elapsed[1] * 1e3, elapsed[2] * 1e3, elapsed[3] * 1e3,
                 elapsed[4] * 1e3, elapsed[5] * 1e3, elapsed[6] * 1e3);
+        if (staged) ds4_gpu_qwen4_stream_stage_clear();
         return ok;
     }
     /* A decode batch runs the shared expert as dense projections over its
@@ -59184,18 +59205,36 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
             if (stream_dbg) fprintf(stderr, "ds4: moe L%u streamed=%d\n", il, streamed);
         }
         if (!streamed) {
-            ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
-                                              l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,
-                                              DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
-                                              shared_dense ? 0u : l->ffn_gate_shexp->abs_offset,
-                                              shared_dense ? 0u : l->ffn_up_shexp->abs_offset,
-                                              shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type) != 0;
-            mts_seal(MTS_MID);
-            if (ok) ok = ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, l->ffn_down_exps->abs_offset,
-                                               l->ffn_down_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED, DS4_N_FF_EXP,
-                                               DS4_N_EMBD, shared_dense ? 0u : l->ffn_down_shexp->abs_offset,
-                                               shared_dense ? UINT32_MAX : l->ffn_down_shexp->type) != 0;
-            mts_seal(MTS_DOWN);
+            /* A streamed layer whose cache load failed has no mapped view for its
+             * experts, so the resident kernels would read an uncovered range.
+             * Stage its selected experts first; the kernels then read them. */
+            bool staged_rows = false;
+            if (experts_streamed) {
+                staged_rows = ds4_gpu_qwen4_stream_stage_layer(m->map, m->size, il, g->selected, T, DS4_N_EXPERT_USED,
+                                                               l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                                                               l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type,
+                                                               l->ffn_down_exps->type, DS4_N_EXPERT, DS4_N_EMBD,
+                                                               DS4_N_FF_EXP, DS4_N_EMBD) != 0;
+                if (!staged_rows) {
+                    fprintf(stderr, "ds4: qwen4 layer %u: expert cache load and expert staging both failed\n", il);
+                    ok = false;
+                }
+            }
+            if (!experts_streamed || staged_rows) {
+                ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
+                                                  l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,
+                                                  DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
+                                                  shared_dense ? 0u : l->ffn_gate_shexp->abs_offset,
+                                                  shared_dense ? 0u : l->ffn_up_shexp->abs_offset,
+                                                  shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type) != 0;
+                mts_seal(MTS_MID);
+                if (ok) ok = ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, l->ffn_down_exps->abs_offset,
+                                                   l->ffn_down_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED, DS4_N_FF_EXP,
+                                                   DS4_N_EMBD, shared_dense ? 0u : l->ffn_down_shexp->abs_offset,
+                                                   shared_dense ? UINT32_MAX : l->ffn_down_shexp->type) != 0;
+                mts_seal(MTS_DOWN);
+            }
+            if (staged_rows) ds4_gpu_qwen4_stream_stage_clear();
         }
     }
     if (ok) {
