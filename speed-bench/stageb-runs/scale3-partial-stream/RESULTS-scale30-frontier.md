@@ -433,9 +433,9 @@ output (97% MTP acceptance, few new experts) gate and drain decode at the same
 rate. `DS4_QWEN4_PLE_EVICT_TOKENS=1024` costs long-context prefill: the same
 248K prefill ran at 435-446 t/s without it.
 
-## 4-bit KV cache (opt-in, DS4_QWEN4_KV_Q4=1)
+## 4-bit KV cache (default since the next section; `DS4_QWEN4_KV_Q4=0` opts out)
 
-`DS4_QWEN4_KV_Q4=1` stores K/V as 4-bit signed levels (-7..7) on the FP8
+The 4-bit cache stores K/V as 4-bit signed levels (-7..7) on the FP8
 cache's per-64-block fp16 scale (absmax/7), in the FP8 buffers at half their
 size: each lane's 8 elements are one 32-bit word, read as one word in the decode
 tile and as four words per 32-element segment in the prefill attention. Head
@@ -474,3 +474,43 @@ all three, swap unchanged):
 Dropping the sidecar pages every 1024 tokens makes long prefill re-fault the
 table; without eviction the clean pages stay in the page cache (reclaimable)
 and nothing swaps. For the stream config, leave the eviction off.
+
+## 4-bit KV on by default; batched sessions with a compressed cache
+
+With the packed cache matching FP8 quality, it is now the default KV storage
+for head dim 256: `DS4_QWEN4_KV_Q4` unset means 4-bit whether or not
+`DS4_QWEN4_KV_FP8` is set, and `DS4_QWEN4_KV_Q4=0` restores the previous
+behaviour (E4M3 with `DS4_QWEN4_KV_FP8=1`, the half cache without it).
+
+8K, 400 tokens, main config, binary and `metal/` from one snapshot, compared
+with the runs of the previous build:
+
+| run | KV announced | output |
+|---|---|---|
+| no KV env | 4-bit | identical to the old `DS4_QWEN4_KV_Q4=1` run (count prompt) |
+| `DS4_QWEN4_KV_FP8=1` | 4-bit | identical to the old `DS4_QWEN4_KV_Q4=1` runs (count, Vietnamese) |
+| `DS4_QWEN4_KV_FP8=1 DS4_QWEN4_KV_Q4=0` | FP8 | identical to the old FP8 run |
+
+`ds4-server --batched-session N` (two or more concurrent sessions sharing one
+arena) could not decode with any compressed cache: the speculative (MTP)
+batch and its draft pass built their attention row entries with only the half
+cache pointers, so FP8 and 4-bit sessions attended NULL caches with an
+uninitialized KV mode. With the previous build, two concurrent requests under
+`DS4_QWEN4_KV_Q4=1` fail at once with `metal speculative batch failed`. All
+three row builders now share one binder that passes the session's KV storage
+(half, E4M3 or 4-bit) and mode; the same two requests now decode coherently at
+~18-22 t/s each.
+
+Batched decode is not bit-identical to single-session decode in either KV
+format: the batch computes a session's rows alongside other sessions' rows and
+rounds differently (the per-position half K/V already differ in the last bits
+at the first batched token). With identical prompts in two concurrent sessions,
+the logits differ by ~1e-6 at first; the first different token came ~100
+tokens in, at a near-tie (top-2 margin 0.004). A compressed cache makes this
+visible sooner: a last-bit difference can move a value across a quantization
+level. With the half cache, the 200-token replies in these tests happened to
+match the single-session replies exactly; with FP8 and 4-bit they diverge
+after ~100 tokens and stay coherent. Single-session decode is unchanged and
+deterministic (same reply with gates on or off, ring on or off, streamed or
+resident); `DS4_QWEN4_SESSION_BATCH=0` makes concurrent requests reproduce
+it exactly.

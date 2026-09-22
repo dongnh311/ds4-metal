@@ -58155,9 +58155,10 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
      * one-shot generate, bench) allocates E4M3 byte K/V + per-64-block scale
      * instead of the half cache. */
     { const char *e_fp8 = getenv("DS4_QWEN4_KV_FP8"); g->kv_fp8 = (e_fp8 && e_fp8[0] && e_fp8[0] != '0'); }
-    /* DS4_QWEN4_KV_Q4=1: 4-bit K/V (signed levels on a per-64-block absmax scale)
-     * in the same buffers as the FP8 cache, half their size. Head dim 256 only. */
-    { const char *e_q4 = getenv("DS4_QWEN4_KV_Q4"); g->kv_q4 = (e_q4 && e_q4[0] && e_q4[0] != '0') && DS4_N_HEAD_DIM == 256u; }
+    /* 4-bit K/V (signed levels on a per-64-block absmax scale) in the same
+     * buffers as the FP8 cache, half their size. Default for head dim 256;
+     * DS4_QWEN4_KV_Q4=0 falls back to DS4_QWEN4_KV_FP8 (E4M3) or the half cache. */
+    { const char *e_q4 = getenv("DS4_QWEN4_KV_Q4"); g->kv_q4 = !(e_q4 && e_q4[0] == '0') && DS4_N_HEAD_DIM == 256u; }
     if (g->kv_q4) g->kv_fp8 = true;
     if (g->kv_fp8) {
         static int announced = 0;
@@ -73714,9 +73715,6 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
          * per-64-block scale INSTEAD of the half k/v cache (the KV memory win).
          * qwen4_graph_alloc preserves kv_fp8 across its memset. */
         { const char *e_fp8 = getenv("DS4_QWEN4_KV_FP8"); s->qwen4_graph.kv_fp8 = (e_fp8 && e_fp8[0] && e_fp8[0] != '0'); }
-        if (s->qwen4_graph.kv_fp8) {
-            fprintf(stderr, "ds4: in-kernel FP8 KV cache enabled (E4M3, per-64-block scale)\n");
-        }
         if (!qwen4_graph_alloc(&s->qwen4_graph, &e->weights, (uint32_t)ctx_size, cap_tokens,
                                e->glm_mtp, shared,
                                s->qwen4_slot >= 0 ? e->qwen4_lin_state_pool : NULL,
@@ -79440,6 +79438,24 @@ static bool qwen4_batch_attention_entries(ds4_gpu_qwen4_attn_row *rows, uint32_t
                                                        g->sel_stride, scale);
 }
 
+/* One attention row entry for session graph r at position pos: its caches in
+ * whichever KV storage the graph allocated (half, E4M3 or 4-bit). */
+static void qwen4_attn_row_bind(ds4_gpu_qwen4_attn_row *e, const ds4_qwen4_gpu_graph *r,
+                                uint32_t il, uint32_t pos, uint32_t sparse_pos) {
+    e->k_cache = qwen4_kcache((ds4_qwen4_gpu_graph *)r, il);
+    e->v_cache = qwen4_vcache((ds4_qwen4_gpu_graph *)r, il);
+    e->ik_cache = r->layer_ik_cache[il];
+    e->block_key = r->layer_block_key[il];
+    e->pos3 = r->pos3;
+    e->k_cache_fp8 = r->layer_k_cache_fp8[il];
+    e->v_cache_fp8 = r->layer_v_cache_fp8[il];
+    e->k_scale = r->layer_k_scale[il];
+    e->v_scale = r->layer_v_scale[il];
+    e->pos = pos;
+    e->use_sel = pos >= sparse_pos;
+    e->fp8 = (int)qwen4_kv_mode(r);
+}
+
 static bool qwen4_batch_attention_rows(int count, ds4_qwen4_gpu_graph *rowg,
                                        ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                        const ds4_layer_weights *l, uint32_t il) {
@@ -79452,18 +79468,7 @@ static bool qwen4_batch_attention_rows(int count, ds4_qwen4_gpu_graph *rowg,
                     r->ik_ring, g->ik_ring);
             return false;
         }
-        rows[i].k_cache = qwen4_kcache((ds4_qwen4_gpu_graph *)r, il);
-        rows[i].v_cache = qwen4_vcache((ds4_qwen4_gpu_graph *)r, il);
-        rows[i].ik_cache = r->layer_ik_cache[il];
-        rows[i].block_key = r->layer_block_key[il];
-        rows[i].pos3 = r->pos3;
-        rows[i].k_cache_fp8 = r->layer_k_cache_fp8[il];
-        rows[i].v_cache_fp8 = r->layer_v_cache_fp8[il];
-        rows[i].k_scale = r->layer_k_scale[il];
-        rows[i].v_scale = r->layer_v_scale[il];
-        rows[i].pos = r->pos;
-        rows[i].use_sel = r->pos >= sparse_pos;
-        rows[i].fp8 = (int)qwen4_kv_mode(r);
+        qwen4_attn_row_bind(&rows[i], r, il, r->pos, sparse_pos);
         if (r->pos >= r->ctx_cap) return false;
     }
     return qwen4_batch_attention_entries(rows, (uint32_t)count, g, m, l, il);
@@ -79793,13 +79798,7 @@ static bool qwen4_graph_encode_native_session_batch_ragged(const qwen4_batch_mem
                 const ds4_qwen4_gpu_graph *r = &rowg[i];
                 for (uint32_t t = 0; t < mem[i].n; t++) {
                     ds4_gpu_qwen4_attn_row *e = &arows[mem[i].row0 + t];
-                    e->k_cache = r->layer_k_cache[il];
-                    e->v_cache = r->layer_v_cache[il];
-                    e->ik_cache = r->layer_ik_cache[il];
-                    e->block_key = r->layer_block_key[il];
-                    e->pos3 = r->pos3;
-                    e->pos = r->pos + t;
-                    e->use_sel = e->pos >= sparse_pos;
+                    qwen4_attn_row_bind(e, r, il, r->pos + t, sparse_pos);
                     if (e->pos >= r->ctx_cap) ok = false;
                 }
             }
@@ -79842,13 +79841,7 @@ static bool qwen4_batch_mtp_drafts(qwen4_batch_member *mem, int count, const uin
         for (uint32_t t = 0; t < mem[i].n; t++) {
             ids[mem[i].row0 + t] = t + 1u < committed[i] ? mem[i].tokens[t + 1u] : parents[i];
             ds4_gpu_qwen4_attn_row *e = &arows[mem[i].row0 + t];
-            e->k_cache = r->layer_k_cache[il];
-            e->v_cache = r->layer_v_cache[il];
-            e->ik_cache = r->layer_ik_cache[il];
-            e->block_key = r->layer_block_key[il];
-            e->pos3 = r->pos3;
-            e->pos = idx0[i] + t;
-            e->use_sel = e->pos >= sparse_pos;
+            qwen4_attn_row_bind(e, r, il, idx0[i] + t, sparse_pos);
             if (e->pos >= r->ctx_cap) return false;
         }
     }
