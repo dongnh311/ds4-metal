@@ -1595,8 +1595,8 @@ static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, con
         struct timespec ts_mono;
         clock_gettime(CLOCK_MONOTONIC, &ts_mono);
         const double mono_ms = (double)ts_mono.tv_sec * 1e3 + (double)ts_mono.tv_nsec / 1e6;
-        fprintf(stderr, "ds4: cb '%s': mono %.1f ms: ", label ? label : "?", mono_ms);
-        fprintf(stderr, "encode %.1f ms, commit->done %.1f ms, gpu span %.1f ms, gpu start +%.1f ms, caller 0x%llx\n",
+        fprintf(stderr, "ds4: cb '%s': mono %.3f ms: ", label ? label : "?", mono_ms);
+        fprintf(stderr, "encode %.3f ms, commit->done %.3f ms, gpu span %.3f ms, gpu start +%.3f ms, caller 0x%llx\n",
                 t_commit - g_batch_cb_created_ms, t_done - t_commit,
                 (cb.GPUEndTime - cb.GPUStartTime) * 1e3,
                 cb.GPUStartTime * 1e3 - (mono_ms - (t_done - t_commit)),
@@ -15447,6 +15447,9 @@ retry:
     for (uint32_t layer = 0;
          layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
          layer++) {
+        /* Only the streamed layers hold entries; skipping empty layers does not
+         * change which entry wins, it only avoids reading ~6 MB of empty slots. */
+        if (g_stream_expert_cache_layer_count[layer] == 0) continue;
         for (uint32_t expert = 0;
              expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
              expert++) {
@@ -15571,6 +15574,9 @@ retry:
     for (uint32_t layer = 0;
          layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
          layer++) {
+        /* Only the streamed layers hold entries; skipping empty layers does not
+         * change which entry wins, it only avoids reading ~6 MB of empty slots. */
+        if (g_stream_expert_cache_layer_count[layer] == 0) continue;
         for (uint32_t expert = 0;
              expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
              expert++) {
@@ -16005,6 +16011,9 @@ static void ds4_gpu_stream_expert_cache_prune_global(
         for (uint32_t layer = 0;
              layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
              layer++) {
+            /* Only the streamed layers hold entries; skipping empty layers does not
+             * change which entry wins, it only avoids reading ~6 MB of empty slots. */
+            if (g_stream_expert_cache_layer_count[layer] == 0) continue;
             for (uint32_t expert = 0;
                  expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
                  expert++) {
@@ -50288,6 +50297,17 @@ int ds4_gpu_qwen4_moe_stream_layer(
             return 0;
         }
     }
+    /* Submit the expert dispatches now so the GPU runs them while the host
+     * encodes up to the next streamed layer's router, instead of idling until
+     * that layer's drain commits everything at once. It hides part of the
+     * commit latency: +3% decode, same output. DS4_QWEN4_STREAM_FLUSH=0 keeps
+     * one submission per drain for A/B. */
+    static int flush_after = -1;
+    if (flush_after < 0) {
+        const char *fa = getenv("DS4_QWEN4_STREAM_FLUSH");
+        flush_after = !(fa && fa[0] == '0');
+    }
+    if (flush_after && had_batch && ds4_gpu_flush_commands() == 0) return 0;
     if (g_qws_t) {
         g_qws_disp_ms += ds4_gpu_now_ms() - _t2;
         if ((++g_qws_calls % 480u) == 0u)

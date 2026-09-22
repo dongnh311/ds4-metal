@@ -214,3 +214,58 @@ cache ("using locked cache cap: 120 experts / 0.22 GiB"), so decode falls to
 GiB, the cache locks fully, and decode returns to 30.6 t/s; prefill drops from
 386 to 334 t/s. BF16 KV at 256K fails to lock the cache even with an empty
 context, so FP8 KV is required there. All full-context runs found the needle.
+
+## Long-context prefill: resident baseline at 248K
+
+unc31, the same 248,161-token prompt, FP8 KV, chunk 2048, MTP, ctx 262144:
+
+| mode | prefill t/s | gen t/s | peak wired | needle |
+|---|---:|---:|---:|---|
+| resident | 562.6 | 27.78 | 57.87 GiB | HIT |
+| 16 streamed (K=32) @ 6GB, rerun | 446.1 | - | - | - |
+| 16 streamed (K=32) @ 6GB, earlier run | 334.4 | 30.60 | 47.63 GiB | HIT |
+
+Resident holds 562 t/s at 248K against 588 at 124K, so attention is not what
+slows long-context prefill. The streamed rerun with the staging profile gives
+446 t/s (79% of resident) against 334 t/s in the earlier run with the same
+config: the earlier number came from a worse machine memory state and does not
+reproduce. Staging stayed in the page cache for the whole rerun (27-45 GB/s,
+disk reads 50-160 MB/s) and took 44 s of 554 s. Resident decode at a full 256K
+(27.78 t/s) is slower than 16 streamed layers (30.60 t/s): at 57.9 GiB peak the
+resident run is under memory pressure.
+
+## Where the per-layer decode cost goes
+
+Per-command-buffer timings (`DS4_METAL_CB_TIMES=1`, printed at µs precision),
+unc31, 12 streamed layers @ 6GB, 8K, no MTP. Each streamed layer is one command
+buffer: its GPU span is ~0.55 ms, like a resident layer, so the address-table
+kernels cost nothing extra. Around it, per layer:
+
+| part | ms |
+|---|---:|
+| commit -> done minus GPU span (submit + completion wake-up) | ~0.18 |
+| host gap between buffers (read `selected`, cache lookup, loads) | ~0.15 median, 0.30 mean |
+| encode of the segment | ~0.04 |
+
+Resident encodes a whole token in 0.64 ms (~14 µs per layer) while the GPU
+runs, so encode is not the cost. Two host-side fixes:
+
+- Submit the expert dispatches right after encoding them
+  (`DS4_QWEN4_STREAM_FLUSH`, now on by default; `=0` disables), so the GPU runs
+  them while the host encodes up to the next router.
+- The eviction scans (`take_reusable`, `take_reusable_batch`, `prune_global`)
+  walked all 80 x 512 entries (~6 MB) per miss once the cache is full; they now
+  skip layers with no entries. Victim choice is unchanged.
+
+Decode A/B, 8K, 600 tokens, each variant run twice in ABCD/DCBA order; output
+is byte-identical across variants within each mode:
+
+| variant | gen t/s, MTP | gen t/s, no MTP |
+|---|---:|---:|
+| before | 34.15 | 27.90 |
+| flush | 35.13 | 28.37 |
+| scan skip | 34.73 | 28.13 |
+| both | 35.31 (+3.4%) | 28.74 (+3.0%) |
+
+Resident with MTP at 8K is 38.20, so the main config is now at ~92%. What is
+left is mostly the submit/wake-up latency of the per-layer drain.
