@@ -3303,6 +3303,17 @@ kernel void kernel_qwen4_moe_down(
 // half. The host service thread reads the mailbox as soon as the command
 // buffer's lines reach memory and can tell a fresh word from a stale one by the
 // tag, without waiting for the buffer's completion status.
+/* Copies a streamed layer's router input to the gate's hidden slot so the
+ * service thread can run the next streamed layer's router on it and read the
+ * experts it predicts while the GPU is still on this layer. */
+kernel void kernel_qwen4_stream_gate_hidden(
+        device const float *x,
+        device float       *dst,
+        constant uint      &n,
+        uint tid [[thread_position_in_grid]]) {
+    if (tid < n) dst[tid] = x[tid];
+}
+
 kernel void kernel_qwen4_stream_gate_publish(
         device const int32_t *selected,
         device uint          *mailbox,

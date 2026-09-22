@@ -3492,6 +3492,11 @@ int ds4_gpu_qwen4_moe_down_tensor(
         uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
         uint32_t ff_dim, uint32_t out_dim,
         uint64_t shared_down_offset, uint32_t shared_type);
+/* Streamed decode lookahead: before a streamed layer's MoE, name the next
+ * streamed layer so its gate can read the experts its router input predicts.
+ * top == 0 disables it for that gate. */
+void ds4_gpu_qwen4_stream_lookahead(uint32_t layer, uint32_t top, uint64_t router_offset,
+                                    uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset);
 int ds4_gpu_qwen4_moe_stream_layer(
         ds4_gpu_tensor *mid, ds4_gpu_tensor *part,
         const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,

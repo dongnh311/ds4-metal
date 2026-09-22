@@ -59246,6 +59246,29 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
             l->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
             (l->ffn_down_exps->type == DS4_TENSOR_Q2_K ||
              l->ffn_down_exps->type == DS4_TENSOR_Q4_K)) {
+            /* Name the next streamed layer so this layer's gate can prefetch
+             * the experts its router input predicts (DS4_QWEN4_STREAM_LOOKAHEAD
+             * = predictions per row; 0 is off). */
+            {
+                static int la_top = -1;
+                if (la_top < 0) {
+                    const char *e = getenv("DS4_QWEN4_STREAM_LOOKAHEAD");
+                    la_top = e ? atoi(e) : 0;
+                    if (la_top < 0) la_top = 0;
+                    if (la_top > (int)DS4_N_EXPERT_USED) la_top = (int)DS4_N_EXPERT_USED;
+                }
+                const uint32_t nl = il + 1u;
+                const ds4_layer_weights *ln = la_top && nl < DS4_N_LAYER - DS4_N_NEXTN_PREDICT ?
+                    &w->layer[nl] : NULL;
+                const bool next_streamed = ln && ln->ffn_gate_inp && ln->ffn_gate_inp->type == DS4_TENSOR_F32 &&
+                    !qwen4_stream_layer_pinned_resident(nl) &&
+                    qwen4_stream_expert_cache_addr_layout_supported(w, ln, nl);
+                ds4_gpu_qwen4_stream_lookahead(nl, next_streamed ? (uint32_t)la_top : 0u,
+                                               next_streamed ? ln->ffn_gate_inp->abs_offset : 0u,
+                                               next_streamed ? ln->ffn_gate_exps->abs_offset : 0u,
+                                               next_streamed ? ln->ffn_up_exps->abs_offset : 0u,
+                                               next_streamed ? ln->ffn_down_exps->abs_offset : 0u);
+            }
             streamed = ds4_gpu_qwen4_moe_stream_layer(
                 g->mid, g->part, g->mixed, g->selected, m->map, m->size, il,
                 l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset, l->ffn_down_exps->abs_offset,
