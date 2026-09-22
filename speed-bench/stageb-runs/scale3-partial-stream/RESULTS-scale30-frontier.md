@@ -149,3 +149,26 @@ fails; peak 57.4 GiB, a mis-sized cache for one streamed layer).
 
 Decode at 124K stays at ~70% of resident (23.7 vs 34.2); it is untouched by
 these changes and its cause is still not isolated.
+
+## Correction: long-context decode is ~88% of resident, not ~70%
+
+The 124K "decode ~70%" figures above came from the needle prompt, whose answer
+ends at EOS after about 75 tokens (41 verify cycles + 34 accepted drafts), and
+they started from a cold expert cache: with staging, prefill no longer fills
+the cache. Re-measured with the same 124K context but a closing instruction to
+count to 400, so both runs decode ~595 tokens (unc31, FP8, MTP, chunk 2048):
+
+| mode | gen t/s | vs resident | prefill t/s | MTP accept |
+|---|---:|---:|---:|---:|
+| resident | 35.08 | 100% | 588.3 | 75.5% |
+| 12 streamed @ 6GB | 30.73 | 88% | 538.2 | 75.5% |
+
+Outputs are byte-identical. The streaming cost is 4.0 ms/token for 12 layers,
+0.34 ms per streamed layer, the same per-layer cost measured at 8K, so long
+context adds no decode cost of its own.
+
+Cache warmup after a long prefill: the first ~250 decode calls with misses
+average 6.3 missed experts per call, settling to ~1.7. The first 480 calls
+spend 531 ms loading against ~90 ms per 480 calls afterwards, and drain adds
+~0.45 s, so warmup costs ~0.5-0.9 s once per prompt: 3-4% of a 600-token reply,
+20-30% of a 75-token one, which is what the earlier figure measured.
