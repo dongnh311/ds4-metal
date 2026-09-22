@@ -16359,6 +16359,8 @@ static int ds4_gpu_stream_expert_cache_load_batch(
         uint64_t       down_offset,
         uint64_t       gate_expert_bytes,
         uint64_t       down_expert_bytes,
+        const uint8_t *copy_base,           /* NULL: pread; else copy from here */
+        const uint64_t *copy_region,        /* gate, up, down starts in copy_base */
         ds4_gpu_stream_expert_cache_entry **entries) {
     if (!g_ssd_streaming_mode || !ids || !entries || n_ids == 0 ||
         n_ids > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
@@ -16438,6 +16440,12 @@ static int ds4_gpu_stream_expert_cache_load_batch(
         uint8_t *gate_dst = (uint8_t *)[gate_bufs[k] contents] + gate_inner[k];
         uint8_t *up_dst = (uint8_t *)[up_bufs[k] contents] + up_inner[k];
         uint8_t *down_dst = (uint8_t *)[down_bufs[k] contents] + down_inner[k];
+        if (copy_base) {
+            memcpy(gate_dst, copy_base + copy_region[0] + eid * gate_expert_bytes, gate_expert_bytes);
+            memcpy(up_dst, copy_base + copy_region[1] + eid * gate_expert_bytes, gate_expert_bytes);
+            memcpy(down_dst, copy_base + copy_region[2] + eid * down_expert_bytes, down_expert_bytes);
+            continue;
+        }
         tasks[3u * k + 0u] = (ds4_gpu_stream_expert_pread_task) {
             .offset = gate_offset + eid * gate_expert_bytes,
             .len = gate_expert_bytes,
@@ -16457,9 +16465,9 @@ static int ds4_gpu_stream_expert_cache_load_batch(
 
     uint64_t read_bytes = 0;
     double read_ms = 0.0;
-    if (ok) ok = ds4_gpu_stream_expert_pread_tasks(tasks, n_miss * 3u, &read_bytes, &read_ms);
+    if (ok && !copy_base) ok = ds4_gpu_stream_expert_pread_tasks(tasks, n_miss * 3u, &read_bytes, &read_ms);
     free(tasks);
-    if (ok) {
+    if (ok && !copy_base) {
         ds4_gpu_stream_expert_cache_note_pread(layer, read_bytes, read_ms);
         if (getenv("DS4_METAL_STREAMING_EXPERT_PREAD_PROFILE") != NULL) {
             fprintf(stderr,
@@ -49960,7 +49968,8 @@ int ds4_gpu_qwen4_stream_stage_layer(
         const ds4_gpu_tensor *selected, uint32_t n_tokens, uint32_t n_slots,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         uint32_t gate_type, uint32_t down_type,
-        uint32_t n_expert, uint32_t in_dim, uint32_t ff_dim, uint32_t out_dim) {
+        uint32_t n_expert, uint32_t in_dim, uint32_t ff_dim, uint32_t out_dim,
+        uint32_t seed_tokens) {
     g_qwen4_stage.active = 0;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!model_map || !selected || n_tokens == 0 || n_slots == 0 ||
@@ -50012,6 +50021,20 @@ int ds4_gpu_qwen4_stream_stage_layer(
         if (ids[i] < 0 || (uint32_t)ids[i] >= n_expert) ok = 0;
         else used[ids[i]] = 1;
     }
+    /* Experts of the last seed_tokens rows, to seed the decode cache below. */
+    int32_t seed_ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    uint32_t n_seed = 0;
+    if (ok && seed_tokens > 0) {
+        const uint32_t st = seed_tokens < n_tokens ? seed_tokens : n_tokens;
+        uint8_t seen[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+        memset(seen, 0, sizeof(seen));
+        for (uint32_t i = (n_tokens - st) * n_slots; i < n_sel; i++) {
+            if (!seen[ids[i]]) {
+                seen[ids[i]] = 1;
+                seed_ids[n_seed++] = ids[i];
+            }
+        }
+    }
     free(ids);
 
     ds4_gpu_stream_expert_pread_task *tasks = NULL;
@@ -50044,6 +50067,24 @@ int ds4_gpu_qwen4_stream_stage_layer(
     if (ok && getenv("DS4_METAL_STREAMING_EXPERT_PREAD_PROFILE") != NULL) {
         fprintf(stderr, "ds4: qwen4 stage layer=%u tokens=%u runs=%u bytes=%.2f GiB wall=%.3f ms\n",
                 layer, n_tokens, n_tasks / 3u, ds4_gpu_gib(read_bytes), read_ms);
+    }
+    /* On the prompt's last chunk, copy the experts its final rows chose from the
+     * staging buffer into the decode cache, so decode does not start cold. A
+     * failed seed only costs the warmup it was meant to hide. */
+    if (ok && n_seed > 0) {
+        ds4_gpu_stream_expert_cache_entry *seed_entries[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+        const double seed_t0 = ds4_gpu_now_ms();
+        g_glm_stream_expert_addr_table_building++;
+        const int seeded = ds4_gpu_stream_expert_cache_load_batch(model_map, model_size, layer,
+                                                                  seed_ids, n_seed, n_expert,
+                                                                  gate_offset, up_offset, down_offset,
+                                                                  gate_expert_bytes, down_expert_bytes,
+                                                                  base, region, seed_entries);
+        g_glm_stream_expert_addr_table_building--;
+        if (getenv("DS4_METAL_STREAMING_EXPERT_PREAD_PROFILE") != NULL) {
+            fprintf(stderr, "ds4: qwen4 seed layer=%u experts=%u ok=%d wall=%.3f ms\n",
+                    layer, n_seed, seeded, ds4_gpu_now_ms() - seed_t0);
+        }
     }
     if (ok) {
         g_qwen4_stage.map = model_map;
@@ -50148,7 +50189,7 @@ int ds4_gpu_qwen4_moe_stream_layer(
     if (batch_load &&
         !ds4_gpu_stream_expert_cache_load_batch(model_map, model_size, layer, unique_ids, n_unique,
                                                 n_total_expert, gate_offset, up_offset, down_offset,
-                                                gate_expert_bytes, down_expert_bytes, batch_entries)) {
+                                                gate_expert_bytes, down_expert_bytes, NULL, NULL, batch_entries)) {
         if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: batch load (n=%u)\n", layer, n_unique);
         ok = 0;
     }

@@ -8465,6 +8465,22 @@ static bool qwen4_stream_layer_pinned_resident(uint32_t il) {
     return il < (uint32_t)full_layers;
 }
 
+/* Tokens at the end of the prompt whose experts seed the decode expert cache
+ * (DS4_QWEN4_STREAM_SEED_TOKENS, off by default). Staged prefill leaves the
+ * cache untouched, so decode starts cold. Seeding 64 tokens halves the early
+ * decode misses, but its copy runs on the critical path at the end of prefill
+ * and costs about what it saves (124K prompt, 75-token reply: 0.30 s seeding
+ * against 0.24 s less decode), so it stays opt-in. */
+static uint32_t qwen4_stream_seed_tokens(void) {
+    static int tokens = -1;
+    if (tokens < 0) {
+        const char *e = getenv("DS4_QWEN4_STREAM_SEED_TOKENS");
+        tokens = e && e[0] ? atoi(e) : 0;
+        if (tokens < 0) tokens = 0;
+    }
+    return (uint32_t)tokens;
+}
+
 static bool qwen4_stream_stage_prefill_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -57887,6 +57903,9 @@ typedef struct ds4_qwen4_gpu_graph {
     float steer_attn_scale;
     float steer_ffn_scale;
     bool dump_prompt_rows;
+    /* Set by the prefill loops for the prompt's last chunk: staged streamed
+     * layers then seed the decode expert cache from its final tokens. */
+    bool stream_seed_last;
 } ds4_qwen4_gpu_graph;
 
 static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
@@ -59099,7 +59118,8 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                   l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
                                                   l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type,
                                                   l->ffn_down_exps->type, DS4_N_EXPERT, DS4_N_EMBD,
-                                                  DS4_N_FF_EXP, DS4_N_EMBD) != 0;
+                                                  DS4_N_FF_EXP, DS4_N_EMBD,
+                                                  g->stream_seed_last ? qwen4_stream_seed_tokens() : 0u) != 0;
     }
     const bool mm = mm_shape && (!experts_streamed || staged);
     if (mm) {
@@ -59214,7 +59234,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                                l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
                                                                l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type,
                                                                l->ffn_down_exps->type, DS4_N_EXPERT, DS4_N_EMBD,
-                                                               DS4_N_FF_EXP, DS4_N_EMBD) != 0;
+                                                               DS4_N_FF_EXP, DS4_N_EMBD, 0u) != 0;
                 if (!staged_rows) {
                     fprintf(stderr, "ds4: qwen4 layer %u: expert cache load and expert staging both failed\n", il);
                     ok = false;
@@ -59838,8 +59858,10 @@ static int generate_qwen4_metal_argmax(
     for (int i = 0; i < prompt->len && ok;) {
         uint32_t chunk = (uint32_t)(prompt->len - i);
         if (chunk > g->cap_tokens) chunk = g->cap_tokens;
+        g->stream_seed_last = i + (int)chunk == prompt->len;
         ok = qwen4_graph_forward_tokens(g, model, weights, prompt->v + i, chunk,
                                         i + (int)chunk == prompt->len ? logits : NULL, false);
+        g->stream_seed_last = false;
         i += (int)chunk;
         if (progress) progress(progress_ud, "prefill_chunk", i, prompt->len);
     }
@@ -76149,8 +76171,11 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
              * may leave it as the live session. Every completed chunk needs
              * its own logits as well as recurrent/KV state. */
             s->checkpoint_valid = false;
-            if (!qwen4_graph_forward_tokens(&s->qwen4_graph, &e->model, &e->weights,
-                                            prompt->v + i, chunk, s->logits, false)) {
+            s->qwen4_graph.stream_seed_last = i + (int)chunk == prompt->len;
+            const bool chunk_ok = qwen4_graph_forward_tokens(&s->qwen4_graph, &e->model, &e->weights,
+                                                             prompt->v + i, chunk, s->logits, false);
+            s->qwen4_graph.stream_seed_last = false;
+            if (!chunk_ok) {
                 snprintf(err, errlen, "Qwen3.8 prefill failed at token %d", i);
                 s->checkpoint_valid = false;
                 prefill_rc = 1;

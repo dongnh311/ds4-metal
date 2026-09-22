@@ -172,3 +172,22 @@ average 6.3 missed experts per call, settling to ~1.7. The first 480 calls
 spend 531 ms loading against ~90 ms per 480 calls afterwards, and drain adds
 ~0.45 s, so warmup costs ~0.5-0.9 s once per prompt: 3-4% of a 600-token reply,
 20-30% of a 75-token one, which is what the earlier figure measured.
+
+## Decode cache seeding (opt-in, off by default)
+
+With staging, prefill no longer fills the expert cache, so decode starts cold.
+`DS4_QWEN4_STREAM_SEED_TOKENS=N` copies, on the prompt's last chunk, the experts
+its final N rows chose from the staging buffer into the cache. unc31, 124K
+needle (75-token reply), 12 streamed @ 6GB, FP8 + MTP:
+
+| seed | seeded experts | seed cost | decode misses | decode load | gen t/s | decode time |
+|---:|---:|---:|---:|---:|---:|---:|
+| off | 0 | 0 ms | 2228 | 435 ms | 24.95 | 3.01 s |
+| 32 | 1403 | 212 ms | 1104 | 311 ms | 24.57 | 3.05 s |
+| 64 | 2159 | 299 ms | 911 | 211 ms | 27.14 | 2.76 s |
+
+Outputs match resident in all three. Seeding 64 tokens cuts early misses by 59%
+and lifts short-reply gen t/s by 9%, but its copy runs on the critical path at
+the end of prefill: 0.30 s paid against 0.24 s of decode saved, so the
+end-to-end latency does not improve. The streamed layers are the last ones, so
+little work is left to overlap the copy with. It stays available but off.

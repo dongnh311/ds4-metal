@@ -3503,13 +3503,15 @@ int ds4_gpu_qwen4_moe_stream_layer(
         uint64_t shared_down_offset, uint32_t shared_mid_type, uint32_t shared_down_type);
 /* Stage one streamed layer's selected experts so the resident MoE kernels can
  * read them; binds of its gate/up/down tensors use the staging buffer until
- * ds4_gpu_qwen4_stream_stage_clear(). */
+ * ds4_gpu_qwen4_stream_stage_clear(). A nonzero seed_tokens also copies the
+ * experts of the last seed_tokens rows into the decode expert cache. */
 int ds4_gpu_qwen4_stream_stage_layer(
         const void *model_map, uint64_t model_size, uint32_t layer,
         const ds4_gpu_tensor *selected, uint32_t n_tokens, uint32_t n_slots,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         uint32_t gate_type, uint32_t down_type,
-        uint32_t n_expert, uint32_t in_dim, uint32_t ff_dim, uint32_t out_dim);
+        uint32_t n_expert, uint32_t in_dim, uint32_t ff_dim, uint32_t out_dim,
+        uint32_t seed_tokens);
 void ds4_gpu_qwen4_stream_stage_clear(void);
 int ds4_gpu_qwen4_moe_mid_grouped_tensor(
         ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
