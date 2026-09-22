@@ -191,3 +191,26 @@ and lifts short-reply gen t/s by 9%, but its copy runs on the critical path at
 the end of prefill: 0.30 s paid against 0.24 s of decode saved, so the
 end-to-end latency does not improve. The streamed layers are the last ones, so
 little work is left to overlap the copy with. It stays available but off.
+
+## Main config RAM (unc31, streamed layers, 6GB cache, FP8 KV, chunk 2048, MTP)
+
+System-wide wired RAM from `vm_stat` (includes ~3.2 GiB machine baseline). KV
+pages wire as the context fills, so the full-context rows use real prompts
+(124K / 217K / 248K tokens) with ~440-600 decoded tokens.
+
+| ctx | streamed | ctx nearly empty | ctx full (decode) | expert cache | gen t/s | prefill t/s |
+|---:|---:|---:|---:|---|---:|---:|
+| 8K | 12 | 45.5 | - | locked | 32.9 | - |
+| 32K | 12 | 46.1 | - | locked | 33.1 | - |
+| 128K | 12 | 47.8 | 48.2 peak | locked | 30.7 | 538 |
+| 224K | 12 | 50.0 | 50.63 | locked | 32.55 | 384 |
+| 256K | 12 | 50.7 | 51.2 (peak 52.2) | capped to 120 experts | 26.70 | 386 |
+| 256K | 16 | - | 47.63 | locked | 30.60 | 334 |
+
+The machine's `vm.user_wire_limit` is 52.48 GiB. At a full 256K context with
+12 streamed layers, KV growth during prefill leaves no room to mlock the expert
+cache ("using locked cache cap: 120 experts / 0.22 GiB"), so decode falls to
+26.7 t/s. Streaming 16 layers (`DS4_QWEN4_STREAM_FULL_LAYERS=32`) frees ~3.6
+GiB, the cache locks fully, and decode returns to 30.6 t/s; prefill drops from
+386 to 334 t/s. BF16 KV at 256K fails to lock the cache even with an empty
+context, so FP8 KV is required there. All full-context runs found the needle.
