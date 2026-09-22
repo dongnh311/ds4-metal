@@ -298,3 +298,30 @@ puts 86% of resolve there), and the release stores ~54 µs (the GPU sees the
 release within the first ~10 µs of them). Splitting the miss reads into 128
 KB chunks across the pool made it slower (resolve 99 -> 122 µs) and was
 dropped.
+
+## MTP knobs on the main config (gates on, 8K, 500 tokens, two runs each)
+
+Draft depth (`DS4_QWEN4_MTP_DEPTH`; 2 = one draft, 3 = two drafts, 0 = the
+adaptive default):
+
+| prompt | one draft | two drafts | adaptive |
+|---|---:|---:|---:|
+| English prose | 34.4 | 31.8 | 35.4 |
+| code | 36.2 | 31.0 | 36.6 |
+
+Two drafts lose on the streamed config: a three-row verify reaches more
+distinct experts. The adaptive default stays.
+
+Draft vocabulary prefix (`DS4_QWEN4_MTP_DRAFT_ROWS`, the draft scores only the
+first N output rows):
+
+| prompt | full | 131072 | 65536 | 32768 |
+|---|---:|---:|---:|---:|
+| English prose | 35.1 | - | 35.8 | 36.4 |
+| code | 36.1 | - | 37.6 | 36.0 |
+| Vietnamese | 34.6 (71.0% accept) | 29.1 (38.2%) | 29.0 (36.3%) | - |
+
+Vietnamese tokens sit at high ids, so any prefix collapses its acceptance. Do
+not use the prefix knob for multilingual serving; a frequency-built
+`DS4_QWEN4_MTP_DRAFT_VOCAB` list covering the served languages is the only
+form of this idea that could pay.
