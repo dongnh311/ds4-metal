@@ -4929,13 +4929,6 @@ static NSString *ds4_gpu_full_source(void) {
 
     NSString *exe_dir = ds4_gpu_exe_dir();
     const char *dir_override = getenv("DS4_METAL_DIR");
-    static dispatch_once_t log_once;
-    dispatch_once(&log_once, ^{
-        fprintf(stderr, "ds4: Metal kernel source dir: %s%s\n",
-                (dir_override && dir_override[0]) ? dir_override
-                    : (exe_dir ? [exe_dir UTF8String] : "(CWD; exe path unresolved)"),
-                (dir_override && dir_override[0]) ? " (DS4_METAL_DIR)" : " (exe-relative)");
-    });
     NSMutableString *source = [NSMutableString stringWithString:base];
     for (NSArray<NSString *> *spec in required_sources) {
         const char *override_path = getenv([spec[0] UTF8String]);
@@ -4978,6 +4971,26 @@ static NSString *ds4_gpu_full_source(void) {
             return nil;
         }
         [source appendFormat:@"\n// appended %@\n%@\n", loaded_path, loaded];
+        /* Report the directory the sources actually came from: a binary outside
+         * the checkout root (tests/) has no metal/ next to it and falls back to
+         * the CWD. */
+        static dispatch_once_t log_once;
+        dispatch_once(&log_once, ^{
+            const char *from = "per-file override";
+            NSString *dir = loaded_path;
+            if ([loaded_path hasSuffix:spec[1]]) {
+                dir = [loaded_path substringToIndex:loaded_path.length - spec[1].length];
+                if (dir_override && dir_override[0] && [loaded_path hasPrefix:[NSString stringWithUTF8String:dir_override]]) {
+                    from = "DS4_METAL_DIR";
+                } else if (exe_dir && [loaded_path hasPrefix:exe_dir]) {
+                    from = "exe-relative";
+                } else {
+                    from = "CWD";
+                    dir = [[NSFileManager defaultManager] currentDirectoryPath];
+                }
+            }
+            fprintf(stderr, "ds4: Metal kernel source dir: %s (%s)\n", [dir UTF8String], from);
+        });
     }
     return source;
 }
