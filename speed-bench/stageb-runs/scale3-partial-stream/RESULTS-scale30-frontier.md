@@ -686,3 +686,88 @@ session, and `--batched-session 2` with two concurrent requests.
 | 8K | K=36 @ 6GB | ~38.9 (0.96 of resident) | 47.3 GiB |
 | 256K | K=36 @ 6GB | 32.4-32.5 | 48.5-49.6 GiB |
 | 256K | resident | 35.9 | 55.4 GiB |
+
+## The decode bottleneck was the MoE row kernels, not streaming (2026-09-23)
+
+Measured on a freshly rebooted box (no swap), 8K, MTP, 800 tokens, paired runs.
+`DS4_METAL_GPU_IDLE` now also reports the whole timeline: the GPU is busy
+97-98% of the decode wall time, so the host is not the limit. The stage split
+(`DS4_QWEN4_STAGE_TS_PROFILE`, `DS4_QWEN4_MOE_TS_PROFILE`, and the new
+`DS4_QWEN4_SUB_TS_PROFILE` for the linear-attention layer and the
+hyper-connection mixer) against each stage's bytes at ~281 GB/s (the rate the
+output head reaches):
+
+| stage per verify step (resident, before) | ms | byte floor | ratio |
+|---|---:|---:|---:|
+| MoE mid (IQ2_XXS gate/up) | 8.9 | 2.3 | 3.9x |
+| MoE down (Q2_K / Q4_K) | 9.3 | 2.5 | 3.7x |
+| GDN (Q4_K projections + scan) | 7.3 | 4.0 | 1.8x |
+| hyper-connection mixers | 6.8 | 4.3 | 1.6x |
+| attention | 3.5 | 2.2 | 1.6x |
+| output head | 2.4 | 2.3 | 1.0x |
+
+On M5 only MXFP4 rows took the specialized decode MoE kernels; this model's
+IQ2_XXS, Q2_K and Q4_K rows ran the generic `qwen4_row_dot` with runtime type
+branches, and the streamed layers' `*_addr` kernels had no specialization at
+all. Changes (all byte-identical to the previous build, see below):
+
+1. Function-constant specialization for IQ2_XXS / Q2_K / Q4_K rows on M5,
+   resident and `*_addr` kernels: mid -24%, down -20%.
+2. Multi-row down kernels (`kernel_qwen4_moe_down_k` + `_addr`, 4 rows per
+   SIMD group sharing the lane's activation loads).
+3. Down rows load their nibbles/bytes as words, d/dmin as half2, activations as
+   float4. The word extraction makes the backend fuse the chain differently
+   (unpinned, Q4_K rows drift in the last bit and replies diverge after ~200
+   tokens on EN prose), so the chain is pinned to the byte loop's compiled form
+   (`fp contract/reassociate off`, `acc = fma(fma(ds, q, -dm), y, acc)`).
+   Down 1752 -> 1137 ms (400 tokens).
+4. IQ2_XXS mid: one row per SIMD group with the grid and sign tables copied to
+   threadgroup memory (divergent constant-memory reads were the cost):
+   1602 -> 1494 ms.
+
+Paired, same prompt, output byte-identical in every pair:
+
+| config | before (3ff3bf6) | after (cc7c898) | ratio |
+|---|---:|---:|---:|
+| resident, VI | 41.1 | 49.7 | 1.208 |
+| K=36 @ 6GB, VI | 38.6-39.9 | 47.7-47.8 | 1.20 |
+| K=36 @ 6GB, code | 36.7-37.2 | 44.5-44.6 | 1.21 |
+
+Single runs, 8K, 800 tokens, same outputs as before on all three prompts:
+
+| prompt | resident | K=36 @ 6GB |
+|---|---:|---:|
+| VI | 48.9 | 46.2 |
+| EN prose | 47.0 | 45.0 |
+| code | 45.6 | 43.5 |
+
+Full context (251,049-token prompt, counting reply, 600 tokens), K=36 @ 6GB:
+38.49 -> 44.57 t/s, prefill 594 -> 604 t/s, same output, needle HIT, peak
+48.0-49.0 GiB. `ds4-server`: a sequential multi-turn session (reasoning text
+included) matches the previous build byte for byte, decode ~37.7 -> ~44.4 t/s;
+`--batched-session 2` runs clean (two runs of the old build already differ
+from each other there, as noted earlier).
+
+### Measured and not kept
+
+- IQ2_XXS mid with 2 or 4 rows per group: slower (register pressure); the rows
+  are bound by dequant arithmetic, not the activation loads.
+- IQ2_XXS dot variants (sign by XOR, float4 activations, uchar4 grid, a float
+  grid table in constant memory): same bits, no gain or slower.
+- Two-token Q4_K dense matvec (one weight read for both verify columns): same
+  bits, 20% slower (half the threadgroups). The second column is already
+  nearly free (T=1 qkv 2.30 ms vs T=2 2.79 ms).
+- Q4_K dense matvec rows/groups (NR 2/4, NSG 2/4/8): no change.
+- Q8_0 MoE specialization (the MTP layer's down): neutral.
+- 8GB cache and router lookahead on the new build: 0.97-1.01, left as before.
+
+### Where the time goes now (resident, per verify step)
+
+MoE 39%, GDN 23%, hyper-connection 20%, attention 11%, output 7%. The dense
+Q4_K/F16 matvecs run at ~1.5x their byte floor and are latency-bound (320-row
+hyper-connection projections, 12 us norm kernels x 96 per step); a byte-exact
+speedup there needs fusion (norm into the low-rank projection) rather than
+geometry. Streaming K=36 costs ~5% against resident: ~1.1 ms per cycle of GPU
+time inside the gated layers (polls, pass 2) and ~0.8 ms of command-buffer
+boundaries. (A K=47 probe is not a gate test: its one streamed layer falls
+back to staging every step.)
