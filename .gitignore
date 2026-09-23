@@ -24,7 +24,6 @@
 !/tests/vision-fixtures/
 !/tests/vision-fixtures/**
 /tests/cuda_long_context_smoke
-/test_expert_pager
 *.o
 *.dSYM/
 __pycache__/

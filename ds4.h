@@ -162,11 +162,6 @@ typedef struct {
     bool ssd_streaming;
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
-    /* Path to qwen38-experts.bin bundle for qwen4 SSD expert paging.
-     * NULL = pager disabled; set when --ssd-streaming is used with a
-     * qwen4 model and the bundle+index files are present on disk. */
-    const char *qwen4_expert_bundle_path;
-    const char *qwen4_expert_index_path;
     bool inspect_only;
     /* Multi-GPU placement uses this to price per-layer KV storage. */
     int placement_ctx_hint;
@@ -532,6 +527,16 @@ typedef struct {
  * sequential fallback. */
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen);
+/* One speculative cycle for a batch of sessions (greedy acceptance, Qwen3.8
+ * with --mtp): each item feeds its token; a pending draft rides along as a
+ * second row and is committed when it is the target's argmax.  accepted[i]
+ * lists the tokens committed for item i (the fed token, then the draft) and
+ * n_accepted[i] how many; the session's logits then follow its last
+ * committed token.  Engines without native batching run one cycle per
+ * session in turn. */
+int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count,
+                                               int (*accepted)[2], int *n_accepted,
+                                               char *err, size_t errlen);
 /* Advance one resumed prefill suffix and an independent decode batch as one
  * scheduling step. Unsupported combinations use the ordinary serialized
  * session operations. */
@@ -611,20 +616,6 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 #define DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS 14u
 
 uint64_t ds4_session_payload_bytes(ds4_session *s);
-
-/* Bytes of K/V the live session actually holds: the per-layer resident K/V
- * tensors plus the paged store when paged KV is enabled.  This is a measured
- * allocation, not the context-memory estimate; 0 when no graph is resident. */
-uint64_t ds4_session_kv_cache_bytes(ds4_session *s);
-
-/* Expert-pager I/O counters for this session.  Returns 0 when no pager is
- * attached, leaving every out-pointer untouched. */
-int ds4_session_pager_stats(ds4_session *s,
-                            uint64_t *out_hits,
-                            uint64_t *out_misses,
-                            uint64_t *out_pread_bytes,
-                            double *out_latency_ms);
-
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
                               char *err, size_t errlen);
 int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,

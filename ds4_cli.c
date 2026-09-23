@@ -1107,7 +1107,11 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
 
     /* Seed the graph with enough real context to stay on the normal Metal
      * prefill path; scoring starts immediately after this fixed prefix. */
-    const int prefix_len = 32;
+    /* DS4_PPL_PREFIX=N prefills N tokens first, to score at depth (long-context
+     * KV quality); the default keeps the 32-token prefix. */
+    int prefix_len = 32;
+    const char *pp = getenv("DS4_PPL_PREFIX");
+    if (pp && atoi(pp) > 32) prefix_len = atoi(pp);
     if (tokens.len <= prefix_len) {
         fprintf(stderr, "ds4: --perplexity-file needs more than %d tokens\n", prefix_len);
         ds4_tokens_free(&tokens);
@@ -2084,10 +2088,6 @@ static cli_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.engine.ssd_streaming_preload_experts = (uint32_t)v;
-        } else if (!strcmp(arg, "--qwen4-expert-bundle")) {
-            c.engine.qwen4_expert_bundle_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--qwen4-expert-index")) {
-            c.engine.qwen4_expert_index_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--simulate-used-memory")) {
             if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
                                    &c.engine.simulate_used_memory_bytes)) {

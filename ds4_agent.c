@@ -828,6 +828,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.glm_mtp = true;
         } else if (!strcmp(arg, "--mtp-model")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--ple")) {
+            c.engine.ple_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
@@ -2258,7 +2260,16 @@ static void agent_qwen_tool_parse(agent_dsml_parser *p) {
         if (!p->current.name) {
             if (!agent_bytes_starts_with(cur, end, fn_open)) {
                 if (agent_bytes_partial_prefix_at(cur, end, fn_open)) return;
-                agent_dsml_set_error(p, "expected <function=...> in Qwen tool call");
+                if (agent_bytes_starts_with(cur, end, param_open)) {
+                    /* #1050: a <parameter=...> arrived where the tool name is
+                     * expected. Point at the actual mistake. */
+                    agent_dsml_set_error(p,
+                        "Qwen tool call: <parameter=...> appeared before the tool "
+                        "name; emit <function=NAME> first, then its <parameter=...> "
+                        "entries");
+                } else {
+                    agent_dsml_set_error(p, "expected <function=...> in Qwen tool call");
+                }
                 return;
             }
             const char *name_start = cur + sizeof(fn_open) - 1;
