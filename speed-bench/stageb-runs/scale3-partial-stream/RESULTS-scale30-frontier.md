@@ -820,7 +820,13 @@ Measured and not kept (all byte-identical):
 
 The same build on the PROD model (`...-Q2KDownPad768-MTP`, resident, 8K VI,
 paired against the pre-fix build 3ff3bf6): 44.2-44.7 -> 50.9 t/s (+14.5%),
-byte-identical output. PROD itself is unchanged.
+byte-identical output. That baseline ran without specialization; the gateway
+already sets `DS4_QWEN4_MOE_MV_SPECIALIZE=1`, so the gain PROD actually gets is
+smaller: ported (resident parts) and deployed as PROD 5ed89b4, measured with
+the registry's env and flags against aab023d: VI 45.1 -> 47.5, EN prose
+43.0 -> 45.6, code 45.1 -> 47.7 t/s (+5-6%), byte-identical, and `ds4-server`
+with the registry's exact command answers four multi-turn requests byte for
+byte like aab023d and like the previously deployed server binary.
 
 Where this leaves decode: the row kernels are bound by their per-element
 dequant arithmetic, and the byte-exact contract fixes that op sequence. Each
