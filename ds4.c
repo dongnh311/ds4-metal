@@ -58620,14 +58620,21 @@ static int qwen4_idx_select(ds4_gpu_tensor *sel, const ds4_gpu_tensor *score, co
                      : ds4_gpu_qwen4_idx_select_tensor(sel, score, tile_max, n_blocks, n_tokens, top_k);
 }
 
+static int g_sub_armed;
+static inline void sub_seal(int slot);
+enum { SUB_GDN_QKV=1, SUB_GDN_Z=2, SUB_GDN_FRONT=3, SUB_GDN_SCAN=4, SUB_GDN_OUT=5, SUB_GDN_PROJ=6,
+       SUB_HC_NORM=7, SUB_HC_DOWN=8, SUB_HC_MIX=9, SUB_REST=10, SUB_N=11 };
+
 /* grouped norm -> low-rank gate -> mixed; inject may be NULL (final mixer) */
 static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                const ds4_tensor *norm, const ds4_tensor *down,
                                const ds4_tensor *up, const ds4_tensor *inject, uint32_t T) {
     bool ok = ds4_gpu_qwen4_hc_norm_tensor(g->xn, g->inj, g->R, m->map, m->size, norm->abs_offset,
                                            inject ? inject->abs_offset : 0, inject ? inject->type : DS4_TENSOR_F32,
-                                           T, DS4_N_EMBD, DS4_N_HC, inject ? DS4_N_HC : 0u, DS4_RMS_EPS) &&
-              qwen4_gemv(g->lo, m, down, g->xn, T);
+                                           T, DS4_N_EMBD, DS4_N_HC, inject ? DS4_N_HC : 0u, DS4_RMS_EPS);
+    sub_seal(SUB_HC_NORM);
+    ok = ok && qwen4_gemv(g->lo, m, down, g->xn, T);
+    sub_seal(SUB_HC_DOWN);
     if (T > 8u &&
         up->type != DS4_TENSOR_Q8_0) {
         /* prefill: the up projection as a GEMM over the activated low-rank rows */
@@ -58655,10 +58662,13 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
             ds4_gpu_tensor_free(xnv);
             if (!oks) return false;
         }
+        sub_seal(SUB_HC_MIX);
         return true;
     }
-    return ok && ds4_gpu_qwen4_hc_gate_mix_tensor(g->mixed, g->xn, g->lo, m->map, m->size, up->abs_offset,
-                                                  up->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
+    ok = ok && ds4_gpu_qwen4_hc_gate_mix_tensor(g->mixed, g->xn, g->lo, m->map, m->size, up->abs_offset,
+                                                up->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
+    sub_seal(SUB_HC_MIX);
+    return ok;
 }
 
 static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
@@ -58671,10 +58681,12 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
             l->lin_qkv->abs_offset, l->lin_gate->abs_offset, DS4_N_EMBD,
             l->lin_qkv->dim[1], l->lin_gate->dim[1], g->mixed, T) != 0;
     }
-    if (!paired && !(qwen4_gemv(g->qkv, m, l->lin_qkv, g->mixed, T) &&
-          qwen4_gemv(g->z, m, l->lin_gate, g->mixed, T))) {
-        return false;
+    if (!paired) {
+        const bool qok = qwen4_gemv(g->qkv, m, l->lin_qkv, g->mixed, T);
+        sub_seal(SUB_GDN_QKV);
+        if (!qok || !qwen4_gemv(g->z, m, l->lin_gate, g->mixed, T)) return false;
     }
+    sub_seal(SUB_GDN_Z);
     bool ok;
     if (qwen4_graph_fused(g, T)) {
         ok = ds4_gpu_qwen4_gdn_front_tensor(g->qkv, g->layer_lin_hist[il], g->mixed, g->ga, g->gb, m->map, m->size,
@@ -58692,17 +58704,21 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
                                            l->lin_dt_bias->abs_offset, T, DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD,
                                            DS4_N_LIN_HEAD_DIM);
     }
+    sub_seal(SUB_GDN_FRONT);
     if (ok) {
         ok = ds4_gpu_qwen4_gdn_scan_tensor(g->lin_o, g->layer_lin_state[il], g->qkv, g->ga, g->gb, T,
                                            DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM,
                                            g->snap_after_first ? g->snap_lin_state[il] : NULL, 0u,
                                            g->snap_after_second ? g->snap2_lin_state[il] : NULL, 1u) != 0;
     }
+    sub_seal(SUB_GDN_SCAN);
     if (ok) {
         ok = ds4_gpu_qwen4_gdn_out_tensor(g->lin_o, g->z, m->map, m->size, l->lin_norm->abs_offset, T,
                                           DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS) != 0;
     }
+    sub_seal(SUB_GDN_OUT);
     if (ok) ok = qwen4_gemv(g->blk, m, l->lin_out, g->lin_o, T);
+    sub_seal(SUB_GDN_PROJ);
     return ok;
 }
 
@@ -58838,6 +58854,36 @@ static void qwen4_moe_ts_dump(void) {
     fprintf(stderr, "ds4:   %-12s %9.2f ms  (MoE GPU total)\n", "TOTAL", tot);
 }
 static inline void mts_seal(int slot) { if (g_mts_armed) (void)ds4_gpu_qsa_prof_seal(slot); }
+
+/* ---- GDN / hyper-connection sub-stage GPU timestamps (env DS4_QWEN4_SUB_TS_PROFILE)
+ * Same non-sync seal as the stage profiler, one slot per kernel group of the
+ * linear-attention layer and of the hyper-connection mixer.  Off by default;
+ * do not combine with the other TS profilers. */
+static const char *g_sub_names[SUB_N] = { "", "gdn qkv gemv", "gdn z gemv", "gdn front", "gdn scan",
+    "gdn out norm", "gdn out gemv", "hc norm", "hc down gemv", "hc gate mix", "rest" };
+static double g_sub_gpu[SUB_N];
+static uint64_t g_sub_steps;
+static void qwen4_sub_ts_dump(void);
+static int qwen4_sub_ts_enabled(void) {
+    static int c = -1;
+    if (c < 0) {
+        const char *e = getenv("DS4_QWEN4_SUB_TS_PROFILE");
+        c = (e && e[0] && e[0] != '0') ? 1 : 0;
+        if (c) atexit(qwen4_sub_ts_dump);
+    }
+    return c;
+}
+static void qwen4_sub_ts_dump(void) {
+    if (g_sub_steps == 0) return;
+    ds4_gpu_qsa_prof_get(g_sub_gpu, SUB_N);
+    double tot = 0.0;
+    for (int i = 1; i < SUB_N; i++) tot += g_sub_gpu[i];
+    fprintf(stderr, "ds4: === SUB TS profile (%llu forward calls T<=8) ===\n", (unsigned long long)g_sub_steps);
+    for (int i = 1; i < SUB_N; i++)
+        fprintf(stderr, "ds4:   %-14s %9.2f ms  %5.1f%%  %.3f ms/call\n", g_sub_names[i], g_sub_gpu[i],
+                tot > 0.0 ? 100.0 * g_sub_gpu[i] / tot : 0.0, g_sub_gpu[i] / (double)g_sub_steps);
+}
+static inline void sub_seal(int slot) { if (g_sub_armed) (void)ds4_gpu_qsa_prof_seal(slot); }
 
 /* Diagnostic (SCALE-1b): capture routed expert selections per (pos, layer) for
  * offline routing-locality / cache-sim analysis. env DS4_QWEN4_ROUTER_LOG=<path>.
@@ -59413,6 +59459,8 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     const bool prof_on = timing == 2 && T > 1u;
     g_stg_armed = qwen4_stage_ts_enabled() && (T <= 8u);
     if (g_stg_armed) { (void)ds4_gpu_qsa_prof_seal(-1); g_stg_steps++; }
+    g_sub_armed = qwen4_sub_ts_enabled() && (T <= 8u);
+    if (g_sub_armed) { (void)ds4_gpu_qsa_prof_seal(-1); g_sub_steps++; }
     double prof_last = prof_on ? now_sec() : 0.0;
 #define QWEN4_PROF(idx_) do { \
         if (prof_on) { \
@@ -59439,6 +59487,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         }
         QWEN4_PROF(0);
         stg_seal(STG_PLE);
+        sub_seal(SUB_REST);
         if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, T);
         QWEN4_PROF(1);
         stg_seal(STG_HCATTN);
@@ -59454,6 +59503,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         }
         QWEN4_PROF(ds4_qwen4_layer_is_linear(il) ? 2 : 3);
         stg_seal(ds4_qwen4_layer_is_linear(il) ? STG_GDN : STG_ATTN);
+        sub_seal(SUB_REST);
         if (T == 1u && !g->mtp_R && DS4_N_HC == 4u && ds4_gpu_qwen4_decode_fusions_enabled() &&
             l->hc_ffn_inject->type == DS4_TENSOR_F16) {
             if (ok) ok = ds4_gpu_qwen4_hc_combine_norm_tensor(g->hc_u, g->blk, g->inj,
@@ -59483,6 +59533,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         if (ok) ok = qwen4_graph_apply_steering_ffn(g, il, T);
         QWEN4_PROF(5);
         stg_seal(STG_MOE);
+        sub_seal(SUB_REST);
         /* Submit this prefix while the host encodes the remaining layers.
          * Flush keeps the same ordered queue and retains pending buffers;
          * end_commands below waits for both batches before inputs are reused. */
@@ -59513,6 +59564,8 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         if (ok) ok = qwen4_gemv(g->logits, m, w->output, g->mixed, 1);
     }
     stg_seal(STG_OUT);
+    sub_seal(SUB_REST);
+    g_sub_armed = 0;
     const double t2 = timing ? now_sec() : 0.0;
     if (!ds4_gpu_end_commands()) ok = false;
     const double t3 = timing ? now_sec() : 0.0;

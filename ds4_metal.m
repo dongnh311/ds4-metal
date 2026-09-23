@@ -48536,8 +48536,10 @@ enum {
     QWEN4_K_MOE_DOWN_MXFP4_PF,
     QWEN4_K_MOE_MID_ADDR,
     QWEN4_K_MOE_DOWN_ADDR,
+    QWEN4_K_MOE_MID_IQ2_NR1,
     QWEN4_K_MOE_MID_IQ2_NR2,
     QWEN4_K_MOE_MID_IQ2_NR4,
+    QWEN4_K_MOE_MID_IQ2_ADDR_NR1,
     QWEN4_K_MOE_MID_IQ2_ADDR_NR2,
     QWEN4_K_MOE_MID_IQ2_ADDR_NR4,
     QWEN4_K_MOE_DOWN_Q4K_NR2,
@@ -48656,8 +48658,10 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_moe_down_mxfp4_pf",
     "kernel_qwen4_moe_mid_addr",
     "kernel_qwen4_moe_down_addr",
+    "kernel_qwen4_moe_mid_iq2_nr1",
     "kernel_qwen4_moe_mid_iq2_nr2",
     "kernel_qwen4_moe_mid_iq2_nr4",
+    "kernel_qwen4_moe_mid_iq2_addr_nr1",
     "kernel_qwen4_moe_mid_iq2_addr_nr2",
     "kernel_qwen4_moe_mid_iq2_addr_nr4",
     "kernel_qwen4_moe_down_q4k_nr2",
@@ -48775,20 +48779,22 @@ static uint32_t qwen4_moe_mv_rows(void) {
 
 /* Multi-row decode MoE kernels (kernel_qwen4_moe_mid_iq2 / _down_k and their
  * address-table twins): rows per SIMD group for IQ2_XXS gate/up and Q4_K/Q2_K
- * down, 0 for the one-row kernels.  Byte-identical either way.  On M5 the
- * down rows gain (unc31 8K verify: 1752 -> 1580 ms) and the IQ2_XXS rows,
- * bound by their dequant arithmetic rather than the activation loads, lose
- * (1598 -> 1770 ms).  DS4_QWEN4_MOE_MR_MID / _MR_DOWN = 0/2/4 override. */
+ * down, 0 for the one-row kernels.  Byte-identical either way.  On M5 (unc31
+ * 8K verify, 400 tokens) the down rows with word loads take 1752 -> 1137 ms;
+ * the IQ2_XXS rows are bound by their dequant arithmetic, so more rows per
+ * group lose, but one row with the grid and sign tables in threadgroup memory
+ * gains (1602 -> 1494 ms).  DS4_QWEN4_MOE_MR_MID = 0/1/2/4 and
+ * DS4_QWEN4_MOE_MR_DOWN = 0/2/4 override. */
 static uint32_t qwen4_moe_mr_rows(uint32_t type) {
     if (type != 16u && type != 12u && type != 10u) return 0u;
     const bool m5 = ds4_gpu_device_is_m5_apple_silicon();
-    const uint64_t v = type == 16u ? ds4_gpu_env_u64("DS4_QWEN4_MOE_MR_MID", 0u, 0u, 4u)
+    const uint64_t v = type == 16u ? ds4_gpu_env_u64("DS4_QWEN4_MOE_MR_MID", m5 ? 1u : 0u, 0u, 4u)
                                    : ds4_gpu_env_u64("DS4_QWEN4_MOE_MR_DOWN", m5 ? 4u : 0u, 0u, 4u);
-    return v >= 4u ? 4u : v >= 2u ? 2u : 0u;
+    return v >= 4u ? 4u : v >= 2u ? 2u : v == 1u && type == 16u ? 1u : 0u;
 }
 
 static uint32_t qwen4_moe_mr_groups(void) {
-    return (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_MOE_MR_NSG", 4u, 1u, 16u);
+    return (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_MOE_MR_NSG", 8u, 1u, 16u);
 }
 
 static uint32_t qwen4_moe_mv_groups(uint32_t type) {
@@ -48812,7 +48818,7 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
         id<MTLComputePipelineState> pipeline = nil;
         if (kernel == QWEN4_K_MOE_MID || kernel == QWEN4_K_MOE_DOWN || kernel == QWEN4_K_MOE_DOWN_MXFP4_PF ||
             kernel == QWEN4_K_MOE_MID_ADDR || kernel == QWEN4_K_MOE_DOWN_ADDR ||
-            (kernel >= QWEN4_K_MOE_MID_IQ2_NR2 && kernel <= QWEN4_K_MOE_DOWN_Q2K_ADDR_NR4)) {
+            (kernel >= QWEN4_K_MOE_MID_IQ2_NR1 && kernel <= QWEN4_K_MOE_DOWN_Q2K_ADDR_NR4)) {
             const qwen4_moe_args *a = args;
             const bool specialize = qwen4_moe_mv_specialize(a->weight_type);
             const uint32_t values[] = {a->weight_type, a->shared_type, specialize ? a->in_dim : 0u, specialize ? qwen4_moe_mv_rows() : 0u};
@@ -50134,7 +50140,7 @@ int ds4_gpu_qwen4_moe_mid_tensor(
     int kernel = !q4k ? QWEN4_K_MOE_MID : nr == 1u ? QWEN4_K_MOE_MID_Q4K_NR1 : QWEN4_K_MOE_MID_Q4K;
     const uint32_t mr = weight_type == 16u ? qwen4_moe_mr_rows(weight_type) : 0u;
     if (mr) {
-        kernel = mr == 4u ? QWEN4_K_MOE_MID_IQ2_NR4 : QWEN4_K_MOE_MID_IQ2_NR2;
+        kernel = mr == 4u ? QWEN4_K_MOE_MID_IQ2_NR4 : mr == 2u ? QWEN4_K_MOE_MID_IQ2_NR2 : QWEN4_K_MOE_MID_IQ2_NR1;
         tg_nsg = qwen4_moe_mr_groups();
         rows_per_tg = mr * tg_nsg;
     }
@@ -50182,7 +50188,8 @@ int ds4_gpu_qwen4_moe_down_tensor(
     const int prefetch_override = ds4_gpu_env_bool("DS4_QWEN4_MOE_DOWN_PREFETCH");
     const bool prefetch = weight_type == 39u && (ff_dim % 32u) == 0 &&
         (prefetch_override >= 0 ? prefetch_override > 0 : ds4_gpu_device_is_m5_apple_silicon());
-    const uint32_t mr = qwen4_moe_mr_rows(weight_type);
+    /* the multi-row down rows take the lane's eight activations whole */
+    const uint32_t mr = (ff_dim % 8u) == 0 ? qwen4_moe_mr_rows(weight_type) : 0u;
     if (mr) {
         const int kernel = weight_type == 12u ? (mr == 4u ? QWEN4_K_MOE_DOWN_Q4K_NR4 : QWEN4_K_MOE_DOWN_Q4K_NR2)
                                               : (mr == 4u ? QWEN4_K_MOE_DOWN_Q2K_NR4 : QWEN4_K_MOE_DOWN_Q2K_NR2);
@@ -51445,8 +51452,8 @@ int ds4_gpu_qwen4_moe_stream_layer(
             const uint32_t nsg = mr ? qwen4_moe_mr_groups() : spec ? qwen4_moe_mv_groups(gate_type) : 4u;
             const uint32_t nr = mr ? mr : spec ? qwen4_moe_mv_rows() : 2u;
             const uint32_t rows_per_tg = nr * nsg;
-            const int mid_kernel = mr == 4u ? QWEN4_K_MOE_MID_IQ2_ADDR_NR4 : mr == 2u ? QWEN4_K_MOE_MID_IQ2_ADDR_NR2
-                                                                                  : QWEN4_K_MOE_MID_ADDR;
+            const int mid_kernel = mr == 4u ? QWEN4_K_MOE_MID_IQ2_ADDR_NR4 : mr == 2u ? QWEN4_K_MOE_MID_IQ2_ADDR_NR2 :
+                                   mr == 1u ? QWEN4_K_MOE_MID_IQ2_ADDR_NR1 : QWEN4_K_MOE_MID_ADDR;
             if (!qwen4_dispatch_resident(mid_kernel, &a, sizeof(a), b, 8,
                                 MTLSizeMake((ff_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
                                 MTLSizeMake(32u * nsg, 1, 1), 0, mid_res, n_mid_res)) {
@@ -51476,7 +51483,7 @@ down_dispatch:
                 if (!qwen4_bind_weight(&b[4], model_map, model_size, shared_down_offset, sh_down_bytes, "shared down")) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: shared down bind (off=%llu)\n", layer, (unsigned long long)shared_down_offset); return 0; }
             } else { b[4] = b[0]; }
             const bool spec = qwen4_moe_mv_specialize(down_type);
-            const uint32_t mr = qwen4_moe_mr_rows(down_type);
+            const uint32_t mr = (ff_dim % 8u) == 0 ? qwen4_moe_mr_rows(down_type) : 0u;
             const uint32_t nsg = mr ? qwen4_moe_mr_groups() : spec ? qwen4_moe_mv_groups(down_type) : 4u;
             const uint32_t nr = mr ? mr : spec ? qwen4_moe_mv_rows() : 2u;
             const uint32_t rows_per_tg = nr * nsg;

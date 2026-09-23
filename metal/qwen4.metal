@@ -3450,6 +3450,54 @@ kernel void kernel_qwen4_moe_down_addr(
     (ACC_) += dl_ * part_; \
 } while (0)
 
+/* QWEN4_IQ2_ACC with the grid and sign tables copied to threadgroup memory */
+#define QWEN4_IQ2_ACC_TG(ACC_, BLK_, IB32_, J_, Y_) do { \
+    device const uchar *blk_ = (device const uchar *)(BLK_); \
+    const float d_ = (float)(*(device const half *)blk_); \
+    device const ushort *q2_ = (device const ushort *)(blk_ + 2) + 4 * (IB32_); \
+    const uint aux_g_ = (uint)q2_[0] | ((uint)q2_[1] << 16); \
+    const uint aux_s_ = (uint)q2_[2] | ((uint)q2_[3] << 16); \
+    const float dl_ = d_ * (0.5f + (float)(aux_s_ >> 28)) * 0.25f; \
+    threadgroup const uchar *grid_ = (threadgroup const uchar *)(tg_grid + ((aux_g_ >> (8 * (J_))) & 0xFFu)); \
+    const uint signs_ = tg_signs[(aux_s_ >> (7 * (J_))) & 127u]; \
+    float part_ = 0.0f; \
+    for (uint i_ = 0; i_ < 8; i_++) part_ += (float)grid_[i_] * ((signs_ >> i_) & 1u ? -(Y_)[i_] : (Y_)[i_]); \
+    (ACC_) += dl_ * part_; \
+} while (0)
+
+/* Copies the IQ2_XXS grid and sign tables to threadgroup memory; every
+ * thread of the group must call it before any early return. */
+#define QWEN4_IQ2_TG_TABLES() \
+    threadgroup ulong tg_grid[256]; \
+    threadgroup uchar tg_signs[128]; \
+    { \
+        const uint tid_ = (uint)sgitg * 32u + (uint)tiisg, nt_ = ntg.x; \
+        for (uint k_ = tid_; k_ < 256u; k_ += nt_) tg_grid[k_] = ds4_metal_iq2xxs_grid[k_]; \
+        for (uint k_ = tid_; k_ < 128u; k_ += nt_) tg_signs[k_] = ds4_metal_ksigns_iq2xs[k_]; \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+    }
+
+template <uint NR>
+static inline void qwen4_iq2_mid_rows_tg(device const char *gb, device const char *ub, uint row_bytes,
+                                         uint row0, uint out_rows, device const float *xt, uint in_dim,
+                                         ushort tiisg, thread float *accg, thread float *accu,
+                                         threadgroup const ulong *tg_grid, threadgroup const uchar *tg_signs) {
+    const uint nb = in_dim / 256;
+    const uint ib32 = tiisg / 4, j = tiisg % 4;
+    for (uint r = 0; r < NR; r++) { accg[r] = 0.0f; accu[r] = 0.0f; }
+    for (uint ib = 0; ib < nb; ib++) {
+        device const float *yp = xt + ib * 256 + ib32 * 32 + j * 8;
+        float y[8];
+        for (uint i = 0; i < 8; i++) y[i] = yp[i];
+        for (uint r = 0; r < NR; r++) {
+            if (row0 + r >= out_rows) break;
+            const uint64_t off = (uint64_t)(row0 + r) * row_bytes + (uint64_t)ib * 66;
+            QWEN4_IQ2_ACC_TG(accg[r], gb + off, ib32, j, y);
+            QWEN4_IQ2_ACC_TG(accu[r], ub + off, ib32, j, y);
+        }
+    }
+}
+
 template <uint NR>
 static inline void qwen4_iq2_mid_rows(device const char *gb, device const char *ub, uint row_bytes,
                                       uint row0, uint out_rows, device const float *xt, uint in_dim,
@@ -3483,23 +3531,31 @@ static inline void qwen4_kdown_rows(device const char *db, uint row_bytes, uint 
         for (uint ib = 0; ib < nb; ib++) {
             const uint e0 = ib * 256u + group * 32u + l;
             if (e0 >= in_dim) continue;   /* every element of the lane is in the tail */
-            device const float *yp = m + e0;
-            float y[8];
-            for (uint i = 0; i < 8; i++) y[i] = e0 + i < in_dim ? yp[i] : 0.0f;
+            /* in_dim % 8 == 0 (host), so the lane's eight elements are all in */
+            const float4 ya = ((device const float4 *)(m + e0))[0], yb = ((device const float4 *)(m + e0))[1];
+            const float y[8] = { ya.x, ya.y, ya.z, ya.w, yb.x, yb.y, yb.z, yb.w };
             for (uint r = 0; r < NR; r++) {
                 if (row0 + r >= out_rows) break;
                 device const uchar *blk = (device const uchar *)(db + (uint64_t)(row0 + r) * row_bytes + (uint64_t)ib * 144);
-                const float d = (float)(*(device const half *)blk);
-                const float dmin = (float)(*(device const half *)(blk + 2));
+                const half2 dd = *(device const half2 *)blk;
+                const float d = (float)dd.x;
+                const float dmin = (float)dd.y;
                 device const uchar *sc = blk + 4;
                 uint s, mn;
                 if (group < 4) { s = sc[group] & 63u; mn = sc[group + 4] & 63u; }
                 else { s = (sc[group + 4] & 0xFu) | ((sc[group - 4] & 0xC0u) >> 2); mn = (sc[group + 4] >> 4) | ((sc[group] & 0xC0u) >> 2); }
                 const float ds = d * (float)s, dm = dmin * (float)mn;
-                device const uchar *qs = blk + 16 + (group >> 1) * 32 + l;
+                /* 144-byte blocks in 16-byte aligned rows: the lane's eight bytes load
+                 * as one uint2.  The word extraction changes how the backend fuses the
+                 * chain, so it is spelled out as the byte loop compiles:
+                 * acc = fma(fma(ds, q, -dm), y, acc). */
+                const uint2 qv = *(device const uint2 *)(blk + 16 + (group >> 1) * 32 + l);
                 for (uint i = 0; i < 8; i++) {
-                    if (e0 + i >= in_dim) continue;
-                    acc[r] += (ds * (float)((qs[i] >> shift) & 0xFu) - dm) * y[i];
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+                    const uint qb = ((i < 4 ? qv.x : qv.y) >> (8u * (i & 3u))) & 0xFFu;
+                    const float qf = (float)((qb >> shift) & 0xFu);
+                    acc[r] = fma(fma(ds, qf, -dm), y[i], acc[r]);
                 }
             }
         }
@@ -3508,18 +3564,29 @@ static inline void qwen4_kdown_rows(device const char *db, uint row_bytes, uint 
         const uint q_base = 32u * (group / 8u) + 16u * (group & 1u), shift = ((group / 2u) & 3u) * 2u;
         for (uint ib = 0; ib < nb; ib++) {
             if (ib * 256u + group * 16u + l >= in_dim) continue;
-            device const float *yp = m + ib * 256 + group * 16 + l;
-            float y[8];
-            for (uint i = 0; i < 8; i++) y[i] = yp[i];
+            device const float4 *yp = (device const float4 *)(m + ib * 256 + group * 16 + l);
+            const float4 ya = yp[0], yb = yp[1];
+            const float y[8] = { ya.x, ya.y, ya.z, ya.w, yb.x, yb.y, yb.z, yb.w };
             for (uint r = 0; r < NR; r++) {
                 if (row0 + r >= out_rows) break;
                 device const uchar *blk = (device const uchar *)(db + (uint64_t)(row0 + r) * row_bytes + (uint64_t)ib * 84);
-                const float d = (float)(*(device const half *)(blk + 80));
-                const float dmin = (float)(*(device const half *)(blk + 82));
+                const half2 dd = *(device const half2 *)(blk + 80);
+                const float d = (float)dd.x;
+                const float dmin = (float)dd.y;
                 const uint sc = blk[group];
                 const float ds = d * (float)(sc & 0xFu), dm = dmin * (float)(sc >> 4);
-                device const uchar *qs = blk + 16 + q_base + l;
-                for (uint i = 0; i < 8; i++) acc[r] += (ds * (float)((qs[i] >> shift) & 3u) - dm) * y[i];
+                /* 84-byte blocks are only 4-byte aligned: two word loads.  The word
+                 * extraction changes how the backend fuses the chain, so it is
+                 * spelled out as the byte loop compiles: acc = fma(fma(ds, q, -dm), y, acc). */
+                device const uint *qw = (device const uint *)(blk + 16 + q_base + l);
+                const uint q0 = qw[0], q1 = qw[1];
+                for (uint i = 0; i < 8; i++) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+                    const uint qb = ((i < 4 ? q0 : q1) >> (8u * (i & 3u))) & 0xFFu;
+                    const float qf = (float)((qb >> shift) & 3u);
+                    acc[r] = fma(fma(ds, qf, -dm), y[i], acc[r]);
+                }
             }
         }
     }
@@ -3545,7 +3612,8 @@ static inline void qwen4_kdown_rows(device const char *db, uint row_bytes, uint 
 
 #define QWEN4_MR_MID_ROUTED(NR_, GB_, UB_) do { \
     float accg[NR_], accu[NR_]; \
-    qwen4_iq2_mid_rows<NR_>((GB_), (UB_), args.row_bytes, row0, args.out_rows, xt, dim, tiisg, accg, accu); \
+    qwen4_iq2_mid_rows_tg<NR_>((GB_), (UB_), args.row_bytes, row0, args.out_rows, xt, dim, tiisg, accg, accu, \
+                               tg_grid, tg_signs); \
     for (uint r = 0; r < (NR_) && row0 + r < args.out_rows; r++) { \
         const float g = simd_sum(accg[r]); \
         const float u = simd_sum(accu[r]); \
@@ -3567,6 +3635,7 @@ kernel void kernel_qwen4_moe_mid_iq2(
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]],
         ushort3 ntg [[threads_per_threadgroup]]) {
+    QWEN4_IQ2_TG_TABLES()
     QWEN4_MR_PRELUDE(NR)
     device const float *xt = x + (uint64_t)tok * args.in_dim;
     device float *mo = mid + ((uint64_t)tok * n_out + slot) * args.out_rows;
@@ -3590,6 +3659,7 @@ kernel void kernel_qwen4_moe_mid_iq2_addr(
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]],
         ushort3 ntg [[threads_per_threadgroup]]) {
+    QWEN4_IQ2_TG_TABLES()
     QWEN4_MR_PRELUDE(NR)
     const bool shared = slot == args.n_slots;
     const int32_t expert = shared ? -1 : selected[(uint64_t)tok * args.n_slots + slot];
@@ -3680,6 +3750,8 @@ kernel void kernel_qwen4_moe_down_k_addr(
     device const char *, uint3, ushort, ushort, ushort3
 #define QWEN4_MR_DOWN_ADDR_SIG device const uint64_t *, device const int32_t *, device const float *, \
     device float *, device const char *, device const uint *, uint3, ushort, ushort, ushort3
+template [[host_name("kernel_qwen4_moe_mid_iq2_nr1")]] kernel void kernel_qwen4_moe_mid_iq2<1>(constant ds4_metal_args_qwen4_moe &, QWEN4_MR_MID_SIG);
+template [[host_name("kernel_qwen4_moe_mid_iq2_addr_nr1")]] kernel void kernel_qwen4_moe_mid_iq2_addr<1>(constant ds4_metal_args_qwen4_moe &, QWEN4_MR_MID_ADDR_SIG);
 template [[host_name("kernel_qwen4_moe_mid_iq2_nr2")]] kernel void kernel_qwen4_moe_mid_iq2<2>(constant ds4_metal_args_qwen4_moe &, QWEN4_MR_MID_SIG);
 template [[host_name("kernel_qwen4_moe_mid_iq2_nr4")]] kernel void kernel_qwen4_moe_mid_iq2<4>(constant ds4_metal_args_qwen4_moe &, QWEN4_MR_MID_SIG);
 template [[host_name("kernel_qwen4_moe_mid_iq2_addr_nr2")]] kernel void kernel_qwen4_moe_mid_iq2_addr<2>(constant ds4_metal_args_qwen4_moe &, QWEN4_MR_MID_ADDR_SIG);
