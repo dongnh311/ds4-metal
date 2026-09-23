@@ -2031,14 +2031,21 @@ static int check_router_log(const char *path, const char *prompt_path) {
     REQUIRE(imatrix_read_text_file(prompt_path, &prompt, &prompt_bytes));
     REQUIRE(ds4_engine_open(&engine, &opt) == 0);
     ds4_tokenize_text(engine, prompt, &tokens);
-    REQUIRE(tokens.len > PREFIX + STEPS);
+    REQUIRE(tokens.len > PREFIX + 1 + STEPS);
     REQUIRE(ds4_session_create(&control, engine, 4096) == 0);
     REQUIRE(ds4_session_create(&candidate, engine, 4096) == 0);
     ds4_tokens input = {.v = tokens.v, .len = PREFIX, .cap = PREFIX};
     REQUIRE(ds4_session_sync(control, &input, err, sizeof(err)) == 0);
     REQUIRE(ds4_session_sync(candidate, &input, err, sizeof(err)) == 0);
+    /* Exercise the single-token prefill fallback with the log ON: it must not
+     * be recorded as a decoded token. */
+    ds4_tokens input2 = {.v = tokens.v, .len = PREFIX + 1, .cap = PREFIX + 1};
+    unsetenv("DS4_V41_ROUTER_LOG");
+    REQUIRE(ds4_session_sync(control, &input2, err, sizeof(err)) == 0);
+    setenv("DS4_V41_ROUTER_LOG", log_path, 1);
+    REQUIRE(ds4_session_sync(candidate, &input2, err, sizeof(err)) == 0);
     for (int step = 0; step < STEPS; step++) {
-        const int token = tokens.v[PREFIX + step];
+        const int token = tokens.v[PREFIX + 1 + step];
         unsetenv("DS4_V41_ROUTER_LOG");
         REQUIRE(ds4_session_eval(control, token, err, sizeof(err)) == 0);
         setenv("DS4_V41_ROUTER_LOG", log_path, 1);
@@ -2055,6 +2062,7 @@ static int check_router_log(const char *path, const char *prompt_path) {
         const int n = sscanf(line, "%u %u %d %d %d %d %d %d", &pos, &layer,
                              &e[0], &e[1], &e[2], &e[3], &e[4], &e[5]);
         REQUIRE(n == 2 + (int)DS4_N_EXPERT_USED && layer == lines % DS4_N_LAYER);
+        REQUIRE(pos == (unsigned)(PREFIX + 1) + lines / DS4_N_LAYER);
         for (int i = 0; i < n - 2; i++) {
             REQUIRE(e[i] >= 0 && (uint32_t)e[i] < DS4_N_EXPERT);
             for (int j = 0; j < i; j++) REQUIRE(e[i] != e[j]);

@@ -41621,6 +41621,10 @@ static void ds41_router_log_flush(uint32_t pos) {
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+    /* The router log records decoded tokens only: the single-token prefill
+     * fallback and imatrix collection also reach this function with
+     * logits == NULL (or g->imatrix set) and are not decoded tokens. */
+    const bool log_route = logits != NULL && !g->imatrix;
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
@@ -41675,7 +41679,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = ds41_graph_layer(g, m, l, il, token);
 #endif
         }
-        if (ok) ds41_router_log_capture(g, il);
+        if (ok && log_route) ds41_router_log_capture(g, il);
         g->engram_rows = engram_input;
         /* Separate Engram inputs let resident layers remain queued until the
          * completed token reaches the CPU.
@@ -41699,7 +41703,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = ds4_gpu_begin_commands() != 0;
     }
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
-    if (ok) ds41_router_log_flush(g->pos);
+    if (ok && log_route) ds41_router_log_flush(g->pos);
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
     if (ok && logits) ok = queued_logits ?
