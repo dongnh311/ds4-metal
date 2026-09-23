@@ -2084,7 +2084,29 @@ done:
 }
 #endif
 
+static int check_decode_profile_format(void) {
+    int rc = 1;
+    char line[256];
+    const ds41_decode_profile p = {.tokens = 2, .step_ms = 200.0, .engram_ms = 2.0,
+        .gpu_ms = 120.0, .pread_ms = 30.0, .pread_bytes = UINT64_C(6) << 20,
+        .hits = 100, .misses = 20};
+    FILE *fp = tmpfile();
+    REQUIRE(fp);
+    ds41_decode_profile_print(fp, &p);
+    rewind(fp);
+    REQUIRE(fgets(line, sizeof(line), fp));
+    REQUIRE(!strcmp(line, "ds4: V4.1 decode profile: tokens=2 step_ms=100.000 engram_ms=1.000 "
+                          "gpu_busy_ms=60.000 pread_ms=15.000 pread_mib=3.000 hits=50.00 misses=10.00\n"));
+    fprintf(stderr, "V4.1 decode profile format PASS\n");
+    rc = 0;
+done:
+    if (fp) fclose(fp);
+    return rc;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--decode-profile-format"))
+        return check_decode_profile_format();
     if (argc == 2 && !strcmp(argv[1], "--router-log-format"))
         return check_router_log_format();
 #ifdef __APPLE__

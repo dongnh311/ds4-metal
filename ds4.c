@@ -41618,6 +41618,26 @@ static void ds41_router_log_flush(uint32_t pos) {
     g_ds41_router_log_layers = 0;
 }
 
+/* Diagnostic (V4.1 Phase 0): DS4_V41_DECODE_PROFILE=1 prints, every 64
+ * decoded tokens, per-token averages since the first one: step wall time,
+ * Engram read time, GPU busy time (with DS4_METAL_GPU_BUSY_PROFILE=1) and the
+ * streaming expert cache's pread time, bytes, hits and misses. */
+typedef struct {
+    uint64_t tokens, pread_bytes, hits, misses;
+    double step_ms, engram_ms, gpu_ms, pread_ms;
+} ds41_decode_profile;
+
+static ds41_decode_profile g_ds41_decode_profile;
+
+static void ds41_decode_profile_print(FILE *fp, const ds41_decode_profile *p) {
+    const double n = p->tokens ? (double)p->tokens : 1.0;
+    fprintf(fp, "ds4: V4.1 decode profile: tokens=%llu step_ms=%.3f engram_ms=%.3f "
+            "gpu_busy_ms=%.3f pread_ms=%.3f pread_mib=%.3f hits=%.2f misses=%.2f\n",
+            (unsigned long long)p->tokens, p->step_ms / n, p->engram_ms / n,
+            p->gpu_ms / n, p->pread_ms / n, (double)p->pread_bytes / n / 1048576.0,
+            (double)p->hits / n, (double)p->misses / n);
+}
+
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
@@ -41628,6 +41648,17 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    const bool profile = log_route && getenv("DS4_V41_DECODE_PROFILE") != NULL;
+    uint64_t hits0 = 0, misses0 = 0, pread_bytes0 = 0;
+    double pread_ms0 = 0.0;
+    const double step_t0 = profile ? now_sec() : 0.0;
+    const double gpu_ms0 = profile ? ds4_gpu_busy_accum_ms() : 0.0;
+    if (profile) ds4_gpu_stream_expert_cache_counters(&hits0, &misses0, &pread_bytes0, &pread_ms0);
+#endif
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    const double engram_t0 = profile ? now_sec() : 0.0;
+#endif
 #ifdef __APPLE__
     const bool parallel = !ds41_image_at(g, g->pos) &&
         !getenv("DS4_METAL_DISABLE_V41_ENGRAM_PARALLEL");
@@ -41643,6 +41674,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (!ds4_engram_read(&g->table[i], ids[i], DS4_ENGRAM_COLS, g->rows[i])) return false;
 #endif
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    const double engram_s = profile ? now_sec() - engram_t0 : 0.0;
+#endif
     const float initial_pre[] = {1, 0, 0, 0};
     if (!ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) ||
         !ds4_gpu_begin_commands()) return false;
@@ -41713,6 +41747,23 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         g->valid = false;
         return false;
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (profile) {
+        ds41_decode_profile *p = &g_ds41_decode_profile;
+        uint64_t hits = 0, misses = 0, pread_bytes = 0;
+        double pread_ms = 0.0;
+        ds4_gpu_stream_expert_cache_counters(&hits, &misses, &pread_bytes, &pread_ms);
+        p->tokens++;
+        p->step_ms += (now_sec() - step_t0) * 1e3;
+        p->engram_ms += engram_s * 1e3;
+        p->gpu_ms += ds4_gpu_busy_accum_ms() - gpu_ms0;
+        p->pread_ms += pread_ms - pread_ms0;
+        p->pread_bytes += pread_bytes - pread_bytes0;
+        p->hits += hits - hits0;
+        p->misses += misses - misses0;
+        if (p->tokens % 64u == 0u) ds41_decode_profile_print(stderr, p);
+    }
+#endif
     g->history = next_history;
     g->pos++;
     return true;

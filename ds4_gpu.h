@@ -449,6 +449,12 @@ int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
 #endif
 void ds4_gpu_print_memory_report(const char *label);
 
+/* Diagnostics: cumulative GPU busy time of waited command buffers (only while
+ * DS4_METAL_GPU_BUSY_PROFILE is set) and streaming expert-cache counters. */
+double ds4_gpu_busy_accum_ms(void);
+void ds4_gpu_stream_expert_cache_counters(uint64_t *hits, uint64_t *misses,
+                                          uint64_t *pread_bytes, double *pread_ms);
+
 #include "ds4_gpu_tp.h"
 /* Skip the whole-file model residency set (TP sharding: only the
  * owned ranges are warmed; the rest must never be paged in). Call before

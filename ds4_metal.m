@@ -13571,6 +13571,18 @@ static void ds4_gpu_stream_expert_cache_note_pread(
     }
 }
 
+double ds4_gpu_busy_accum_ms(void) {
+    return g_gpu_busy_accum * 1000.0;
+}
+
+void ds4_gpu_stream_expert_cache_counters(uint64_t *hits, uint64_t *misses,
+                                          uint64_t *pread_bytes, double *pread_ms) {
+    if (hits) *hits = g_stream_expert_cache_hits;
+    if (misses) *misses = g_stream_expert_cache_misses;
+    if (pread_bytes) *pread_bytes = g_stream_expert_cache_pread_bytes;
+    if (pread_ms) *pread_ms = g_stream_expert_cache_pread_ms;
+}
+
 static uint32_t ds4_gpu_stream_expert_pread_thread_limit(void) {
     uint32_t threads = 9;
     const char *env = getenv("DS4_METAL_STREAMING_EXPERT_PREAD_THREADS");
