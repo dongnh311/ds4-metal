@@ -18,6 +18,7 @@ _SCALAR = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?
            10: "<Q", 11: "<q", 12: "<d"}
 _STRING, _ARRAY = 8, 9
 ROUTED = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
+SITE_NORM = re.compile(r"^(output_norm|blk\.\d+\.(attn|ffn)_norm)\.weight$")
 
 
 class _Reader:
@@ -87,14 +88,18 @@ def tensor_sizes(tensors, data_start, file_bytes):
 def role(name):
     if name == "token_embd.weight":
         return "embedding"
+    if SITE_NORM.match(name):
+        return "norm"
     if ROUTED.match(name):
         return "routed"
     if name.endswith(".engram_embd.weight"):
         return "engram_disk"
+    if ".indexer.attn_k." in name or ".indexer.k_norm." in name:
+        return "compressor"
     if name.startswith("output"):
         return "output"
     for key, label in (("_shexp", "shared"), ("ffn_gate_inp", "router"), ("exp_probs", "router"),
-                       ("indexer", "indexer"), ("compressor", "compressor"), (".hc_", "hc"),
+                       ("indexer", "indexer"), ("compressor", "compressor"), (".hc_", "mhc"),
                        (".engram_", "engram"), (".attn", "attention"), ("norm", "norm")):
         if key in name:
             return label

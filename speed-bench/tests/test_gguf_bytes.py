@@ -99,14 +99,17 @@ class RoleTest(unittest.TestCase):
         cases = {
             "blk.3.indexer.attn_q_b.weight": "indexer",
             "blk.3.attn_compressor_norm.weight": "compressor",
-            "blk.3.hc_attn_fn.weight": "hc",
+            "blk.3.hc_attn_fn.weight": "mhc",
             "blk.3.ffn_gate_shexp.weight": "shared",
             "blk.3.ffn_exp_probs_b.bias": "router",
             "blk.3.ffn_gate_inp.weight": "router",
             "blk.3.engram_kv.weight": "engram",
             "blk.3.attn_q_a_norm.weight": "attention",
+            "output_norm.weight": "norm",
+            "blk.3.attn_norm.weight": "norm",
             "blk.3.ffn_norm.weight": "norm",
-            "output_norm.weight": "output",
+            "blk.3.indexer.attn_k.weight": "compressor",
+            "blk.3.indexer.k_norm.weight": "compressor",
         }
         for name, want in cases.items():
             self.assertEqual(gguf_bytes.role(name), want, name)
