@@ -41603,8 +41603,13 @@ static void ds41_router_log_capture(ds41_gpu_graph *g, uint32_t il) {
             return;
         }
     }
-    if (ds4_gpu_tensor_copy(g_ds41_router_log_buf, il * row, g->selected, 0, row))
+    if (ds4_gpu_tensor_copy(g_ds41_router_log_buf, il * row, g->selected, 0, row)) {
         g_ds41_router_log_layers = il + 1u;
+        return;
+    }
+    fprintf(stderr, "ds4: V4.1 router log copy failed at layer %u; router log disabled\n", il);
+    g_ds41_router_log_failed = true;
+    g_ds41_router_log_layers = 0;
 }
 
 static void ds41_router_log_flush(uint32_t pos) {
