@@ -1986,13 +1986,107 @@ done:
 
 #endif
 
+static int check_router_log_format(void) {
+    int rc = 1;
+    char line[128];
+    const int32_t ids[6] = {5, 17, 383, 0, 1, 2};
+    FILE *fp = tmpfile();
+    REQUIRE(fp);
+    ds41_router_log_write(fp, 42, ids, 2, 3);
+    rewind(fp);
+    REQUIRE(fgets(line, sizeof(line), fp) && !strcmp(line, "42 0 5 17 383\n"));
+    REQUIRE(fgets(line, sizeof(line), fp) && !strcmp(line, "42 1 0 1 2\n"));
+    REQUIRE(!fgets(line, sizeof(line), fp));
+    /* An unwritable path disables the logger once; decode must not care. */
+    setenv("DS4_V41_ROUTER_LOG", "/nonexistent-dir/router.log", 1);
+    REQUIRE(!ds41_router_log_on());
+    REQUIRE(!ds41_router_log_on());
+    unsetenv("DS4_V41_ROUTER_LOG");
+    fprintf(stderr, "V4.1 router log format PASS\n");
+    rc = 0;
+done:
+    unsetenv("DS4_V41_ROUTER_LOG");
+    if (fp) fclose(fp);
+    return rc;
+}
+
+#ifdef __APPLE__
+static int check_router_log(const char *path, const char *prompt_path) {
+    ds4_engine *engine = NULL;
+    ds4_session *control = NULL, *candidate = NULL;
+    ds4_tokens tokens = {0};
+    char *prompt = NULL, err[256] = "", log_path[] = "/tmp/ds41_router_log_XXXXXX";
+    size_t prompt_bytes;
+    FILE *fp = NULL;
+    uint32_t lines = 0;
+    int rc = 1;
+    enum { PREFIX = 511, STEPS = 32 };
+    const int fd = mkstemp(log_path);
+    ds4_engine_options opt = {.model_path = path, .backend = DS4_BACKEND_METAL,
+        .context_size = 4096, .power_percent = 100, .ssd_streaming = true,
+        .ssd_streaming_cache_bytes = UINT64_C(8) << 30};
+    REQUIRE(fd >= 0);
+    close(fd);
+    unsetenv("DS4_V41_ROUTER_LOG");
+    REQUIRE(imatrix_read_text_file(prompt_path, &prompt, &prompt_bytes));
+    REQUIRE(ds4_engine_open(&engine, &opt) == 0);
+    ds4_tokenize_text(engine, prompt, &tokens);
+    REQUIRE(tokens.len > PREFIX + STEPS);
+    REQUIRE(ds4_session_create(&control, engine, 4096) == 0);
+    REQUIRE(ds4_session_create(&candidate, engine, 4096) == 0);
+    ds4_tokens input = {.v = tokens.v, .len = PREFIX, .cap = PREFIX};
+    REQUIRE(ds4_session_sync(control, &input, err, sizeof(err)) == 0);
+    REQUIRE(ds4_session_sync(candidate, &input, err, sizeof(err)) == 0);
+    for (int step = 0; step < STEPS; step++) {
+        const int token = tokens.v[PREFIX + step];
+        unsetenv("DS4_V41_ROUTER_LOG");
+        REQUIRE(ds4_session_eval(control, token, err, sizeof(err)) == 0);
+        setenv("DS4_V41_ROUTER_LOG", log_path, 1);
+        REQUIRE(ds4_session_eval(candidate, token, err, sizeof(err)) == 0);
+        REQUIRE(!memcmp(control->logits, candidate->logits, DS4_N_VOCAB * sizeof(float)));
+    }
+    unsetenv("DS4_V41_ROUTER_LOG");
+    REQUIRE((fp = fopen(log_path, "r")) != NULL);
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        if (line[0] == '#') continue;
+        unsigned pos, layer;
+        int e[6];
+        const int n = sscanf(line, "%u %u %d %d %d %d %d %d", &pos, &layer,
+                             &e[0], &e[1], &e[2], &e[3], &e[4], &e[5]);
+        REQUIRE(n == 2 + (int)DS4_N_EXPERT_USED && layer == lines % DS4_N_LAYER);
+        for (int i = 0; i < n - 2; i++) {
+            REQUIRE(e[i] >= 0 && (uint32_t)e[i] < DS4_N_EXPERT);
+            for (int j = 0; j < i; j++) REQUIRE(e[i] != e[j]);
+        }
+        lines++;
+    }
+    REQUIRE(lines == (uint32_t)STEPS * DS4_N_LAYER);
+    fprintf(stderr, "V4.1 router log: %u lines; logits identical with and without it PASS\n", lines);
+    rc = 0;
+done:
+    if (err[0]) fprintf(stderr, "%s\n", err);
+    unsetenv("DS4_V41_ROUTER_LOG");
+    if (fp) fclose(fp);
+    unlink(log_path);
+    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    ds4_session_free(candidate); ds4_session_free(control); ds4_engine_close(engine);
+    ds4_tokens_free(&tokens); free(prompt);
+    return rc;
+}
+#endif
+
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--router-log-format"))
+        return check_router_log_format();
 #ifdef __APPLE__
     if (argc == 2 && !strcmp(argv[1], "--engram-reads")) return test_parallel_engram();
     if (argc == 4 && !strcmp(argv[2], "--engram-parallel"))
         return check_decode_control(argv[1], argv[3], false, "DS4_METAL_DISABLE_V41_ENGRAM_PARALLEL");
     if (argc == 4 && !strcmp(argv[2], "--engram-parallel-ssd"))
         return check_decode_control(argv[1], argv[3], true, "DS4_METAL_DISABLE_V41_ENGRAM_PARALLEL");
+    if (argc == 4 && !strcmp(argv[2], "--router-log"))
+        return check_router_log(argv[1], argv[3]);
 #endif
 
     if (argc == 2 && !strcmp(argv[1], "--batch-admission"))

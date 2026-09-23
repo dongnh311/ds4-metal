@@ -41555,6 +41555,69 @@ static bool ds41_engram_parallel(const ds4_engram_table *tables, const uint32_t 
 }
 #endif
 
+/* Diagnostic (V4.1 Phase 0): DS4_V41_ROUTER_LOG=<path> writes one line per
+ * decoded token and layer, "pos layer e0 .. e{k-1}", for offline routing
+ * locality analysis. Off by default. Each layer's `selected` is blitted into
+ * a log buffer inside the active command buffer and read once per token after
+ * the final drain, so the log adds no synchronization and cannot change
+ * outputs. An unwritable path disables it after one error. */
+static FILE *g_ds41_router_log_fp;
+static ds4_gpu_tensor *g_ds41_router_log_buf;
+static int32_t *g_ds41_router_log_host;
+static uint32_t g_ds41_router_log_layers;
+static bool g_ds41_router_log_failed;
+
+static void ds41_router_log_write(FILE *fp, uint32_t pos, const int32_t *ids,
+                                  uint32_t n_layer, uint32_t k) {
+    for (uint32_t il = 0; il < n_layer; il++) {
+        fprintf(fp, "%u %u", pos, il);
+        for (uint32_t i = 0; i < k; i++) fprintf(fp, " %d", ids[il * k + i]);
+        fputc('\n', fp);
+    }
+}
+
+static bool ds41_router_log_on(void) {
+    const char *path = getenv("DS4_V41_ROUTER_LOG");
+    if (!path || !path[0] || g_ds41_router_log_failed) return false;
+    if (!g_ds41_router_log_fp) {
+        g_ds41_router_log_fp = fopen(path, "w");
+        if (!g_ds41_router_log_fp) {
+            fprintf(stderr, "ds4: cannot open DS4_V41_ROUTER_LOG=%s; router log disabled\n", path);
+            g_ds41_router_log_failed = true;
+            return false;
+        }
+        fprintf(g_ds41_router_log_fp, "# pos layer e0..e%u\n", DS4_N_EXPERT_USED - 1u);
+    }
+    return true;
+}
+
+static void ds41_router_log_capture(ds41_gpu_graph *g, uint32_t il) {
+    if (!ds41_router_log_on()) return;
+    const uint64_t row = (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t);
+    if (!g_ds41_router_log_buf) {
+        g_ds41_router_log_buf = ds4_gpu_tensor_alloc((uint64_t)DS4_N_LAYER * row);
+        g_ds41_router_log_host = malloc((size_t)DS4_N_LAYER * row);
+        if (!g_ds41_router_log_buf || !g_ds41_router_log_host) {
+            fprintf(stderr, "ds4: V4.1 router log buffers unavailable; router log disabled\n");
+            g_ds41_router_log_failed = true;
+            return;
+        }
+    }
+    if (ds4_gpu_tensor_copy(g_ds41_router_log_buf, il * row, g->selected, 0, row))
+        g_ds41_router_log_layers = il + 1u;
+}
+
+static void ds41_router_log_flush(uint32_t pos) {
+    if (!ds41_router_log_on() || !g_ds41_router_log_buf || !g_ds41_router_log_layers) return;
+    const uint64_t row = (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t);
+    if (ds4_gpu_tensor_read(g_ds41_router_log_buf, 0, g_ds41_router_log_host,
+                            g_ds41_router_log_layers * row))
+        ds41_router_log_write(g_ds41_router_log_fp, pos, g_ds41_router_log_host,
+                              g_ds41_router_log_layers, DS4_N_EXPERT_USED);
+    fflush(g_ds41_router_log_fp);
+    g_ds41_router_log_layers = 0;
+}
+
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
@@ -41612,6 +41675,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = ds41_graph_layer(g, m, l, il, token);
 #endif
         }
+        if (ok) ds41_router_log_capture(g, il);
         g->engram_rows = engram_input;
         /* Separate Engram inputs let resident layers remain queued until the
          * completed token reaches the CPU.
@@ -41635,6 +41699,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = ds4_gpu_begin_commands() != 0;
     }
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    if (ok) ds41_router_log_flush(g->pos);
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
     if (ok && logits) ok = queued_logits ?
