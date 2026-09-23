@@ -6,8 +6,10 @@ import re
 import statistics
 import subprocess
 import threading
+import time
 
 GIB = 1024 ** 3
+IDLE_WIRED_LIMIT_GIB = 8.0
 _PAGE_RE = re.compile(r"page size of (\d+) bytes")
 _WIRED_RE = re.compile(r"^Pages wired down:\s+(\d+)\.", re.M)
 
@@ -31,23 +33,54 @@ def summarize(samples):
             "n": len(samples)}
 
 
+def window_summary(timed, t_start, t_end, min_samples=3):
+    """Steady state from samples inside [t_start, t_end]; falls back to the
+    second-half median of all samples when fewer than `min_samples` fall
+    inside the window. `timed` is a list of (monotonic time, bytes)."""
+    if not timed:
+        raise ValueError("no wired samples")
+    all_bytes = [b for _, b in timed]
+    in_window = [b for t, b in timed if t_start <= t <= t_end]
+    if len(in_window) >= min_samples:
+        steady = statistics.median(in_window)
+        window = "decode"
+    else:
+        tail = all_bytes[len(all_bytes) // 2:]
+        steady = statistics.median(tail)
+        window = "fallback"
+    return {"steady_gib": steady / GIB, "peak_gib": max(all_bytes) / GIB,
+            "window": window, "n": len(all_bytes)}
+
+
 def _read_vm_stat():
     return subprocess.run(["vm_stat"], capture_output=True, text=True, check=True).stdout
+
+
+def idle_gib(read=None):
+    """Wired GiB from one vm_stat sample, taken before a run starts."""
+    read = read or _read_vm_stat
+    return parse_vm_stat(read()) / GIB
 
 
 class WiredSampler:
     """Samples vm_stat every `interval` seconds while inside a `with` block."""
 
-    def __init__(self, interval=0.5, read=None):
+    def __init__(self, interval=0.5, read=None, on_sample=None):
         self.interval = interval
         self.read = read or _read_vm_stat
+        self.on_sample = on_sample
         self.samples = []
+        self.timed = []
         self._stop = threading.Event()
         self._thread = None
 
     def _run(self):
         while not self._stop.is_set():
-            self.samples.append(parse_vm_stat(self.read()))
+            value = parse_vm_stat(self.read())
+            self.samples.append(value)
+            self.timed.append((time.monotonic(), value))
+            if self.on_sample is not None:
+                self.on_sample(value)
             self._stop.wait(self.interval)
 
     def __enter__(self):

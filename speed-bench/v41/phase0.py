@@ -16,6 +16,8 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -41,10 +43,12 @@ PLANS = {
 ENV = {"DS4_V41_DECODE_PROFILE": "1", "DS4_METAL_GPU_BUSY_PROFILE": "1",
        "DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY": "1"}
 SWAP_LIMIT_MIB = 256.0
+DECODE_MARGIN_S = 1.0
 FIELDS = ["workload", "ctx", "cache_gb", "gen", "prefill_tps", "gen_tps", "gen_steady_tps",
           "gen_first_ms", "step_ms", "gpu_busy_ms", "pread_ms", "engram_ms", "host_gap_ms",
           "pread_mib", "hits", "misses", "decode_hit_rate", "cache_experts", "cache_hit_rate",
-          "wired_steady_gib", "wired_peak_gib", "swap_delta_mib", "contaminated", "router_log"]
+          "wired_steady_gib", "wired_peak_gib", "wired_window", "wired_idle_gib",
+          "swap_delta_mib", "contaminated", "router_log"]
 PROFILE_RE = re.compile(
     r"ds4: V4\.1 decode profile: tokens=(\d+) step_ms=([\d.]+) engram_ms=([\d.]+) "
     r"gpu_busy_ms=([\d.]+) pread_ms=([\d.]+) pread_mib=([\d.]+) hits=([\d.]+) misses=([\d.]+)")
@@ -112,6 +116,7 @@ def combine(spec, bench, profile, cache, wired_summary, swap_delta_mib, contamin
     row = {"workload": workload, "ctx": ctx, "cache_gb": gb, "gen": gen, **bench,
            "wired_steady_gib": wired_summary["steady_gib"],
            "wired_peak_gib": wired_summary["peak_gib"],
+           "wired_window": wired_summary.get("window"),
            "swap_delta_mib": swap_delta_mib, "contaminated": contaminated}
     if profile:
         for key in ("step_ms", "engram_ms", "gpu_busy_ms", "pread_ms", "pread_mib",
@@ -124,13 +129,21 @@ def combine(spec, bench, profile, cache, wired_summary, swap_delta_mib, contamin
     return row
 
 
+def _fail_router_log(router_log):
+    """On any failure after the child started, keep a failed run's router log
+    around under a distinct name so it is never mistaken for a good one."""
+    if router_log and os.path.exists(router_log):
+        os.replace(router_log, router_log + ".failed")
+
+
 def run_one(bin_dir, model, prompts_dir, out_dir, spec, dry_run=False,
             running=machine.ds4_running, swap=machine.swap_used_mib,
-            sampler=wired.WiredSampler):
+            sampler=wired.WiredSampler, idle_read=None):
     workload, ctx, gb, gen, log_router = spec
     tag = f"{workload}-c{ctx}-g{gb}-n{gen}"
     result_path = os.path.join(out_dir, tag + ".result.json")
     csv_path = os.path.join(out_dir, tag + ".csv")
+    router_log = os.path.join(out_dir, tag + ".router.log") if log_router else None
     cmd = bench_cmd(bin_dir, model, os.path.join(prompts_dir, workload + ".txt"),
                     ctx, gen, gb, csv_path)
     if dry_run:
@@ -139,32 +152,71 @@ def run_one(bin_dir, model, prompts_dir, out_dir, spec, dry_run=False,
     if os.path.exists(result_path):
         print("phase0: skip (done)", tag)
         return None
+    idle = wired.idle_gib(read=idle_read)
+    if idle > wired.IDLE_WIRED_LIMIT_GIB:
+        raise SystemExit(f"phase0: {idle:.1f} GiB wired before the run; the machine is not idle")
     busy = running()
     if busy:
         raise SystemExit("phase0: ds4 is running; the machine must be free:\n" + busy)
-    env = dict(os.environ, **ENV)
-    router_log = os.path.join(out_dir, tag + ".router.log") if log_router else None
+    env = dict(os.environ)
+    env.pop("DS4_V41_ROUTER_LOG", None)
+    env.update(ENV)
     if router_log:
         env["DS4_V41_ROUTER_LOG"] = router_log
     stderr_path = os.path.join(out_dir, tag + ".stderr")
     swap0 = swap()
+    contam = {"hit": False}
+    stop_poll = threading.Event()
+
+    def poll(interval):
+        while not stop_poll.wait(interval):
+            try:
+                line = running()
+            except StopIteration:
+                # A test's finite fake `running()` iterator was exhausted by
+                # this background poll; stop watching rather than crash the
+                # thread. Real callers (machine.ds4_running) never raise this.
+                return
+            if line and csv_path not in line:
+                contam["hit"] = True
+
     with open(stderr_path, "w") as err, sampler() as ws:
+        interval = getattr(ws, "interval", 0.5)
+        poll_thread = threading.Thread(target=poll, args=(interval,), daemon=True)
+        poll_thread.start()
         rc = subprocess.run(cmd, env=env, stdout=err, stderr=err).returncode
+        t_exit = time.monotonic()
+        stop_poll.set()
+        poll_thread.join()
     if rc != 0:
+        _fail_router_log(router_log)
         raise SystemExit(f"phase0: {tag} failed (rc={rc}), see {stderr_path}")
-    contaminated = bool(running())
+    contaminated = contam["hit"] or bool(running())
     with open(stderr_path) as fp:
         stderr = fp.read()
     try:
         with open(csv_path) as fp:
             bench = parse_bench_csv(fp.read())
     except (OSError, ValueError) as exc:
+        _fail_router_log(router_log)
         raise SystemExit(f"phase0: {tag} produced no usable CSV ({exc}), see {stderr_path}")
-    row = combine(spec, bench, parse_profile(stderr), parse_cache(stderr), ws.summary(),
+    gen_tps = bench["gen_tps"]
+    if gen_tps > 0:
+        decode_s = gen / gen_tps
+        t_start = t_exit - DECODE_MARGIN_S - decode_s
+        t_end = t_exit - DECODE_MARGIN_S
+    else:
+        t_start, t_end = t_exit, t_exit - 1.0   # empty window -> forces fallback
+    wsum = wired.window_summary(ws.timed, t_start, t_end)
+    row = combine(spec, bench, parse_profile(stderr), parse_cache(stderr), wsum,
                   swap() - swap0, contaminated)
     row["router_log"] = router_log
-    with open(result_path, "w") as fp:
+    row["wired_idle_gib"] = idle
+    row["ds4_env"] = {k: v for k, v in env.items() if k.startswith("DS4_")}
+    tmp_path = result_path + ".tmp"
+    with open(tmp_path, "w") as fp:
         json.dump(row, fp, indent=1)
+    os.replace(tmp_path, result_path)
     print(f"phase0: done {tag} {row['gen_steady_tps']:.2f} t/s"
           + (" CONTAMINATED" if contaminated else ""))
     return row
@@ -188,6 +240,8 @@ def _flag(row):
         flags.append("swapped")
     if row.get("contaminated"):
         flags.append("contaminated")
+    if (row.get("host_gap_ms") or 0.0) < 0:
+        flags.append("overlap")
     return ", ".join(flags)
 
 
@@ -199,17 +253,24 @@ def report(rows, bytes_json, locality):
     """Markdown tables for RESULTS.md; `locality` entries carry a 'name' key."""
     roof = gguf_bytes.roofline(bytes_json, bytes_json.get("gbps", 290.0))
     lines = ["## Measured decode (per token)", "",
-             "| workload | ctx | cache GB | t/s | step ms | GPU busy | pread | Engram | host gaps "
-             "| hit rate | wired GiB | flags |",
-             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"]
+             "`host_gap_ms` is step_ms minus GPU busy, pread and Engram time: a residual, not a "
+             "direct measurement. It can go negative (flagged `overlap`) when pread overlaps GPU "
+             "work.", "",
+             "| workload | ctx | cache GB | gen | t/s | prefill t/s | TTFT ms | step ms | GPU busy "
+             "| pread | Engram | host gaps | hit rate | wired GiB | log | flags |",
+             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
+             "| ---: | ---: | --- | --- |"]
     for r in sorted(rows, key=lambda r: (r["workload"], r["ctx"], r["cache_gb"])):
         lines.append(
-            f"| {r['workload']} | {r['ctx']} | {r['cache_gb']} | {_fmt(r.get('gen_steady_tps'))} "
+            f"| {r['workload']} | {r['ctx']} | {r['cache_gb']} | {_fmt(r.get('gen'), 'd')} "
+            f"| {_fmt(r.get('gen_steady_tps'))} | {_fmt(r.get('prefill_tps'))} "
+            f"| {_fmt(r.get('gen_first_ms'), '.1f')} "
             f"| {_fmt(r.get('step_ms'), '.1f')} | {_fmt(r.get('gpu_busy_ms'), '.1f')} "
             f"| {_fmt(r.get('pread_ms'), '.1f')} | {_fmt(r.get('engram_ms'), '.1f')} "
             f"| {_fmt(r.get('host_gap_ms'), '.1f')} | {_fmt(r.get('decode_hit_rate'), '.3f')} "
-            f"| {_fmt(r.get('wired_steady_gib'), '.1f')} | {_flag(r)} |")
-    clean = [r for r in rows if not _flag(r)]
+            f"| {_fmt(r.get('wired_steady_gib'), '.1f')} | {'yes' if r.get('router_log') else '—'} "
+            f"| {_flag(r)} |")
+    clean = [r for r in rows if not _flag(r) and not r.get("router_log")]
     best = max(clean, key=lambda r: r["gen_steady_tps"]) if clean else None
     lines += ["", "Best clean run: " + (
         f"{best['gen_steady_tps']:.2f} t/s ({best['workload']}, ctx {best['ctx']}, "

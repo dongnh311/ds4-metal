@@ -38,6 +38,49 @@ class WiredTest(unittest.TestCase):
         self.assertGreaterEqual(len(ws.samples), 2)
         self.assertEqual(ws.summary()["peak_gib"], 262144 * 16384 / wired.GIB)
 
+    def test_sampler_collects_timed(self):
+        with wired.WiredSampler(interval=0.01, read=lambda: SAMPLE) as ws:
+            time.sleep(0.05)
+        self.assertGreaterEqual(len(ws.timed), 2)
+        for t, b in ws.timed:
+            self.assertIsInstance(t, float)
+            self.assertEqual(b, 262144 * 16384)
+
+
+class WindowSummaryTest(unittest.TestCase):
+    def test_picks_only_in_window_samples(self):
+        g = wired.GIB
+        timed = [(0.0, 1 * g), (1.0, 5 * g), (2.0, 6 * g), (3.0, 7 * g), (4.0, 40 * g)]
+        s = wired.window_summary(timed, 1.0, 3.0)
+        self.assertEqual(s["steady_gib"], 6.0)
+        self.assertEqual(s["peak_gib"], 40.0)
+        self.assertEqual(s["window"], "decode")
+        self.assertEqual(s["n"], 5)
+
+    def test_fallback_when_too_few_in_window(self):
+        g = wired.GIB
+        timed = [(0.0, 1 * g), (1.0, 2 * g), (2.0, 3 * g), (3.0, 4 * g), (4.0, 5 * g)]
+        s = wired.window_summary(timed, 10.0, 11.0)
+        self.assertEqual(s["window"], "fallback")
+        # median of second half of all samples: [3, 4, 5] * g -> 4 GiB
+        self.assertEqual(s["steady_gib"], 4.0)
+        self.assertEqual(s["peak_gib"], 5.0)
+        self.assertEqual(s["n"], 5)
+
+    def test_fallback_respects_min_samples(self):
+        g = wired.GIB
+        timed = [(0.0, 1 * g), (1.0, 2 * g), (2.0, 10 * g)]
+        s = wired.window_summary(timed, 1.0, 2.0, min_samples=3)
+        self.assertEqual(s["window"], "fallback")
+
+
+class IdleGibTest(unittest.TestCase):
+    def test_idle_gib_from_one_sample(self):
+        self.assertEqual(wired.idle_gib(read=lambda: SAMPLE), 262144 * 16384 / wired.GIB)
+
+    def test_idle_wired_limit_constant(self):
+        self.assertEqual(wired.IDLE_WIRED_LIMIT_GIB, 8.0)
+
 
 if __name__ == "__main__":
     unittest.main()
