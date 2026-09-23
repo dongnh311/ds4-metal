@@ -73,12 +73,14 @@ capacity.
 
 ### Policy
 
-- Initial capacity 32768 rows (`DS4_QWEN4_KV_INIT_CAP` overrides), always a multiple of 4096 and never
-  above `ctx_cap`.
-- Reserve on sync: `need = prompt_len + 4096`. If `need > alloc_cap`, grow.
+- Initial capacity 32768 rows (`DS4_QWEN4_KV_INIT_CAP` overrides), rounded up to a multiple of 256 rows
+  (about 139 KB of 4-bit KV) and never above `ctx_cap`. The 256-row grain lets tests cross growth
+  thresholds with short prompts; it costs nothing at run time.
+- Reserve on sync: `need = prompt_len + reserve`, `reserve` = 4096 (`DS4_QWEN4_KV_RESERVE` overrides, for
+  tests). If `need > alloc_cap`, grow.
 - Grow on demand: before every forward (prefill chunk, decode, MTP verify/draft, span verify, batched
   rows), if `pos + T + 64 > alloc_cap`, grow (64 rows covers the widest verify, 17 rows, with room).
-- Grow target: `max(need, 2*alloc_cap)` rounded up to 4096, clamped to `ctx_cap`; if the result is
+- Grow target: `max(need, 2*alloc_cap)` rounded up to 256, clamped to `ctx_cap`; if the result is
   above `ctx_cap/2`, jump straight to `ctx_cap` to avoid a second large copy.
 - Shrink at a session boundary: when `ds4_session_sync` resets the graph (the new prompt does not
   extend the checkpoint) and `need <= alloc_cap/4`, reallocate at `max(init_cap, need)`. The 1/4
@@ -95,8 +97,8 @@ command buffers, so the GPU holds no reference to the old buffers there. This is
 2. Copy the used prefix on the CPU (Shared storage): KV/scale/`pos3` rows `[0, pos)`, block-key blocks
    `[0, pos/4]` (plus the ik rows when the ring is off).
 3. Swap the pointers, free the old buffers, set `alloc_cap`.
-4. On allocation failure, keep the old buffers and report the same error as "context full"; state is
-   untouched.
+4. On allocation failure, keep the old buffers and return an error naming the KV capacity; state is
+   untouched. `DS4_QWEN4_KV_GROW_TEST_FAIL=1` makes every resize fail, so tests can check this.
 
 Shared arena: its `score`/`tile_max` grow to the largest `alloc_cap` among borrowing sessions, and each
 session re-reads its borrowed scratch pointers from the arena at the start of every forward, so no
