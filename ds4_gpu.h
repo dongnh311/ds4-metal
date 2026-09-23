@@ -82,8 +82,25 @@ int ds4_gpu_commands_active(void);
 #include "ds4_deepseek41_gpu.h"
 #ifdef __APPLE__
 int ds4_gpu_parallel_ffn_finish(void);
+/* Execute an armed V4.1 shared expert without routed work (serial control). */
+int ds4_gpu_dsv41_shared_expert_only(void);
 void ds4_gpu_parallel_ffn_abort(void);
 int ds4_gpu_parallel_ffn_start(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *shared_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              model_dim,
+        uint32_t              shared_dim,
+        const ds4_gpu_tensor *x,
+        float                 clamp);
+/* V4.1 BF16 shared expert; returns zero without arming if unavailable. */
+int ds4_gpu_dsv41_parallel_ffn_start(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
         ds4_gpu_tensor       *mid,
@@ -668,6 +685,12 @@ int ds4_gpu_dsv4_topk_mask_tensor(
  * attention output projections, and DS4's tail-only RoPE.
  */
 
+/* Scalar Q8 decode with the V4.1 BF16 rounding boundary at the final store. */
+int ds4_gpu_matmul_q8_0_decode_bf16_tensor(
+    ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+    uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+    const ds4_gpu_tensor *x);
+
 int ds4_gpu_matmul_q8_0_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -1118,6 +1141,18 @@ int ds4_gpu_rms_norm_plain_rows_tensor(
         uint32_t                n,
         uint32_t                rows,
         float                   eps);
+
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+int ds4_gpu_dsv41_norm_bf16(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        float                   eps);
+#endif
 
 int ds4_gpu_rms_norm_weight_tensor(
         ds4_gpu_tensor       *out,
@@ -2102,6 +2137,25 @@ int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                use_mask,
         uint32_t                n_head,
         uint32_t                head_dim);
+/* Independent single-dispatch projection sections; a false begin requests
+ * the serial fallback. End joins the section before dependent work. */
+int ds4_gpu_dsv41_begin_parallel(void);
+void ds4_gpu_dsv41_end_parallel(void);
+int ds4_gpu_dsv41_attention_selected(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t                n_comp,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        const ds4_gpu_tensor *selected_ids);
 
 int ds4_gpu_attention_decode_heads_rope_tensor(
         ds4_gpu_tensor       *heads,
@@ -2409,6 +2463,18 @@ int ds4_gpu_attention_output_low_q8_tensor(
         uint64_t                rank,
         uint32_t                n_groups,
         const ds4_gpu_tensor *heads);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+int ds4_gpu_dsv41_attention_low_bf16(
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        const ds4_gpu_tensor *heads);
+#endif
+
 int ds4_gpu_attention_output_low_q4_K_slice_tensor(
         ds4_gpu_tensor       *low,
         const void             *model_map,
@@ -2859,6 +2925,14 @@ int ds4_gpu_hc_split_sinkhorn_tensor(
         uint32_t                n_hc,
         uint32_t                sinkhorn_iters,
         float                   eps);
+
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+int ds4_gpu_dsv41_hc_sum_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual,
+        const ds4_gpu_tensor *weights, bool split);
+int ds4_gpu_dsv41_hc_expand_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split);
+#endif
 
 int ds4_gpu_hc_weighted_sum_tensor(
         ds4_gpu_tensor       *out,
