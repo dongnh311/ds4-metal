@@ -7329,6 +7329,52 @@ static void test_qwen_kv_grow(void) {
     ds4_tokens prompt = {0};
     static int ref[640], got[640];
 
+    /* Batched decode over the shared arena (DS4_TEST_SHARE_WORKSPACE=1):
+     * P crosses its capacity inside the batch and grows the arena's indexer
+     * scores; Q keeps borrowing them. The flag on must reproduce the same
+     * batched tokens as the flag off.  Then P restarts on a short prompt and
+     * shrinks while Q, still larger, keeps decoding correctly. */
+    if (test_env_bool("DS4_TEST_SHARE_WORKSPACE")) {
+        ds4_tokens pp = {0}, qp = {0}, small = {0};
+        test_kv_grow_prompt(engine, 3900, 10, &pp);
+        test_kv_grow_prompt(engine, 4000, 11, &qp);
+        test_kv_grow_prompt(engine, 200, 12, &small);
+        static int toks[2][2][300];   /* [flag][session][step] */
+        static int tail[2][32];       /* Q after P shrank, [flag][step] */
+        for (int flag = 1; flag >= 0; flag--) {
+            test_kv_grow_env(flag == 1, 4096, 64);
+            ds4_session *p = NULL, *q = NULL;
+            char err[192] = {0};
+            TEST_ASSERT(ds4_session_create(&p, engine, TEST_KV_CTX) == 0);
+            TEST_ASSERT(ds4_session_create(&q, engine, TEST_KV_CTX) == 0);
+            TEST_ASSERT(ds4_session_sync(p, &pp, err, sizeof(err)) == 0);
+            TEST_ASSERT(ds4_session_sync(q, &qp, err, sizeof(err)) == 0);
+            for (int step = 0; step < 300; step++) {
+                ds4_decode_item items[2] = {
+                    {.session = p, .token = ds4_session_argmax(p)},
+                    {.session = q, .token = ds4_session_argmax(q)},
+                };
+                toks[flag][0][step] = items[0].token;
+                toks[flag][1][step] = items[1].token;
+                TEST_ASSERT(ds4_sessions_eval_batch(items, 2, err, sizeof(err)) == 0);
+            }
+            if (flag == 1) {
+                TEST_ASSERT(ds4_test_qwen4_alloc_cap(p) == 8192);
+                TEST_ASSERT(ds4_test_qwen4_alloc_cap(q) == 8192);
+            }
+            TEST_ASSERT(ds4_session_sync(p, &small, err, sizeof(err)) == 0);
+            if (flag == 1) TEST_ASSERT(ds4_test_qwen4_alloc_cap(p) == 4096);
+            TEST_ASSERT(test_kv_grow_decode(engine, q, 32, false, tail[flag]) >= 0);
+            ds4_session_free(q);
+            ds4_session_free(p);
+        }
+        TEST_ASSERT(memcmp(toks[0], toks[1], sizeof(toks[0])) == 0);
+        TEST_ASSERT(memcmp(tail[0], tail[1], sizeof(tail[0])) == 0);
+        ds4_tokens_free(&pp);
+        ds4_tokens_free(&qp);
+        ds4_tokens_free(&small);
+    }
+
     /* The flag off keeps the full capacity; on starts at the initial one and
      * decodes the same tokens while everything fits. */
     test_kv_grow_prompt(engine, 1000, 1, &prompt);

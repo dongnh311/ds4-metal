@@ -58335,7 +58335,8 @@ static bool qwen4_graph_resize_ctx(ds4_qwen4_gpu_graph *g, uint32_t rows,
         const uint64_t kv_row = g->kv_fp8 ? (g->kv_q4 ? kv_dim / 2u : kv_dim) : kv_dim * 2u;
         const uint64_t sc_row = (kv_dim / 64u) * 2u;
         const uint64_t bk_bytes = (used / 4u + 1u) * DS4_N_INDEXER_HEAD_DIM * 2u;
-        ok = ds4_gpu_begin_commands() != 0;
+        const bool began = ds4_gpu_begin_commands() != 0;
+        ok = began;
         for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
             if (ds4_qwen4_layer_is_linear(il)) continue;
             if (g->kv_fp8) {
@@ -58353,7 +58354,7 @@ static bool qwen4_graph_resize_ctx(ds4_qwen4_gpu_graph *g, uint32_t rows,
             if (ok) ok = ds4_gpu_tensor_copy(b.bk[il], 0, g->layer_block_key[il], 0, bk_bytes);
         }
         if (ok) ok = ds4_gpu_tensor_copy(b.pos3, 0, g->pos3, 0, used * 4u * sizeof(uint32_t));
-        ok = ds4_gpu_end_commands() != 0 && ok;
+        if (began) ok = ds4_gpu_end_commands() != 0 && ok;
     }
     if (!ok) {
         ds4_gpu_tensor_free(score);
@@ -81252,6 +81253,15 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
             return 1;
         }
     }
+#ifdef DS4_HAS_QWEN4_GPU
+    for (int i = 0; i < count; i++) {
+        ds4_session *s = items[i].session;
+        if (ds4_session_is_qwen4(s) && s->qwen4_graph_ready &&
+            qwen4_session_ensure_cap(s, s->qwen4_graph.pos + DS4_QWEN4_KV_MARGIN, err, errlen) != 0) {
+            return 1;
+        }
+    }
+#endif
 #ifdef DS4_HAS_QWEN4_METAL
     if (count >= 2 && count <= 16 && ds4_session_is_qwen4(items[0].session) && e->glm_mtp &&
         !e->tp.active && e->backend == DS4_BACKEND_METAL &&
@@ -81461,6 +81471,15 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
         }
     }
 
+#ifdef DS4_HAS_QWEN4_GPU
+    for (int i = 0; i < count; i++) {
+        ds4_session *s = items[i].session;
+        if (ds4_session_is_qwen4(s) && s->qwen4_graph_ready &&
+            qwen4_session_ensure_cap(s, s->qwen4_graph.pos + DS4_QWEN4_KV_MARGIN, err, errlen) != 0) {
+            return 1;
+        }
+    }
+#endif
 #ifndef DS4_NO_GPU
     if (e->backend == DS4_BACKEND_CUDA) {
         return ds4_sessions_eval_batch_cuda(items, count, err, errlen);
