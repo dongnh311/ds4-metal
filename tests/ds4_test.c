@@ -13,6 +13,7 @@ uint32_t ds4_qwen4_kv_grow_target(uint32_t alloc, uint32_t need, uint32_t ctx_ca
 uint32_t ds4_qwen4_kv_shrink_target(uint32_t alloc, uint32_t need, uint32_t init, uint32_t ctx_cap);
 uint32_t ds4_qwen4_kv_reserve(const char *env_value);
 int ds4_test_qwen4_alloc_cap(ds4_session *s);
+int ds4_test_qwen4_arena_blocks(ds4_engine *e);
 
 static ds4_engine *test_engine_fast;
 static ds4_engine *test_engine_quality;
@@ -7365,9 +7366,15 @@ static void test_qwen_kv_grow(void) {
             if (flag == 1) {
                 TEST_ASSERT(ds4_test_qwen4_alloc_cap(p) == 8192);
                 TEST_ASSERT(ds4_test_qwen4_alloc_cap(q) == 8192);
+                /* the shared arena's indexer scores cover the 8192 rows */
+                TEST_ASSERT(ds4_test_qwen4_arena_blocks(engine) >= 8192 / 4 + 1);
             }
             TEST_ASSERT(ds4_session_sync(p, &small, err, sizeof(err)) == 0);
-            if (flag == 1) TEST_ASSERT(ds4_test_qwen4_alloc_cap(p) == 4096);
+            if (flag == 1) {
+                TEST_ASSERT(ds4_test_qwen4_alloc_cap(p) == 4096);
+                /* P shrank, but Q still borrows the arena at 8192 rows */
+                TEST_ASSERT(ds4_test_qwen4_arena_blocks(engine) >= 8192 / 4 + 1);
+            }
             TEST_ASSERT(test_kv_grow_decode(engine, q, 32, false, tail[flag]) >= 0);
             ds4_session_free(q);
             ds4_session_free(p);
@@ -7476,10 +7483,58 @@ static void test_qwen_kv_grow(void) {
         TEST_ASSERT(strstr(err, "KV capacity") != NULL);
         TEST_ASSERT(ds4_test_qwen4_alloc_cap(s) == 4096);
         unsetenv("DS4_QWEN4_KV_GROW_TEST_FAIL");
+        /* a prompt with an invalid token id fails before it grows anything */
+        {
+            ds4_tokens bad = {0};
+            for (int i = 0; i < prompt.len; i++) ds4_tokens_push(&bad, prompt.v[i]);
+            bad.v[bad.len - 1] = -1;
+            TEST_ASSERT(ds4_session_sync(s, &bad, err, sizeof(err)) != 0);
+            TEST_ASSERT(strstr(err, "vocabulary") != NULL);
+            TEST_ASSERT(ds4_test_qwen4_alloc_cap(s) == 4096);
+            ds4_tokens_free(&bad);
+        }
+        /* only DS4_QWEN4_KV_GROW_TEST_FAIL=1 fails a resize, "0" does not */
+        setenv("DS4_QWEN4_KV_GROW_TEST_FAIL", "0", 1);
         TEST_ASSERT(ds4_session_sync(s, &prompt, err, sizeof(err)) == 0);
+        unsetenv("DS4_QWEN4_KV_GROW_TEST_FAIL");
         TEST_ASSERT(test_kv_grow_decode(engine, s, 16, false, got) == 8192);
         TEST_ASSERT(memcmp(ref, got, 16 * sizeof(int)) == 0);
         ds4_session_free(s);
+    }
+
+    /* G. restoring a short KV payload into a session that grew starts over at
+     *    the initial capacity (a KV disk-cache hit after a long conversation):
+     *    S2 grew to 10240 rows, S1's ~1016-row checkpoint shrinks it to 4096. */
+    {
+        test_kv_grow_env(true, 4096, 64);
+        ds4_tokens big = {0};
+        test_kv_grow_prompt(engine, 1000, 13, &prompt);
+        test_kv_grow_prompt(engine, 10000, 14, &big);
+        ds4_session *s1 = NULL, *s2 = NULL;
+        char err[192] = {0};
+        int head[16];
+        TEST_ASSERT(ds4_session_create(&s1, engine, TEST_KV_CTX) == 0);
+        TEST_ASSERT(ds4_session_create(&s2, engine, TEST_KV_CTX) == 0);
+        TEST_ASSERT(ds4_session_sync(s1, &prompt, err, sizeof(err)) == 0);
+        TEST_ASSERT(test_kv_grow_decode(engine, s1, 16, false, head) == 4096);
+        FILE *fp = tmpfile();
+        TEST_ASSERT(fp != NULL);
+        TEST_ASSERT(ds4_session_save_payload(s1, fp, err, sizeof(err)) == 0);
+        const uint64_t bytes = (uint64_t)ftell(fp);
+        rewind(fp);
+        TEST_ASSERT(ds4_session_sync(s2, &big, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_test_qwen4_alloc_cap(s2) == 10240);
+        const int lrc = ds4_session_load_payload(s2, fp, bytes, err, sizeof(err));
+        if (lrc != 0) fprintf(stderr, "ds4-test: kv-grow payload load failed: %s\n", err);
+        TEST_ASSERT(lrc == 0);
+        fclose(fp);
+        TEST_ASSERT(ds4_test_qwen4_alloc_cap(s2) == 4096);
+        TEST_ASSERT(test_kv_grow_decode(engine, s1, 32, false, ref) == 4096);
+        TEST_ASSERT(test_kv_grow_decode(engine, s2, 32, false, got) == 4096);
+        TEST_ASSERT(memcmp(ref, got, 32 * sizeof(int)) == 0);
+        ds4_session_free(s2);
+        ds4_session_free(s1);
+        ds4_tokens_free(&big);
     }
 
     ds4_tokens_free(&prompt);

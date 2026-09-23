@@ -57788,7 +57788,13 @@ static const ds4_vision_span *qwen4_fake_spans(size_t *count) {
 #define DS4_QWEN4_KV_GRAIN 256u
 #define DS4_QWEN4_KV_DEFAULT_INIT 32768u
 #define DS4_QWEN4_KV_DEFAULT_RESERVE 4096u
-#define DS4_QWEN4_KV_MARGIN 64u  /* widest verify is 17 rows; 64 leaves room */
+/* Rows kept free past pos before every decode-time forward.  It must cover the
+ * widest single one: a prompt-lookup span verify of up to 17 rows (span <= 16
+ * plus the first token: n_logit_rows in qwen4_graph_alloc, toks[18] in
+ * qwen4_span_verify) plus the chained MTP draft row written one position
+ * later.  Prefill chunks are covered by the reservation at sync instead.  A
+ * wider verify or a deeper draft chain must update this margin. */
+#define DS4_QWEN4_KV_MARGIN 64u
 
 static uint64_t qwen4_kv_round(uint64_t rows) {
     return (rows + DS4_QWEN4_KV_GRAIN - 1u) / DS4_QWEN4_KV_GRAIN * DS4_QWEN4_KV_GRAIN;
@@ -58305,7 +58311,8 @@ static bool qwen4_graph_resize_ctx(ds4_qwen4_gpu_graph *g, uint32_t rows,
                                    ds4_qwen4_gpu_graph *arena, bool arena_sole_user) {
     if (rows == g->alloc_cap) return true;
     if (rows < g->pos || rows > g->ctx_cap) return false;
-    if (getenv("DS4_QWEN4_KV_GROW_TEST_FAIL")) return false;
+    const char *test_fail = getenv("DS4_QWEN4_KV_GROW_TEST_FAIL");
+    if (test_fail && test_fail[0] == '1') return false;
 
     qwen4_ctx_bufs b;
     if (!qwen4_ctx_bufs_alloc(g, rows, &b)) return false;
@@ -58328,7 +58335,14 @@ static bool qwen4_graph_resize_ctx(ds4_qwen4_gpu_graph *g, uint32_t rows,
         }
     }
 
-    const uint64_t used = g->pos;
+    /* The nextn (MTP) layer can hold rows past pos: a chained draft writes
+     * its row at pos and leaves mtp_pos = pos + 1, and the exact-sampling
+     * replacement draft at pos + 1 attends to it.  Keep those rows too;
+     * the extra rows of the other layers are copied as unused bytes. */
+    uint64_t used = g->mtp_pos;
+    if (used > g->alloc_cap) used = g->alloc_cap;
+    if (used > rows) used = rows;
+    if (used < g->pos) used = g->pos;
     bool ok = true;
     if (used) {
         const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
@@ -58363,11 +58377,13 @@ static bool qwen4_graph_resize_ctx(ds4_qwen4_gpu_graph *g, uint32_t rows,
         return false;
     }
 
-    const uint64_t new_bytes = qwen4_ctx_bufs_bytes(&b);
+    uint64_t new_bytes = qwen4_ctx_bufs_bytes(&b);
     qwen4_ctx_bufs_swap(g, &b);                   /* b now holds the old set */
-    const uint64_t old_bytes = qwen4_ctx_bufs_bytes(&b);
+    uint64_t old_bytes = qwen4_ctx_bufs_bytes(&b);
     qwen4_ctx_bufs_free(&b);
     if (resize_scratch) {
+        new_bytes += ds4_gpu_tensor_bytes(score) + ds4_gpu_tensor_bytes(tile_max);
+        old_bytes += ds4_gpu_tensor_bytes(owner->score) + ds4_gpu_tensor_bytes(owner->tile_max);
         ds4_gpu_tensor_free(owner->score);
         ds4_gpu_tensor_free(owner->tile_max);
         owner->score = score;
@@ -63796,7 +63812,6 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
         payload_set_err(err, errlen, "KV checkpoint is longer than this session's context");
         return 1;
     }
-    if (qwen4_session_ensure_cap(s, rows + DS4_QWEN4_KV_MARGIN, err, errlen) != 0) return 1;
     token_vec new_checkpoint = {0};
     for (uint32_t i = 0; i < rows; i++) {
         uint32_t tok;
@@ -63818,6 +63833,23 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
     s->glm_mtp_have = 0;
     s->glm_mtp_have2 = false;
     g->snap_valid = g->snap2_valid = g->snap0_valid = false;
+    /* Grow-on-demand KV: the payload rewrites every row and all recurrent
+     * state the graph keeps, so start the graph over and size it for this
+     * checkpoint.  A restore after a long conversation then gives back the
+     * capacity the checkpoint does not need, and a grow copies no rows the
+     * payload is about to overwrite.  With the flag off ensure_cap only
+     * re-reads the scratch borrowed from the engine arena. */
+    if (g->kv_grow) {
+        qwen4_graph_reset(g);
+        s->checkpoint.len = 0;
+        qwen4_session_shrink_cap(s, rows + g->kv_reserve);
+    }
+    if (qwen4_session_ensure_cap(s, rows + DS4_QWEN4_KV_MARGIN, err, errlen) != 0) {
+        token_vec_free(&new_checkpoint);
+        qwen4_graph_reset(g);
+        s->checkpoint.len = 0;
+        return 1;
+    }
     if (payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), remaining, err, errlen) != 0) {
         token_vec_free(&new_checkpoint);
         return 1;
@@ -76586,6 +76618,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     if (ds4_session_is_qwen4(s)) {
         ds4_engine *e = s->engine;
         int start = 0;
+        bool was_reset = false;
         s->glm_mtp_have = 0;
         s->glm_mtp_have2 = false;
         if (s->checkpoint_valid &&
@@ -76598,17 +76631,19 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             qwen4_graph_reset(&s->qwen4_graph);
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
-            qwen4_session_shrink_cap(s, (uint32_t)prompt->len + s->qwen4_graph.kv_reserve);
-        }
-        if (qwen4_session_ensure_cap(s, (uint32_t)prompt->len + s->qwen4_graph.kv_reserve,
-                                     err, errlen) != 0) {
-            return 1;
+            was_reset = true;
         }
         for (int i = start; i < prompt->len; i++) {
             if (prompt->v[i] < 0 || prompt->v[i] >= (int)DS4_N_VOCAB) {
                 snprintf(err, errlen, "token id %d at position %d is outside the vocabulary", prompt->v[i], i);
                 return 1;
             }
+        }
+        /* size the caches only for a prompt that will run */
+        if (was_reset) qwen4_session_shrink_cap(s, (uint32_t)prompt->len + s->qwen4_graph.kv_reserve);
+        if (qwen4_session_ensure_cap(s, (uint32_t)prompt->len + s->qwen4_graph.kv_reserve,
+                                     err, errlen) != 0) {
+            return 1;
         }
         s->qwen4_graph.vis_spans = s->sync_images;
         s->qwen4_graph.vis_span_count = s->sync_image_count;
@@ -86617,6 +86652,17 @@ int ds4_test_qwen4_alloc_cap(ds4_session *s) {
     if (s && ds4_session_is_qwen4(s) && s->qwen4_graph_ready) return (int)s->qwen4_graph.alloc_cap;
 #else
     (void)s;
+#endif
+    return -1;
+}
+
+/* Test hook: indexer blocks the engine's shared qwen4 arena holds scores
+ * for, or -1 when there is no arena. */
+int ds4_test_qwen4_arena_blocks(ds4_engine *e) {
+#ifdef DS4_HAS_QWEN4_GPU
+    if (e && e->qwen4_shared_workspace) return (int)e->qwen4_shared_workspace->n_block_cap;
+#else
+    (void)e;
 #endif
     return -1;
 }
