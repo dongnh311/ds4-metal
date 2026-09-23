@@ -57779,6 +57779,60 @@ static const ds4_vision_span *qwen4_fake_spans(size_t *count) {
     *count = n;
     return spans;
 }
+
+/* Grow-on-demand KV (DS4_QWEN4_KV_GROW=1).  The qwen4 caches sized by the
+ * context (KV, scales, block keys, positions, indexer scores) are allocated
+ * for alloc_cap rows instead of the full -c capacity, grow before a forward
+ * that needs more and shrink when a session starts over.  These helpers are
+ * the policy only: plain arithmetic, so the tests call them without a model. */
+#define DS4_QWEN4_KV_GRAIN 256u
+#define DS4_QWEN4_KV_DEFAULT_INIT 32768u
+#define DS4_QWEN4_KV_DEFAULT_RESERVE 4096u
+#define DS4_QWEN4_KV_MARGIN 64u  /* widest verify is 17 rows; 64 leaves room */
+
+static uint64_t qwen4_kv_round(uint64_t rows) {
+    return (rows + DS4_QWEN4_KV_GRAIN - 1u) / DS4_QWEN4_KV_GRAIN * DS4_QWEN4_KV_GRAIN;
+}
+
+static uint32_t qwen4_kv_env_u32(const char *env_value, uint32_t fallback) {
+    if (!env_value || !env_value[0]) return fallback;
+    const long v = strtol(env_value, NULL, 10);
+    if (v <= 0) return fallback;
+    return v > (long)UINT32_MAX ? UINT32_MAX : (uint32_t)v;
+}
+
+uint32_t ds4_qwen4_kv_initial_cap(uint32_t ctx_cap, const char *env_value) {
+    const uint64_t init = qwen4_kv_round(qwen4_kv_env_u32(env_value, DS4_QWEN4_KV_DEFAULT_INIT));
+    return init < ctx_cap ? (uint32_t)init : ctx_cap;
+}
+
+uint32_t ds4_qwen4_kv_reserve(const char *env_value) {
+    return qwen4_kv_env_u32(env_value, DS4_QWEN4_KV_DEFAULT_RESERVE);
+}
+
+/* Rows to allocate for a graph holding alloc rows that needs need rows: double
+ * (or jump to need), and past half of -c go straight to -c so the largest
+ * copy happens at most once. */
+uint32_t ds4_qwen4_kv_grow_target(uint32_t alloc, uint32_t need, uint32_t ctx_cap) {
+    if (need > ctx_cap) need = ctx_cap;
+    if (need <= alloc) return alloc;
+    uint64_t target = (uint64_t)alloc * 2u;
+    if (target < need) target = need;
+    target = qwen4_kv_round(target);
+    if (target > ctx_cap / 2u) target = ctx_cap;
+    return (uint32_t)target;
+}
+
+/* Rows to keep when a session starts over and needs need rows: shrink only
+ * when need fits in a quarter of what is allocated, never below init. */
+uint32_t ds4_qwen4_kv_shrink_target(uint32_t alloc, uint32_t need, uint32_t init, uint32_t ctx_cap) {
+    if (need > alloc / 4u) return alloc;
+    uint64_t target = qwen4_kv_round(need);
+    if (target < init) target = init;
+    if (target > ctx_cap) target = ctx_cap;
+    return target < alloc ? (uint32_t)target : alloc;
+}
+
 #ifdef DS4_HAS_QWEN4_GPU
 /* ------------------------------------------------------------------------
  * Qwen3.8-Flash-Next GPU graph.  One command batch per forward; f32

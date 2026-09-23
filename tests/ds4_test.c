@@ -8,6 +8,10 @@
 
 bool ds4_test_dspark_cache_window_crop(void);
 bool ds4_test_dspark_prefix_capture(ds4_engine *engine, const ds4_tokens *prompt);
+uint32_t ds4_qwen4_kv_initial_cap(uint32_t ctx_cap, const char *env_value);
+uint32_t ds4_qwen4_kv_grow_target(uint32_t alloc, uint32_t need, uint32_t ctx_cap);
+uint32_t ds4_qwen4_kv_shrink_target(uint32_t alloc, uint32_t need, uint32_t init, uint32_t ctx_cap);
+uint32_t ds4_qwen4_kv_reserve(const char *env_value);
 
 static ds4_engine *test_engine_fast;
 static ds4_engine *test_engine_quality;
@@ -7192,6 +7196,37 @@ static void test_dspark_verify_depth(void) {
 }
 #endif
 
+/* Grow-on-demand KV capacity policy: plain arithmetic, no model needed. */
+static void test_qwen_kv_grow_policy(void) {
+    TEST_ASSERT(ds4_qwen4_kv_initial_cap(262144, NULL) == 32768);
+    TEST_ASSERT(ds4_qwen4_kv_initial_cap(262144, "") == 32768);
+    TEST_ASSERT(ds4_qwen4_kv_initial_cap(262144, "junk") == 32768);
+    TEST_ASSERT(ds4_qwen4_kv_initial_cap(262144, "1000") == 1024);
+    TEST_ASSERT(ds4_qwen4_kv_initial_cap(8192, NULL) == 8192);
+    TEST_ASSERT(ds4_qwen4_kv_initial_cap(512, "256") == 256);
+
+    TEST_ASSERT(ds4_qwen4_kv_grow_target(32768, 32768, 262144) == 32768);
+    TEST_ASSERT(ds4_qwen4_kv_grow_target(32768, 32769, 262144) == 65536);
+    TEST_ASSERT(ds4_qwen4_kv_grow_target(32768, 100000, 262144) == 100096);
+    TEST_ASSERT(ds4_qwen4_kv_grow_target(65536, 70000, 262144) == 131072);
+    TEST_ASSERT(ds4_qwen4_kv_grow_target(131072, 131073, 262144) == 262144);
+    TEST_ASSERT(ds4_qwen4_kv_grow_target(32768, 140000, 262144) == 262144);
+    TEST_ASSERT(ds4_qwen4_kv_grow_target(256, 300, 512) == 512);
+    TEST_ASSERT(ds4_qwen4_kv_grow_target(262144, 400000, 262144) == 262144);
+    TEST_ASSERT(ds4_qwen4_kv_grow_target(4096, 4097, 65536) == 8192);
+    TEST_ASSERT(ds4_qwen4_kv_grow_target(4096, 10064, 65536) == 10240);
+
+    TEST_ASSERT(ds4_qwen4_kv_shrink_target(262144, 5000, 32768, 262144) == 32768);
+    TEST_ASSERT(ds4_qwen4_kv_shrink_target(262144, 40000, 32768, 262144) == 40192);
+    TEST_ASSERT(ds4_qwen4_kv_shrink_target(262144, 70000, 32768, 262144) == 262144);
+    TEST_ASSERT(ds4_qwen4_kv_shrink_target(32768, 100, 32768, 262144) == 32768);
+    TEST_ASSERT(ds4_qwen4_kv_shrink_target(10240, 264, 4096, 65536) == 4096);
+
+    TEST_ASSERT(ds4_qwen4_kv_reserve(NULL) == 4096);
+    TEST_ASSERT(ds4_qwen4_kv_reserve("64") == 64);
+    TEST_ASSERT(ds4_qwen4_kv_reserve("0") == 4096);
+}
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
@@ -7206,6 +7241,7 @@ typedef struct {
 } ds4_test_entry;
 
 static const ds4_test_entry test_entries[] = {
+    {"--qwen-kv-grow-policy", "qwen-kv-grow-policy", "Qwen3.8 grow-on-demand KV capacity policy (no model)", test_qwen_kv_grow_policy},
 #ifndef DS4_NO_GPU
     {"--qwen4-prefill-checkpoints", "qwen4-prefill-checkpoints", "Qwen chunk checkpoints restore matching logits and state", test_qwen_prefill_checkpoints},
     {"--qwen4-restore-reuse", "qwen4-restore-reuse", "Qwen restore discards old verifier state and rejects truncated payloads", test_qwen_restore_reused_session},
