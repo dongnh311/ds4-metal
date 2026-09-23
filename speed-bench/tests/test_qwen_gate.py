@@ -87,6 +87,14 @@ class EvaluateTest(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertIn("registry command changed", failures[0])
 
+    def test_full_check_against_fast_baseline(self):
+        baseline = {"registry_command": ["a"]}
+        current = {"registry_command": ["a"], "tps_median": 9.8, "wired": {"steady_gib": 40.0},
+                   "needle_hit": True}
+        failures = qwen_gate.evaluate(baseline, current)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("baseline lacks full-tier data", failures[0])
+
 
 if __name__ == "__main__":
     unittest.main()

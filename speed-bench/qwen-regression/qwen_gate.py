@@ -88,6 +88,10 @@ def evaluate(baseline, current):
     if baseline.get("registry_command") != current.get("registry_command"):
         failures.append("registry command changed; re-record the baseline")
         return failures
+    if (current.get("tps_median") is not None or current.get("wired")) and \
+            (not baseline.get("tps_median") or not baseline.get("wired")):
+        failures.append("baseline lacks full-tier data; re-record with --full")
+        return failures
     if baseline.get("tps_median") and current.get("tps_median") is not None:
         floor = baseline["tps_median"] * TPS_FLOOR
         if current["tps_median"] < floor:
