@@ -7338,9 +7338,99 @@ static void test_qwen_kv_grow(void) {
     TEST_ASSERT(test_kv_grow_run(engine, &prompt, 32, false, got) == 4096);
     TEST_ASSERT(memcmp(ref, got, 32 * sizeof(int)) == 0);
 
-    /* Without growth a prompt past the initial capacity fails cleanly. */
-    test_kv_grow_prompt(engine, 5000, 2, &prompt);
-    TEST_ASSERT(test_kv_grow_run(engine, &prompt, 1, false, got) == -1);
+    /* A. growth mid-decode (plain eval): 3800 prompt tokens fit 4096, the
+     *    decode crosses 4096 - 64 one token at a time. */
+    test_kv_grow_prompt(engine, 3800, 3, &prompt);
+    test_kv_grow_env(false, 4096, 64);
+    TEST_ASSERT(test_kv_grow_run(engine, &prompt, 600, false, ref) == TEST_KV_CTX);
+    test_kv_grow_env(true, 4096, 64);
+    TEST_ASSERT(test_kv_grow_run(engine, &prompt, 600, false, got) == 8192);
+    TEST_ASSERT(memcmp(ref, got, 600 * sizeof(int)) == 0);
+
+    /* B. growth at the sync reservation: 9000 + 4096 -> 13312 rows. */
+    test_kv_grow_prompt(engine, 9000, 4, &prompt);
+    test_kv_grow_env(false, 4096, 4096);
+    TEST_ASSERT(test_kv_grow_run(engine, &prompt, 32, false, ref) == TEST_KV_CTX);
+    test_kv_grow_env(true, 4096, 4096);
+    TEST_ASSERT(test_kv_grow_run(engine, &prompt, 32, false, got) == 13312);
+    TEST_ASSERT(memcmp(ref, got, 32 * sizeof(int)) == 0);
+
+    /* C. growth mid-decode under MTP speculation. */
+    test_kv_grow_prompt(engine, 3800, 5, &prompt);
+    test_kv_grow_env(false, 4096, 64);
+    TEST_ASSERT(test_kv_grow_run(engine, &prompt, 600, true, ref) == TEST_KV_CTX);
+    test_kv_grow_env(true, 4096, 64);
+    TEST_ASSERT(test_kv_grow_run(engine, &prompt, 600, true, got) == 8192);
+    TEST_ASSERT(memcmp(ref, got, 600 * sizeof(int)) == 0);
+
+    /* D. shrink at a session boundary: 10000 tokens grow to 10240 rows, an
+     *    unrelated 200-token prompt resets the graph and shrinks it to 4096. */
+    {
+        ds4_tokens small = {0};
+        test_kv_grow_prompt(engine, 200, 7, &small);
+        test_kv_grow_env(false, 4096, 64);
+        TEST_ASSERT(test_kv_grow_run(engine, &small, 32, false, ref) == TEST_KV_CTX);
+        test_kv_grow_env(true, 4096, 64);
+        test_kv_grow_prompt(engine, 10000, 6, &prompt);
+        ds4_session *s = NULL;
+        char err[192] = {0};
+        TEST_ASSERT(ds4_session_create(&s, engine, TEST_KV_CTX) == 0);
+        TEST_ASSERT(ds4_session_sync(s, &prompt, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_test_qwen4_alloc_cap(s) == 10240);
+        TEST_ASSERT(ds4_session_sync(s, &small, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_test_qwen4_alloc_cap(s) == 4096);
+        TEST_ASSERT(test_kv_grow_decode(engine, s, 32, false, got) == 4096);
+        TEST_ASSERT(memcmp(ref, got, 32 * sizeof(int)) == 0);
+        ds4_session_free(s);
+        ds4_tokens_free(&small);
+    }
+
+    /* E. a KV payload longer than a fresh session's capacity grows it first. */
+    {
+        test_kv_grow_env(true, 4096, 64);
+        test_kv_grow_prompt(engine, 6000, 8, &prompt);
+        ds4_session *live = NULL, *restored = NULL;
+        char err[192] = {0};
+        int head[16];
+        TEST_ASSERT(ds4_session_create(&live, engine, TEST_KV_CTX) == 0);
+        TEST_ASSERT(ds4_session_create(&restored, engine, TEST_KV_CTX) == 0);
+        TEST_ASSERT(ds4_session_sync(live, &prompt, err, sizeof(err)) == 0);
+        TEST_ASSERT(test_kv_grow_decode(engine, live, 16, false, head) == 8192);
+        FILE *fp = tmpfile();
+        TEST_ASSERT(fp != NULL);
+        TEST_ASSERT(ds4_session_save_payload(live, fp, err, sizeof(err)) == 0);
+        const uint64_t bytes = (uint64_t)ftell(fp);
+        rewind(fp);
+        TEST_ASSERT(ds4_test_qwen4_alloc_cap(restored) == 4096);
+        TEST_ASSERT(ds4_session_load_payload(restored, fp, bytes, err, sizeof(err)) == 0);
+        fclose(fp);
+        TEST_ASSERT(ds4_test_qwen4_alloc_cap(restored) == 8192);
+        TEST_ASSERT(test_kv_grow_decode(engine, live, 32, false, ref) == 8192);
+        TEST_ASSERT(test_kv_grow_decode(engine, restored, 32, false, got) == 8192);
+        TEST_ASSERT(memcmp(ref, got, 32 * sizeof(int)) == 0);
+        ds4_session_free(restored);
+        ds4_session_free(live);
+    }
+
+    /* F. a failed resize leaves the session usable. */
+    {
+        test_kv_grow_prompt(engine, 5000, 9, &prompt);
+        test_kv_grow_env(false, 4096, 64);
+        TEST_ASSERT(test_kv_grow_run(engine, &prompt, 16, false, ref) == TEST_KV_CTX);
+        test_kv_grow_env(true, 4096, 64);
+        ds4_session *s = NULL;
+        char err[192] = {0};
+        TEST_ASSERT(ds4_session_create(&s, engine, TEST_KV_CTX) == 0);
+        setenv("DS4_QWEN4_KV_GROW_TEST_FAIL", "1", 1);
+        TEST_ASSERT(ds4_session_sync(s, &prompt, err, sizeof(err)) != 0);
+        TEST_ASSERT(strstr(err, "KV capacity") != NULL);
+        TEST_ASSERT(ds4_test_qwen4_alloc_cap(s) == 4096);
+        unsetenv("DS4_QWEN4_KV_GROW_TEST_FAIL");
+        TEST_ASSERT(ds4_session_sync(s, &prompt, err, sizeof(err)) == 0);
+        TEST_ASSERT(test_kv_grow_decode(engine, s, 16, false, got) == 8192);
+        TEST_ASSERT(memcmp(ref, got, 16 * sizeof(int)) == 0);
+        ds4_session_free(s);
+    }
 
     ds4_tokens_free(&prompt);
     test_restore_env("DS4_QWEN4_KV_GROW", saved[0]);
