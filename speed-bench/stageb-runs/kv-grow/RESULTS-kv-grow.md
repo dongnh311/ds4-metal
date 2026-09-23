@@ -144,6 +144,45 @@ Logs: `task5/server-shrink.err`, `server-shrink-off.err`; vm samples in
 All ds4-server processes started for this task were stopped after use and
 confirmed clean with `pgrep -fl ds4-server`.
 
+### 3. KV disk-cache restore shrinks (fix wave, commit `b7ed475`)
+
+Gate for the final-review finding I1 (a payload restore never shrank). Server
+command as above but without `DS4_QWEN4_MTP_DRAFT_VOCAB`:
+`./ds4-server --metal -m <model> --ple <ple> -c 262144 --prefill-chunk 2048 --mtp
+--ssd-streaming --ssd-streaming-cache-experts 6GB --kv-disk-dir <dir> --kv-disk-space-mb 32768
+--kv-cache-cold-max-tokens 262144 --host 127.0.0.1 --port 18397`, fresh KV dir per
+flag setting. Conversation A is unrelated to B (no shared prefix): the first
+26K characters of `ds4_metal.m` plus a question (7,691 prompt tokens). B is
+`prompt_100k.txt` (98,059 tokens).
+
+Flag on:
+
+| step | request | what the log shows | peak wired during request |
+|---|---|---|---|
+| a | A, `max_tokens` 64 | cold checkpoint at 6,144 tokens | - |
+| b | B, `max_tokens` 32 | A's live state stored (`tokens=7755 reason=evict`); `32768 -> 100352 -> 262144 rows` | - (post: 3,143,516 pages, 47.97 GiB) |
+| c | A + A's reply + "Now name one Metal API call that this code uses." (7,780 tokens) | `qwen4 KV capacity 262144 -> 32768 rows (-2.18 GiB)`, then `kv cache hit text tokens=7755 ... load=45.4 ms` | not comparable (read 2 s late, GPU already idle) |
+| d | c again | disk hit 7,755, no resize (32,768 rows) | 3,012,850 pages (45.97 GiB) |
+| e | B + B's reply + one short turn | disk hit 98,091; `32768 -> 98304` at load, `98304 -> 262144` at the next sync | 3,156,225 pages (48.16 GiB) |
+| f | c again | `262144 -> 32768 rows (-2.18 GiB)`, disk hit 7,755 | 3,012,077 pages (45.96 GiB) |
+
+- Before the fix, the load in step c would have kept 262,144 rows (the loader
+  only grew). Now it drops to the 32,768-row initial capacity.
+- Wired memory: e (262,144 rows) vs f (32,768 rows, same restore path) is
+  144,148 pages lower, **-2.20 GiB**, matching the logged `-2.18 GiB`. Against the
+  reading right after B the drop is 1.99 GiB. Wired memory is held only while
+  the GPU is busy (idle falls to ~0.81M pages), so each reading comes from a
+  0.2 s sampler during the request (`fixwave/wired_during.sh`).
+- Reply c (and d, f), 9 tokens, backticks included:
+  `` `newComputePipelineStateWithFunction:error:` ``.
+- Flag off, fresh KV dir, replaying a, b, c: c is also a disk hit
+  (`tokens=7755`). Replies a, b and c are **byte-identical** to flag on (`cmp`
+  rc=0). Flag-off c peaks at 3,154,700 pages (48.14 GiB), 2.18 GiB above flag-on f.
+
+Logs: `fixwave/srv-{on,off}.err`, replies `fixwave/reply-{on,off}-*.txt`, samples
+`fixwave/wired-*.txt`, `fixwave/vm-on-*.txt`. Both servers were stopped
+(`pgrep -fl ds4-server` empty, port 18397 free) and the KV dirs deleted.
+
 ## Performance A/B
 
 `-c 262144`, flag off vs on. Short/37K/135K alternate off, on, off, on (two
@@ -189,6 +228,46 @@ grow-on-demand patch specifically, but it is a real deviation from the stated
 expectation and is reported here as-is rather than tuned away. Prefill is well
 above the 404 t/s baseline in every run (441-491 t/s), so the prefill side of
 the expectation is met with margin.
+
+### 37K re-measure (after fix wave)
+
+Code at `b7ed475`, same wrapper (`task5/run_ds4.sh`), same prompt and flags
+(`-c 262144 -n 1000 --prompt-file long_prompt_32k_prose.txt`). Three pairs in the
+order off, on, off, on, off, on, then one extra pair in the reverse order (on
+first) after 3 minutes idle, to check the order effect. All four pairs'
+outputs are byte-identical (`cmp`); each flag-on run grew once,
+`32768 -> 65536 rows (+0.31 GiB)`, at sync.
+
+| run | order | prefill t/s | decode t/s | peak wired GiB |
+|---|---|---|---|---|
+| off r3 | 1st | 444.42 | 40.62 | 49.14 |
+| on r3 | 2nd | 483.46 | 36.85 | 47.34 |
+| off r4 | 3rd | 437.01 | 36.42 | 49.14 |
+| on r4 | 4th | 455.22 | 36.09 | 47.26 |
+| off r5 | 5th | 429.34 | 36.05 | 49.14 |
+| on r5 | 6th | 458.58 | 36.14 | 47.41 |
+| on x (extra) | 1st after idle | 487.00 | 41.17 | 47.29 |
+| off x (extra) | 2nd | 429.95 | 35.51 | 49.14 |
+
+Paired differences (on - off):
+
+| pair | prefill | decode | peak wired |
+|---|---|---|---|
+| r3 | +8.8% | -9.3% | -1.79 GiB |
+| r4 | +4.2% | -0.9% | -1.88 GiB |
+| r5 | +6.8% | +0.3% | -1.74 GiB |
+| x (on first) | +13.3% | +15.9% | -1.85 GiB |
+
+Conclusion: the ~40.5-41 t/s decode figure comes from whichever run is the
+first 37K run of a sequence (Task 5 off r1, off r3 here, and on x when the flag-on
+run went first). Every later run decodes at 35.5-36.9 t/s with either flag.
+Leaving out the first runs, decode is 36.235 t/s median with the flag off
+(4 runs, Task 5 included) and 36.58 t/s with it on (5 runs): no sign of a 37K
+decode regression from the flag, and no gain either beyond noise. Prefill is
+4-9% faster with the flag on in the three ordered pairs, and peak wired is
+1.7-1.9 GiB lower. Decode at `-c 262144` stays below the 39.6-40.0 t/s `-c 65536`
+spec figure except in first runs; this re-measure does not explain that.
+Logs: `fixwave/perf37-*.{out,err,peakmem,vmstat}`.
 
 ### 135K (1000 generated tokens, `long_prompt_128k_prose.txt`, 135,151 tokens)
 
@@ -243,7 +322,8 @@ within noise**, matching the expectation ("256K unchanged within noise").
   regression, but it is a real miss against the stated target and is reported
   here rather than tuned away, per the "report honestly" instruction. No engine
   changes were made to chase this number, consistent with this task's scope
-  (verification only, no engine code changes).
+  (verification only, no engine code changes). The fix-wave re-measure ("37K
+  re-measure (after fix wave)") traces the gap to run order, not to the flag.
 
 ## Work-directory layout (not committed)
 
