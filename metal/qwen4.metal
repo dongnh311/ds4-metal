@@ -3577,14 +3577,16 @@ static inline void qwen4_kdown_rows(device const char *db, uint row_bytes, uint 
                 const float ds = d * (float)(sc & 0xFu), dm = dmin * (float)(sc >> 4);
                 /* 84-byte blocks are only 4-byte aligned: two word loads.  The word
                  * extraction changes how the backend fuses the chain, so it is
-                 * spelled out as the byte loop compiles: acc = fma(fma(ds, q, -dm), y, acc). */
+                 * spelled out as the byte loop compiles: acc = fma(fma(ds, q, -dm), y, acc).
+                 * The 2-bit q becomes a float through the 2^23 exponent (exact, and
+                 * cheaper than the integer conversion on M5). */
                 device const uint *qw = (device const uint *)(blk + 16 + q_base + l);
                 const uint q0 = qw[0], q1 = qw[1];
                 for (uint i = 0; i < 8; i++) {
 #pragma clang fp reassociate(off)
 #pragma clang fp contract(off)
                     const uint qb = ((i < 4 ? q0 : q1) >> (8u * (i & 3u))) & 0xFFu;
-                    const float qf = (float)((qb >> shift) & 3u);
+                    const float qf = as_type<float>(0x4B000000u | ((qb >> shift) & 3u)) - 8388608.0f;
                     acc[r] = fma(fma(ds, qf, -dm), y[i], acc[r]);
                 }
             }
