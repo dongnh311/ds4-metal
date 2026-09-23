@@ -828,6 +828,15 @@ the registry's env and flags against aab023d: VI 45.1 -> 47.5, EN prose
 with the registry's exact command answers four multi-turn requests byte for
 byte like aab023d and like the previously deployed server binary.
 
+The 64K draft vocabulary was already supported by the PROD engine (loader
+identical to scale3) but not enabled. Now the gateway registry's ds4 command
+sets `DS4_QWEN4_MTP_DRAFT_VOCAB` (backup `runtime-registry.json.bak-pre-draft-
+vocab-20260923`). Measured on PROD 5ed89b4 with the registry's env and flags,
+paired against the same binary without it: VI 47.7 -> 49.7 t/s (+4.1-4.5%),
+EN prose 45.9 -> 47.8 (+3.9-4.6%), code 48.1 -> 49.5 (+2.3-3.6%, acceptance
+76.2 -> 74.6%); greedy output unchanged on all three and on four server
+turns; +170 MiB.
+
 Where this leaves decode: the row kernels are bound by their per-element
 dequant arithmetic, and the byte-exact contract fixes that op sequence. Each
 remaining byte-exact item is at or below ~1%. A larger step needs a different
