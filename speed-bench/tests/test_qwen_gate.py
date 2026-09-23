@@ -5,7 +5,13 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "qwen-regression"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 import qwen_gate  # noqa: E402
+import wired  # noqa: E402
+
+HIGH_VM_STAT = ("Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+                "Pages free:                                    10623.\n"
+                "Pages wired down:                             600000.\n")   # ~9.16 GiB
 
 ENTRY = {"enabled": True, "process_cwd": "/prod/ds4-metal",
          "process_command": ["/usr/bin/env", "DS4_X=1", "/prod/ds4-metal/ds4-server", "--metal",
@@ -94,6 +100,47 @@ class EvaluateTest(unittest.TestCase):
         failures = qwen_gate.evaluate(baseline, current)
         self.assertEqual(len(failures), 1)
         self.assertIn("baseline lacks full-tier data", failures[0])
+
+
+class RunIdleRefusalTest(unittest.TestCase):
+    def test_refuses_before_server_starts_when_wired_high(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit):
+                qwen_gate.run(None, tmp, False, 650_000, ds4_running=lambda: "",
+                              idle_read=lambda: HIGH_VM_STAT)
+            # No server.log / kv dir means run() never got past the idle check.
+            self.assertFalse(os.path.exists(os.path.join(tmp, "server.log")))
+
+    def test_refuses_when_ds4_already_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit):
+                qwen_gate.run(None, tmp, False, 650_000, ds4_running=lambda: "9 ds4-server")
+
+
+class CheckPreflightTest(unittest.TestCase):
+    def test_refuses_same_out_and_baseline(self):
+        self.assertIsNotNone(qwen_gate.check_preflight("/a", "/a"))
+
+    def test_refuses_missing_baseline_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            baseline = os.path.join(tmp, "baseline")
+            os.makedirs(baseline)
+            out = os.path.join(tmp, "out")
+            self.assertIsNotNone(qwen_gate.check_preflight(out, baseline))
+
+    def test_passes_when_baseline_has_result_and_differs_from_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            baseline = os.path.join(tmp, "baseline")
+            os.makedirs(baseline)
+            with open(os.path.join(baseline, "result.json"), "w") as fp:
+                fp.write("{}")
+            out = os.path.join(tmp, "out")
+            self.assertIsNone(qwen_gate.check_preflight(out, baseline))
+
+
+class NeedleSourceTest(unittest.TestCase):
+    def test_needle_source_is_pinned_text_file(self):
+        self.assertEqual(qwen_gate.NEEDLE_SOURCE, "speed-bench/promessi_sposi.txt")
 
 
 if __name__ == "__main__":

@@ -35,7 +35,7 @@ PROMPTS = {
 NEEDLE = "The secret passphrase is VIOLET-HARBOR-2719."
 NEEDLE_KEY = "VIOLET-HARBOR-2719"
 QUESTION = "\n\nWhat is the secret passphrase stated in the text above? Answer with the passphrase only."
-NEEDLE_SOURCE = "ds4_server.c"
+NEEDLE_SOURCE = "speed-bench/promessi_sposi.txt"
 TPS_FLOOR = 0.97
 WIRED_SLACK_GIB = 0.5
 
@@ -146,10 +146,23 @@ def chat(base, text, max_tokens):
     return reply, usage.get("completion_tokens", 0), usage.get("prompt_tokens", 0), seconds
 
 
-def run(bin_dir, out, full, needle_chars):
-    running = machine.ds4_running()
-    if running:
-        raise SystemExit("qwen_gate: ds4 is running; the machine must be free:\n" + running)
+def check_preflight(out, baseline):
+    """Refusal message for `check`, or None when it is safe to start a server.
+    Both checks run before any server is started."""
+    if os.path.abspath(out) == os.path.abspath(baseline):
+        return "qwen_gate: --out and --baseline resolve to the same path"
+    if not os.path.exists(os.path.join(baseline, "result.json")):
+        return f"qwen_gate: no result.json in baseline {baseline}; record it first"
+    return None
+
+
+def run(bin_dir, out, full, needle_chars, ds4_running=machine.ds4_running, idle_read=None):
+    busy = ds4_running()
+    if busy:
+        raise SystemExit("qwen_gate: ds4 is running; the machine must be free:\n" + busy)
+    idle = wired.idle_gib(read=idle_read)
+    if idle > wired.IDLE_WIRED_LIMIT_GIB:
+        raise SystemExit(f"qwen_gate: {idle:.1f} GiB wired before the run; the machine is not idle")
     os.makedirs(out, exist_ok=True)
     port = int(os.environ.get("DS4_GATE_PORT", "18298"))
     kv = os.path.join(out, "kv")
@@ -180,6 +193,10 @@ def run(bin_dir, out, full, needle_chars):
             reply, _, prompt_tokens, _ = chat(base, prompt, 512)
             result["needle_prompt_tokens"] = prompt_tokens
             result["needle_hit"] = NEEDLE_KEY in reply
+    still = ds4_running()
+    if still:
+        raise SystemExit("qwen_gate: another ds4 process ran during the gate; "
+                          "results are not trustworthy")
     shutil.rmtree(kv, ignore_errors=True)
     with open(os.path.join(out, "result.json"), "w", encoding="utf-8") as fp:
         json.dump(result, fp, indent=1, ensure_ascii=False)
@@ -204,6 +221,9 @@ def main():
         run(None, args.out, args.full, args.needle_chars)
         print("qwen_gate: reference recorded in", args.out)
         return 0
+    msg = check_preflight(args.out, args.baseline)
+    if msg:
+        raise SystemExit(msg)
     current = run(args.bin, args.out, args.full, args.needle_chars)
     failures = [f"{name}: reply differs from the reference"
                 for name in compare_replies(args.baseline, current["replies"])]
