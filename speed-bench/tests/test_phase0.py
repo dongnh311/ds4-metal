@@ -116,6 +116,12 @@ class RunTest(unittest.TestCase):
             self.assertIsNone(out)
             self.assertEqual(os.listdir(tmp), [])
 
+    def test_missing_csv_exits_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit):
+                self.run_one(tmp, "exit 0\n")
+            self.assertFalse(any(n.endswith(".result.json") for n in os.listdir(tmp)))
+
 
 class _FakeSampler:
     def __enter__(self):

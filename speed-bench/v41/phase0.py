@@ -155,8 +155,11 @@ def run_one(bin_dir, model, prompts_dir, out_dir, spec, dry_run=False,
     contaminated = bool(running())
     with open(stderr_path) as fp:
         stderr = fp.read()
-    with open(csv_path) as fp:
-        bench = parse_bench_csv(fp.read())
+    try:
+        with open(csv_path) as fp:
+            bench = parse_bench_csv(fp.read())
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"phase0: {tag} produced no usable CSV ({exc}), see {stderr_path}")
     row = combine(spec, bench, parse_profile(stderr), parse_cache(stderr), ws.summary(),
                   swap() - swap0, contaminated)
     row["router_log"] = router_log
