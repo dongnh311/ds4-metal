@@ -81198,6 +81198,36 @@ static int ds4_sessions_eval_batch_with_prefill_metal(
 }
 #endif
 
+#ifdef DS4_HAS_QWEN4_GPU
+/* Grow every qwen4 session in the batch before any of them is used. A single
+ * combined pass (grow session i, immediately re-read its score/tile_max)
+ * would leave an earlier session's pointers stale: growing session j's KV
+ * capacity can resize the shared arena's score/tile_max buffers (session i
+ * and j borrow the same arena when neither owns private scratch), freeing
+ * the buffers session i already re-read.  So two passes: grow every session
+ * first, then re-read every borrowing session's arena pointers only after
+ * all growth for this batch is done. */
+static int qwen4_batch_ensure_caps(ds4_decode_item *items, int count, char *err, size_t errlen) {
+    for (int i = 0; i < count; i++) {
+        ds4_session *s = items[i].session;
+        if (ds4_session_is_qwen4(s) && s->qwen4_graph_ready &&
+            qwen4_session_ensure_cap(s, s->qwen4_graph.pos + DS4_QWEN4_KV_MARGIN, err, errlen) != 0) {
+            return 1;
+        }
+    }
+    for (int i = 0; i < count; i++) {
+        ds4_session *s = items[i].session;
+        ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+        ds4_qwen4_gpu_graph *arena = s->engine->qwen4_shared_workspace;
+        if (ds4_session_is_qwen4(s) && s->qwen4_graph_ready && !g->owns_scratch && arena) {
+            g->score = arena->score;
+            g->tile_max = arena->tile_max;
+        }
+    }
+    return 0;
+}
+#endif
+
 static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
                                         char *err, size_t errlen);
 static int ds4_sessions_eval_batch_with_prefill_cuda(
@@ -81254,13 +81284,7 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
         }
     }
 #ifdef DS4_HAS_QWEN4_GPU
-    for (int i = 0; i < count; i++) {
-        ds4_session *s = items[i].session;
-        if (ds4_session_is_qwen4(s) && s->qwen4_graph_ready &&
-            qwen4_session_ensure_cap(s, s->qwen4_graph.pos + DS4_QWEN4_KV_MARGIN, err, errlen) != 0) {
-            return 1;
-        }
-    }
+    if (qwen4_batch_ensure_caps(items, count, err, errlen) != 0) return 1;
 #endif
 #ifdef DS4_HAS_QWEN4_METAL
     if (count >= 2 && count <= 16 && ds4_session_is_qwen4(items[0].session) && e->glm_mtp &&
@@ -81472,13 +81496,7 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
     }
 
 #ifdef DS4_HAS_QWEN4_GPU
-    for (int i = 0; i < count; i++) {
-        ds4_session *s = items[i].session;
-        if (ds4_session_is_qwen4(s) && s->qwen4_graph_ready &&
-            qwen4_session_ensure_cap(s, s->qwen4_graph.pos + DS4_QWEN4_KV_MARGIN, err, errlen) != 0) {
-            return 1;
-        }
-    }
+    if (qwen4_batch_ensure_caps(items, count, err, errlen) != 0) return 1;
 #endif
 #ifndef DS4_NO_GPU
     if (e->backend == DS4_BACKEND_CUDA) {

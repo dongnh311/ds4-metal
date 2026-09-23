@@ -7330,10 +7330,10 @@ static void test_qwen_kv_grow(void) {
     static int ref[640], got[640];
 
     /* Batched decode over the shared arena (DS4_TEST_SHARE_WORKSPACE=1):
-     * P crosses its capacity inside the batch and grows the arena's indexer
-     * scores; Q keeps borrowing them. The flag on must reproduce the same
-     * batched tokens as the flag off.  Then P restarts on a short prompt and
-     * shrinks while Q, still larger, keeps decoding correctly. */
+     * Q crosses its capacity inside the batch first and grows the arena's
+     * indexer scores; P keeps borrowing them. The flag on must reproduce the
+     * same batched tokens as the flag off.  Then P restarts on a short prompt
+     * and shrinks while Q, still larger, keeps decoding correctly. */
     if (test_env_bool("DS4_TEST_SHARE_WORKSPACE")) {
         ds4_tokens pp = {0}, qp = {0}, small = {0};
         test_kv_grow_prompt(engine, 3900, 10, &pp);
@@ -7356,7 +7356,11 @@ static void test_qwen_kv_grow(void) {
                 };
                 toks[flag][0][step] = items[0].token;
                 toks[flag][1][step] = items[1].token;
-                TEST_ASSERT(ds4_sessions_eval_batch(items, 2, err, sizeof(err)) == 0);
+                const int rc = ds4_sessions_eval_batch(items, 2, err, sizeof(err));
+                if (rc != 0) {
+                    fprintf(stderr, "ds4-test: batched kv-grow decode failed: %s\n", err);
+                }
+                TEST_ASSERT(rc == 0);
             }
             if (flag == 1) {
                 TEST_ASSERT(ds4_test_qwen4_alloc_cap(p) == 8192);
