@@ -833,3 +833,25 @@ dequant arithmetic, and the byte-exact contract fixes that op sequence. Each
 remaining byte-exact item is at or below ~1%. A larger step needs a different
 accumulation order (for example SIMD-group matrix tiles for the T=2 MoE rows),
 which changes the last bits of the output: a product decision, not a bug.
+
+### Non-byte-exact MoE rows: probe says no (2026-09-23)
+
+Gate set before the probe: build non-exact kernels only if the IQ2_XXS mid
+kernel gets at least 25% faster. Measured with `kbench` on layer 30 (T=2,
+4 of 10 experts shared; T=1), three rounds alternated with the exact kernel:
+
+| mid variant | T=2 us | T=1 us | mid rel. L2 error |
+|---|---:|---:|---:|
+| exact (shipping) | 129-133 | 75-77 | 0 |
+| float4 `dot` (reordered sums, float) | 131-136 | 74-78 | 1.6e-7 |
+| half arithmetic, scalar | 137.7 | 79-89 | 6.8e-4 |
+| half4 `dot` | 135-140 | 80 | 6.3e-4 |
+| upper bound: 1 of 8 elements' work kept | 111.4 | - | (wrong output) |
+
+Half arithmetic is no faster on M5 and adds conversions. The upper bound is
+what any rearrangement of the per-element math could reach (half, int, SIMD-
+group matrix tiles): -15% for mid; the same ablation on the Q4_K down rows
+gives 108.1 -> 94.8 us (-12%). The rest of the time is the IQ2_XXS / K-quant
+block decode (scales, grid and sign indices, loads), which the format fixes.
+With the MoE rows at ~33% of a verify step, the end-to-end ceiling of this
+direction is a few percent, so it is closed: the byte-exact kernels stay.
