@@ -6,11 +6,13 @@ DS4_PATTERN = r"(^|/)ds4(-server|-agent|-bench|-eval)?( |$)"
 _SWAP_RE = re.compile(r"used = ([\d.]+)M")
 
 
-def ds4_running(pgrep=None):
+def ds4_running(pgrep=None, run=subprocess.run):
     """pgrep -fl lines for running ds4 binaries; '' when the machine is free."""
     if pgrep is None:
-        out = subprocess.run(["pgrep", "-fl", DS4_PATTERN],
-                             capture_output=True, text=True).stdout
+        proc = run(["pgrep", "-fl", DS4_PATTERN], capture_output=True, text=True)
+        if proc.returncode not in (0, 1):
+            raise RuntimeError(f"pgrep failed (rc={proc.returncode}): {proc.stderr.strip()}")
+        out = proc.stdout
     else:
         out = pgrep()
     return out.strip()
