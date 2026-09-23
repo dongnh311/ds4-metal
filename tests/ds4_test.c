@@ -126,6 +126,8 @@ static ds4_engine *test_open_engine(bool quality) {
         .mtp_draft_tokens = (mtp && mtp[0] && !quality) ? 4 : 0,
         .glm_mtp = test_env_bool("DS4_TEST_GLM_MTP"),
         .dspark_exact_sampling = test_env_bool("DS4_TEST_MTP_EXACT"),
+        .ple_path = getenv("DS4_TEST_PLE"),
+        .share_session_prefill_workspace = test_env_bool("DS4_TEST_SHARE_WORKSPACE"),
     };
     TEST_ASSERT(ds4_engine_open(&engine, &opt) == 0);
     return engine;
