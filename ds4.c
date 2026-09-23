@@ -57867,6 +57867,14 @@ uint32_t ds4_qwen4_kv_shrink_target(uint32_t alloc, uint32_t need, uint32_t init
 
 typedef struct ds4_qwen4_gpu_graph {
     uint32_t ctx_cap;
+    /* Rows allocated for the context-sized caches (KV, scales, block keys,
+     * positions, indexer scores).  Equals ctx_cap unless kv_grow; the Metal
+     * bindings and every buffer guard use it, while ctx_cap stays the logical
+     * limit (maximum position, ik ring, checkpoint header). */
+    uint32_t alloc_cap;
+    bool kv_grow;          /* DS4_QWEN4_KV_GROW: alloc_cap follows the context in use */
+    uint32_t kv_init_cap;  /* alloc_cap floor when kv_grow */
+    uint32_t kv_reserve;   /* rows reserved past the prompt on sync */
     uint32_t pos;
     uint32_t cap_tokens;
     uint32_t k_blocks;
@@ -58192,6 +58200,100 @@ static ds4_gpu_tensor *qwen4_graph_alloc_f32(uint64_t n) {
     return t;
 }
 
+/* The context-sized caches of one graph, allocated together so a resize can
+ * build the new set before it lets go of the old one.  The ring-sized raw
+ * indexer cache (ik_ring != 0) does not depend on the context and is not
+ * part of the set. */
+typedef struct qwen4_ctx_bufs {
+    ds4_gpu_tensor *k[DS4_MAX_LAYER], *v[DS4_MAX_LAYER];    /* half cache */
+    ds4_gpu_tensor *kf[DS4_MAX_LAYER], *vf[DS4_MAX_LAYER];  /* FP8 / 4-bit cache */
+    ds4_gpu_tensor *ks[DS4_MAX_LAYER], *vs[DS4_MAX_LAYER];  /* per-64 scales */
+    ds4_gpu_tensor *ik[DS4_MAX_LAYER];                      /* only when the ring is off */
+    ds4_gpu_tensor *bk[DS4_MAX_LAYER];                      /* pooled block keys */
+    ds4_gpu_tensor *pos3;
+} qwen4_ctx_bufs;
+
+static void qwen4_ctx_bufs_free(qwen4_ctx_bufs *b) {
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(b->k[il]);
+        ds4_gpu_tensor_free(b->v[il]);
+        ds4_gpu_tensor_free(b->kf[il]);
+        ds4_gpu_tensor_free(b->vf[il]);
+        ds4_gpu_tensor_free(b->ks[il]);
+        ds4_gpu_tensor_free(b->vs[il]);
+        ds4_gpu_tensor_free(b->ik[il]);
+        ds4_gpu_tensor_free(b->bk[il]);
+    }
+    ds4_gpu_tensor_free(b->pos3);
+    memset(b, 0, sizeof(*b));
+}
+
+static uint64_t qwen4_ctx_bufs_bytes(const qwen4_ctx_bufs *b) {
+    uint64_t total = ds4_gpu_tensor_bytes(b->pos3);
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        total += ds4_gpu_tensor_bytes(b->k[il]) + ds4_gpu_tensor_bytes(b->v[il]) +
+                 ds4_gpu_tensor_bytes(b->kf[il]) + ds4_gpu_tensor_bytes(b->vf[il]) +
+                 ds4_gpu_tensor_bytes(b->ks[il]) + ds4_gpu_tensor_bytes(b->vs[il]) +
+                 ds4_gpu_tensor_bytes(b->ik[il]) + ds4_gpu_tensor_bytes(b->bk[il]);
+    }
+    return total;
+}
+
+/* Allocate the context-sized caches for rows positions in g's KV format.
+ * Sizes match what qwen4_graph_alloc always allocated for ctx_cap rows. */
+static bool qwen4_ctx_bufs_alloc(const ds4_qwen4_gpu_graph *g, uint32_t rows, qwen4_ctx_bufs *b) {
+    memset(b, 0, sizeof(*b));
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t blocks = (uint64_t)rows / 4u + 1u;
+    bool ok = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        if (ds4_qwen4_layer_is_linear(il)) continue;
+        if (g->kv_fp8) {
+            const uint64_t kv_bytes = g->kv_q4 ? (uint64_t)rows * kv_dim / 2u : (uint64_t)rows * kv_dim;
+            b->kf[il] = ds4_gpu_tensor_alloc(kv_bytes);
+            b->vf[il] = ds4_gpu_tensor_alloc(kv_bytes);
+            b->ks[il] = ds4_gpu_tensor_alloc((uint64_t)rows * (kv_dim / 64u) * 2u);
+            b->vs[il] = ds4_gpu_tensor_alloc((uint64_t)rows * (kv_dim / 64u) * 2u);
+            ok = b->kf[il] && b->vf[il] && b->ks[il] && b->vs[il];
+        } else {
+            b->k[il] = ds4_gpu_tensor_alloc((uint64_t)rows * kv_dim * 2u);
+            b->v[il] = ds4_gpu_tensor_alloc((uint64_t)rows * kv_dim * 2u);
+            ok = b->k[il] && b->v[il];
+        }
+        if (ok && !g->ik_ring) {
+            b->ik[il] = qwen4_graph_alloc_f32((uint64_t)rows * DS4_N_INDEXER_HEAD_DIM);
+            ok = b->ik[il] != NULL;
+        }
+        if (ok) {
+            b->bk[il] = ds4_gpu_tensor_alloc(blocks * DS4_N_INDEXER_HEAD_DIM * 2u);
+            ok = b->bk[il] != NULL;
+        }
+    }
+    if (ok) {
+        b->pos3 = qwen4_graph_alloc_f32((uint64_t)rows * 4u);
+        ok = b->pos3 != NULL;
+    }
+    if (!ok) qwen4_ctx_bufs_free(b);
+    return ok;
+}
+
+/* Exchange the graph's context-sized caches with the set in b. */
+static void qwen4_ctx_bufs_swap(ds4_qwen4_gpu_graph *g, qwen4_ctx_bufs *b) {
+#define QWEN4_SWAP(a_, b_) do { ds4_gpu_tensor *t_ = (a_); (a_) = (b_); (b_) = t_; } while (0)
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        QWEN4_SWAP(g->layer_k_cache[il], b->k[il]);
+        QWEN4_SWAP(g->layer_v_cache[il], b->v[il]);
+        QWEN4_SWAP(g->layer_k_cache_fp8[il], b->kf[il]);
+        QWEN4_SWAP(g->layer_v_cache_fp8[il], b->vf[il]);
+        QWEN4_SWAP(g->layer_k_scale[il], b->ks[il]);
+        QWEN4_SWAP(g->layer_v_scale[il], b->vs[il]);
+        if (!g->ik_ring) QWEN4_SWAP(g->layer_ik_cache[il], b->ik[il]);
+        QWEN4_SWAP(g->layer_block_key[il], b->bk[il]);
+    }
+    QWEN4_SWAP(g->pos3, b->pos3);
+#undef QWEN4_SWAP
+}
+
 /* shared borrows the engine arena for the transients; NULL allocates private
  * ones.  A borrowing graph must fit inside the arena it borrows: the caller
  * checks cap_tokens and n_block_cap before passing one.
@@ -58199,11 +58301,14 @@ static ds4_gpu_tensor *qwen4_graph_alloc_f32(uint64_t n) {
  * state_pool/hist_pool, when given, hold every slot's recurrent state in one
  * tensor per layer and this graph takes slot's view of it.  A batched decode
  * then advances all its rows with one dispatch; without a pool each session
- * keeps its own tensors and the batch falls back to a dispatch per row. */
+ * keeps its own tensors and the batch falls back to a dispatch per row.
+ * alloc_rows, when non-zero, allocates the context-sized caches for that many
+ * rows (grow-on-demand); 0 allocates ctx_cap. */
 static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint32_t ctx_cap, uint32_t cap_tokens,
                               bool mtp, const ds4_qwen4_gpu_graph *shared,
                               ds4_gpu_tensor *const *state_pool,
-                              ds4_gpu_tensor *const *hist_pool, uint32_t slot) {
+                              ds4_gpu_tensor *const *hist_pool, uint32_t slot,
+                              uint32_t alloc_rows) {
     memset(g, 0, sizeof(*g));
     /* In-kernel FP8 KV: read the env here so every graph_alloc caller (session,
      * one-shot generate, bench) allocates E4M3 byte K/V + per-64-block scale
@@ -58231,6 +58336,9 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     const uint64_t iq_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
     g->ctx_cap = ctx_cap;
+    g->alloc_cap = alloc_rows && alloc_rows < ctx_cap ? alloc_rows : ctx_cap;
+    g->kv_grow = alloc_rows != 0;
+    g->kv_init_cap = g->alloc_cap;
     g->cap_tokens = cap_tokens;
     g->k_blocks = DS4_N_INDEXER_TOP_K / 4u;
     g->n_logit_rows = mtp ? 3u : 1u;
@@ -58242,7 +58350,7 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
             if (n < 3) n = 3; if (n > 16) n = 16;
             if ((uint32_t)(n + 1) > g->n_logit_rows) g->n_logit_rows = (uint32_t)(n + 1); }
     }
-    g->n_block_cap = ctx_cap / 4u + 1u;
+    g->n_block_cap = g->alloc_cap / 4u + 1u;
     /* The raw indexer keys are read only to pool a block's key when its last
      * token arrives: a forward of T tokens reads back at most ratio - 1 keys
      * before its first position. Keeping the last cap_tokens + 2 * ratio keys
@@ -58362,33 +58470,19 @@ private_state:
                 ok = g->snap_lin_state[il] && g->snap_lin_hist[il];
             }
         } else {
-            if (g->kv_fp8) {
-                /* In-kernel FP8: E4M3 byte cache (1 B/elem) + per-64-block fp16
-                 * scale INSTEAD of the half k/v cache -- the KV memory win. */
-                const uint64_t kv_bytes = g->kv_q4 ? (uint64_t)ctx_cap * kv_dim / 2u : (uint64_t)ctx_cap * kv_dim;
-                g->layer_k_cache_fp8[il] = ds4_gpu_tensor_alloc(kv_bytes);
-                g->layer_v_cache_fp8[il] = ds4_gpu_tensor_alloc(kv_bytes);
-                g->layer_k_scale[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * (kv_dim / 64u) * 2u);
-                g->layer_v_scale[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * (kv_dim / 64u) * 2u);
-            } else {
-                g->layer_k_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 2u);
-                g->layer_v_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 2u);
-            }
-            g->layer_ik_cache[il] = qwen4_graph_alloc_f32((uint64_t)(g->ik_ring ? g->ik_ring : ctx_cap) *
-                                                          DS4_N_INDEXER_HEAD_DIM);
-            g->layer_block_key[il] = ds4_gpu_tensor_alloc((uint64_t)g->n_block_cap * DS4_N_INDEXER_HEAD_DIM * 2u);
-            if (g->kv_fp8) {
-                ok = ok && g->layer_k_cache_fp8[il] && g->layer_v_cache_fp8[il] &&
-                     g->layer_k_scale[il] && g->layer_v_scale[il] &&
-                     g->layer_ik_cache[il] && g->layer_block_key[il];
-            } else {
-                ok = ok && g->layer_k_cache[il] && g->layer_v_cache[il] &&
-                     g->layer_ik_cache[il] && g->layer_block_key[il];
+            /* The context-sized caches come from qwen4_ctx_bufs_alloc below;
+             * only the ring-sized raw indexer cache is allocated here. */
+            if (g->ik_ring) {
+                g->layer_ik_cache[il] = qwen4_graph_alloc_f32((uint64_t)g->ik_ring * DS4_N_INDEXER_HEAD_DIM);
+                ok = ok && g->layer_ik_cache[il];
             }
         }
     }
-    g->pos3 = qwen4_graph_alloc_f32((uint64_t)ctx_cap * 4u);
-    ok = ok && g->pos3;
+    if (ok) {
+        qwen4_ctx_bufs ctx_bufs;
+        ok = qwen4_ctx_bufs_alloc(g, g->alloc_cap, &ctx_bufs);
+        if (ok) qwen4_ctx_bufs_swap(g, &ctx_bufs);  /* ctx_bufs now holds the graph's NULLs */
+    }
     g->host_pos3 = xmalloc(T * 4u * sizeof(uint32_t));
     g->host_logits = xmalloc((uint64_t)g->n_logit_rows * DS4_N_VOCAB * sizeof(float));
     if (!ok) {
@@ -59115,7 +59209,7 @@ static bool qwen4_graph_attention_tail(ds4_qwen4_gpu_graph *g, const ds4_model *
                                          m->map, m->size, l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
                                          l->indexer_q_norm->abs_offset, T, DS4_N_HEAD, DS4_N_HEAD_KV,
                                          DS4_N_HEAD_DIM, DS4_N_ROT, DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
-                                         pos0, g->ctx_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS,
+                                         pos0, g->alloc_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS,
                                          g->layer_k_cache_fp8[il], g->layer_v_cache_fp8[il],
                                          g->layer_k_scale[il], g->layer_v_scale[il], kv_fp8, g->ik_ring);
     qsa_pf_end(QSA_PF_PREP);
@@ -59475,7 +59569,7 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
  * chunk.  g->R keeps the pre-mixer streams of every row afterwards. */
 static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                        const int *tokens, uint32_t T, float *logits_out, bool all_rows) {
-    if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
+    if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->alloc_cap) return false;
     if (all_rows && T > g->n_logit_rows) return false;
     for (uint32_t t = 0; t < T; t++) {
         if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) {
@@ -59819,7 +59913,7 @@ static bool qwen4_graph_state_swap2(ds4_qwen4_gpu_graph *g) {
 static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                  uint32_t row, const int *next_tokens, uint32_t T, uint32_t idx, bool want_logits,
                                  float *logits_out, int *draft_out) {
-    if (!g->mtp_R || T == 0u || T > 3u || idx > g->ctx_cap || T > g->ctx_cap - idx ||
+    if (!g->mtp_R || T == 0u || T > 3u || idx > g->alloc_cap || T > g->alloc_cap - idx ||
         row > g->cap_tokens || T > g->cap_tokens - row) return false;
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC;
     const uint32_t il = DS4_N_LAYER - 1u;
@@ -59913,7 +60007,7 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
 static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                        int next_token, uint32_t idx, int *draft_out) {
     if (!g->mtp_R || g->mtp_last_rows == 0u || g->mtp_last_rows > 3u || !draft_out ||
-        idx >= g->ctx_cap || next_token < 0 || next_token >= (int)DS4_N_VOCAB) return false;
+        idx >= g->alloc_cap || next_token < 0 || next_token >= (int)DS4_N_VOCAB) return false;
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC;
     const uint32_t il = DS4_N_LAYER - 1u;
     const ds4_layer_weights *l = &w->layer[il];
@@ -60005,7 +60099,7 @@ static int generate_qwen4_metal_argmax(
         return 1;
     }
     ds4_qwen4_gpu_graph *g = xcalloc(1, sizeof(*g));
-    if (!qwen4_graph_alloc(g, weights, (uint32_t)ctx_size, qwen4_prefill_chunk_tokens((uint32_t)ctx_size), false, NULL, NULL, NULL, 0)) {
+    if (!qwen4_graph_alloc(g, weights, (uint32_t)ctx_size, qwen4_prefill_chunk_tokens((uint32_t)ctx_size), false, NULL, NULL, NULL, 0, 0u)) {
         free(g);
         return 1;
     }
@@ -68584,7 +68678,7 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
             return 1;
         }
         ds4_qwen4_gpu_graph *g = xcalloc(1, sizeof(*g));
-        if (!qwen4_graph_alloc(g, weights, 8192u, 128u, false, NULL, NULL, NULL, 0)) {
+        if (!qwen4_graph_alloc(g, weights, 8192u, 128u, false, NULL, NULL, NULL, 0, 0u)) {
             free(g);
             fclose(lf);
             return 1;
@@ -68722,7 +68816,7 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
             return 1;
         }
         ds4_qwen4_gpu_graph *g = xcalloc(1, sizeof(*g));
-        if (!qwen4_graph_alloc(g, weights, n_seq + 4u, chunk, draft != NULL, NULL, NULL, NULL, 0)) {
+        if (!qwen4_graph_alloc(g, weights, n_seq + 4u, chunk, draft != NULL, NULL, NULL, NULL, 0, 0u)) {
             free(g);
             return 1;
         }
@@ -73819,7 +73913,15 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
          * its own caches.  A session that needs a wider arena replaces it
          * when no live session borrows it (a new context size once the
          * previous sessions closed) and keeps private transients otherwise. */
-        const uint32_t block_cap = (uint32_t)ctx_size / 4u + 1u;
+        /* DS4_QWEN4_KV_GROW=1 (Metal): allocate the context-sized caches for
+         * the initial capacity and grow them as the conversation does. */
+        uint32_t kv_alloc = 0;
+        {
+            const char *grow = getenv("DS4_QWEN4_KV_GROW");
+            if (grow && grow[0] && grow[0] != '0' && e->backend == DS4_BACKEND_METAL)
+                kv_alloc = ds4_qwen4_kv_initial_cap((uint32_t)ctx_size, getenv("DS4_QWEN4_KV_INIT_CAP"));
+        }
+        const uint32_t block_cap = (kv_alloc ? kv_alloc : (uint32_t)ctx_size) / 4u + 1u;
         const bool share = e->share_session_prefill_workspace &&
                            e->backend == DS4_BACKEND_METAL;
         const bool arena_fits = e->qwen4_shared_workspace &&
@@ -73849,10 +73951,19 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                e->glm_mtp, shared,
                                s->qwen4_slot >= 0 ? e->qwen4_lin_state_pool : NULL,
                                s->qwen4_slot >= 0 ? e->qwen4_lin_hist_pool : NULL,
-                               s->qwen4_slot >= 0 ? (uint32_t)s->qwen4_slot : 0u)) {
+                               s->qwen4_slot >= 0 ? (uint32_t)s->qwen4_slot : 0u, kv_alloc)) {
             if (s->qwen4_slot >= 0) e->qwen4_pool_used &= ~(UINT64_C(1) << s->qwen4_slot);
             free(s);
             return 1;
+        }
+        s->qwen4_graph.kv_reserve = ds4_qwen4_kv_reserve(getenv("DS4_QWEN4_KV_RESERVE"));
+        if (kv_alloc) {
+            static bool announced_grow = false;
+            if (!announced_grow) {
+                announced_grow = true;
+                fprintf(stderr, "ds4: qwen4 grow-on-demand KV: %u of %d rows allocated up front\n",
+                        s->qwen4_graph.alloc_cap, ctx_size);
+            }
         }
         if (share && !e->qwen4_shared_workspace) {
             e->qwen4_shared_workspace = xcalloc(1, sizeof(*e->qwen4_shared_workspace));
@@ -79599,7 +79710,7 @@ static bool qwen4_batch_attention_rows(int count, ds4_qwen4_gpu_graph *rowg,
             return false;
         }
         qwen4_attn_row_bind(&rows[i], r, il, r->pos, sparse_pos);
-        if (r->pos >= r->ctx_cap) return false;
+        if (r->pos >= r->alloc_cap) return false;
     }
     return qwen4_batch_attention_entries(rows, (uint32_t)count, g, m, l, il);
 }
@@ -79631,7 +79742,7 @@ static bool qwen4_batch_attention(int count, ds4_qwen4_gpu_graph *rowg,
                                             l->indexer_q_norm->abs_offset, 1u, DS4_N_HEAD,
                                             DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT,
                                             DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
-                                            pos0, r->ctx_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS,
+                                            pos0, r->alloc_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS,
                                             r->layer_k_cache_fp8[il], r->layer_v_cache_fp8[il],
                                             r->layer_k_scale[il], r->layer_v_scale[il],
                                             qwen4_kv_mode(r), r->ik_ring);
@@ -79929,7 +80040,7 @@ static bool qwen4_graph_encode_native_session_batch_ragged(const qwen4_batch_mem
                 for (uint32_t t = 0; t < mem[i].n; t++) {
                     ds4_gpu_qwen4_attn_row *e = &arows[mem[i].row0 + t];
                     qwen4_attn_row_bind(e, r, il, r->pos + t, sparse_pos);
-                    if (e->pos >= r->ctx_cap) ok = false;
+                    if (e->pos >= r->alloc_cap) ok = false;
                 }
             }
             if (ok) ok = qwen4_batch_attention_entries(arows, T, g, m, l, il) &&
@@ -79972,7 +80083,7 @@ static bool qwen4_batch_mtp_drafts(qwen4_batch_member *mem, int count, const uin
             ids[mem[i].row0 + t] = t + 1u < committed[i] ? mem[i].tokens[t + 1u] : parents[i];
             ds4_gpu_qwen4_attn_row *e = &arows[mem[i].row0 + t];
             qwen4_attn_row_bind(e, r, il, idx0[i] + t, sparse_pos);
-            if (e->pos >= r->ctx_cap) return false;
+            if (e->pos >= r->alloc_cap) return false;
         }
     }
     for (uint32_t t = 0; t < N; t++)
@@ -86326,6 +86437,18 @@ int ds4_session_ctx(ds4_session *s) {
 int ds4_session_prefill_cap(ds4_session *s) {
     return s ? (int)s->prefill_cap : 0;
 }
+
+#ifndef DS4_NO_GPU
+/* Test hook: rows allocated for the qwen4 context-sized caches, or -1. */
+int ds4_test_qwen4_alloc_cap(ds4_session *s) {
+#ifdef DS4_HAS_QWEN4_GPU
+    if (s && ds4_session_is_qwen4(s) && s->qwen4_graph_ready) return (int)s->qwen4_graph.alloc_cap;
+#else
+    (void)s;
+#endif
+    return -1;
+}
+#endif
 
 #ifndef DS4_NO_GPU
 /* Test the actual compressor frontiers, not just a short continuation whose

@@ -12,6 +12,7 @@ uint32_t ds4_qwen4_kv_initial_cap(uint32_t ctx_cap, const char *env_value);
 uint32_t ds4_qwen4_kv_grow_target(uint32_t alloc, uint32_t need, uint32_t ctx_cap);
 uint32_t ds4_qwen4_kv_shrink_target(uint32_t alloc, uint32_t need, uint32_t init, uint32_t ctx_cap);
 uint32_t ds4_qwen4_kv_reserve(const char *env_value);
+int ds4_test_qwen4_alloc_cap(ds4_session *s);
 
 static ds4_engine *test_engine_fast;
 static ds4_engine *test_engine_quality;
@@ -7229,6 +7230,125 @@ static void test_qwen_kv_grow_policy(void) {
     TEST_ASSERT(ds4_qwen4_kv_reserve("0") == 4096);
 }
 
+/* Grow-on-demand KV, model-backed.  Needs a Qwen3.8 model and its PLE:
+ *   DS4_TEST_MODEL=...gguf DS4_TEST_PLE=...PLE-Q4_1.gguf DS4_TEST_GLM_MTP=1 \
+ *   DS4_TEST_SSD_STREAMING=1 DS4_TEST_SSD_STREAMING_CACHE_GB=6 \
+ *   DS4_QWEN4_STREAM_FULL_LAYERS=32 DS4_QWEN4_PLE_PREFETCH_FULL=0 \
+ *   ./ds4_test --qwen-kv-grow
+ * Every case compares greedy tokens with the flag on against the flag off. */
+#define TEST_KV_CTX 65536
+
+static void test_kv_grow_env(bool grow, uint32_t init, uint32_t reserve) {
+    char v[32];
+    if (grow) setenv("DS4_QWEN4_KV_GROW", "1", 1); else unsetenv("DS4_QWEN4_KV_GROW");
+    snprintf(v, sizeof(v), "%u", init);
+    setenv("DS4_QWEN4_KV_INIT_CAP", v, 1);
+    snprintf(v, sizeof(v), "%u", reserve);
+    setenv("DS4_QWEN4_KV_RESERVE", v, 1);
+}
+
+/* n raw (untemplated) tokens of varied text: numbers change on every line so
+ * greedy decode keeps reading the KV instead of settling into a loop. */
+static void test_kv_grow_prompt(ds4_engine *engine, int n, int seed, ds4_tokens *out) {
+    buf text = {0};
+    ds4_tokens all = {0};
+    for (int i = 0; all.len < n; ) {
+        for (int j = 0; j < 256; j++, i++) {
+            char line[192];
+            snprintf(line, sizeof(line),
+                     "Log %d.%d: the harbor recorded %d ships, wind %d knots, tide %d cm.\n",
+                     seed, i, (i * 37 + seed) % 91, (i * 13 + seed) % 43, (i * 29 + seed) % 311);
+            buf_puts(&text, line);
+        }
+        ds4_tokens_free(&all);
+        ds4_tokenize_text(engine, text.ptr, &all);
+    }
+    ds4_tokens_free(out);
+    for (int i = 0; i < n; i++) ds4_tokens_push(out, all.v[i]);
+    ds4_tokens_free(&all);
+    buf_free(&text);
+}
+
+/* Greedy-decode n tokens after prompt into out (plain eval, or MTP speculation
+ * when spec).  Unused slots are -1.  Returns the session's allocated KV rows
+ * at the end, or -1 when a step failed. */
+static int test_kv_grow_decode(ds4_engine *engine, ds4_session *s, int n, bool spec, int *out) {
+    char err[192] = {0};
+    const int eos = ds4_token_eos(engine);
+    int got = 0;
+    for (int j = 0; j < n; j++) out[j] = -1;
+    while (got < n) {
+        const int token = ds4_session_argmax(s);
+        if (!spec) {
+            out[got++] = token;
+            if (ds4_session_eval(s, token, err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-test: kv-grow eval failed: %s\n", err);
+                return -1;
+            }
+            continue;
+        }
+        int toks[17];
+        const int ntok = ds4_session_eval_speculative_argmax(s, token, n - got, eos, toks,
+                                                             (int)(sizeof(toks) / sizeof(toks[0])),
+                                                             err, sizeof(err));
+        if (ntok <= 0) {
+            fprintf(stderr, "ds4-test: kv-grow speculative eval failed: %s\n", err);
+            return -1;
+        }
+        for (int j = 0; j < ntok && got < n; j++) out[got++] = toks[j];
+        if (toks[ntok - 1] == eos) break;
+    }
+    return ds4_test_qwen4_alloc_cap(s);
+}
+
+/* Fresh session, sync prompt, decode n tokens.  Returns alloc rows or -1. */
+static int test_kv_grow_run(ds4_engine *engine, const ds4_tokens *prompt, int n, bool spec, int *out) {
+    ds4_session *s = NULL;
+    char err[192] = {0};
+    int alloc = -1;
+    if (ds4_session_create(&s, engine, TEST_KV_CTX) != 0 || !s) return -1;
+    if (ds4_session_sync(s, prompt, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4-test: kv-grow sync failed: %s\n", err);
+    } else {
+        alloc = test_kv_grow_decode(engine, s, n, spec, out);
+    }
+    ds4_session_free(s);
+    return alloc;
+}
+
+static void test_qwen_kv_grow(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine || !ds4_engine_is_qwen4(engine)) {
+        puts("qwen-kv-grow: Qwen3.8 model required, skipped");
+        return;
+    }
+    char *saved[4] = {
+        test_save_env("DS4_QWEN4_KV_GROW"), test_save_env("DS4_QWEN4_KV_INIT_CAP"),
+        test_save_env("DS4_QWEN4_KV_RESERVE"), test_save_env("DS4_QWEN4_KV_GROW_TEST_FAIL"),
+    };
+    ds4_tokens prompt = {0};
+    static int ref[640], got[640];
+
+    /* The flag off keeps the full capacity; on starts at the initial one and
+     * decodes the same tokens while everything fits. */
+    test_kv_grow_prompt(engine, 1000, 1, &prompt);
+    test_kv_grow_env(false, 4096, 64);
+    TEST_ASSERT(test_kv_grow_run(engine, &prompt, 32, false, ref) == TEST_KV_CTX);
+    test_kv_grow_env(true, 4096, 64);
+    TEST_ASSERT(test_kv_grow_run(engine, &prompt, 32, false, got) == 4096);
+    TEST_ASSERT(memcmp(ref, got, 32 * sizeof(int)) == 0);
+
+    /* Without growth a prompt past the initial capacity fails cleanly. */
+    test_kv_grow_prompt(engine, 5000, 2, &prompt);
+    TEST_ASSERT(test_kv_grow_run(engine, &prompt, 1, false, got) == -1);
+
+    ds4_tokens_free(&prompt);
+    test_restore_env("DS4_QWEN4_KV_GROW", saved[0]);
+    test_restore_env("DS4_QWEN4_KV_INIT_CAP", saved[1]);
+    test_restore_env("DS4_QWEN4_KV_RESERVE", saved[2]);
+    test_restore_env("DS4_QWEN4_KV_GROW_TEST_FAIL", saved[3]);
+}
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
@@ -7247,6 +7367,7 @@ static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
     {"--qwen4-prefill-checkpoints", "qwen4-prefill-checkpoints", "Qwen chunk checkpoints restore matching logits and state", test_qwen_prefill_checkpoints},
     {"--qwen4-restore-reuse", "qwen4-restore-reuse", "Qwen restore discards old verifier state and rejects truncated payloads", test_qwen_restore_reused_session},
+    {"--qwen-kv-grow", "qwen-kv-grow", "Qwen3.8 grow-on-demand KV decodes byte-identically to full capacity", test_qwen_kv_grow},
     {"--session-snapshot", "session-snapshot", "session snapshot and recurrent-state round trip", test_session_snapshot_roundtrip},
     {"--session-rewind", "session-rewind", "Qwen3.8 rewind by snapshot restore and by replay", test_session_rewind_replay},
     {"--session-rewind-resample", "session-rewind-resample", "exact-sampling tool-boundary resample rewind restores the block-start state", test_session_rewind_resample_boundary},
