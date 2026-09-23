@@ -771,3 +771,59 @@ geometry. Streaming K=36 costs ~5% against resident: ~1.1 ms per cycle of GPU
 time inside the gated layers (polls, pass 2) and ~0.8 ms of command-buffer
 boundaries. (A K=47 probe is not a gate test: its one streamed layer falls
 back to staging every step.)
+
+## What is left byte-exact after the MoE fix (2026-09-23, afternoon)
+
+New tools in `kbench/`: `qwen4_moe_kbench.c` runs the decode MoE mid/down
+kernels on one layer's real expert weights (32 rotating expert selections so
+the loop reads DRAM, chosen overlap between the two verify tokens, bit dump
+of the outputs), `qwen4_dense_kbench.c` does the same for a dense matvec, and
+`kbench_tensors.py` writes the tensor table they read. The kernel times match
+the engine's (mid ~130-140 us, Q4_K down ~105, Q2_K down ~80 per layer at
+T=2), so kernel variants are checked there in seconds, bit for bit.
+
+Verify step (resident, T=2, per-dispatch encoder timeline): ~840 dispatches.
+
+| kernel group | ms/step | per call | byte floor ratio |
+|---|---:|---:|---:|
+| IQ2_XXS mid (gate/up + shared) | 5.96 | 130 us | ~2x |
+| Q4_K dense (GDN qkv / z / out) | 5.82 | 78 / 49 / 42 us | 1.3-1.5x |
+| Q8_0 (attention q / o, output head) | 4.27 | 123 / 65 / 2313 us | 1.0-1.1x |
+| Q4_K + Q2_K down | 4.55 | 108 / 82 us | 1.7 / 2.2x |
+| hyper-connection F16 down + gate/mix | 5.46 | 31 / 30 us | 1.3x |
+| router F32 | 1.12 | 26 us | 1.4x |
+
+- The IQ2_XXS mid rows are compute-bound at T=2: 138 us whether the two
+  tokens share none or all ten experts (half the bytes), 81 us at T=1. Removing
+  the sign select saves 12%; the grid lookup and the weight loads are not the
+  cost. Down behaves the same way (110 vs 100 us for 0 vs 10 shared).
+- Kept: Q2_K down rows turn the 2-bit weight into a float through the 2^23
+  exponent instead of an integer conversion (exact): ~87 -> ~77 us per layer,
+  +0.2-0.3% decode on unc31 (3 of 3 pairs), same outputs on VI/EN/code,
+  resident and K=36 (commit 17e5000).
+- Upper bounds, measured: every hyper-connection norm dispatch together costs
+  ~1.3% (four extra copies per mixer cost 5.3%, same output); host gaps are 2%
+  of the wall, of which the wake-up after `waitUntilCompleted` is 74 us per
+  wait, two waits per cycle; the K=36 overhead against resident is the SSD
+  read of missed experts (~390 us per gate with misses, 55% of the gates).
+
+Measured and not kept (all byte-identical):
+
+| experiment | result |
+|---|---|
+| pair kernels: an expert both verify tokens chose is decoded once for both rows | -11% mid, -17% down at 10/10 shared, but slower at the real overlap (~4/10): mid 136 -> 148, down 112 -> 122 us (skip test + a second dispatch, ~15 us even when empty; one kernel with both paths is 19% slower from register pressure) |
+| IQ2_XXS grid as floats in threadgroup memory | 138 -> 154 us (per-threadgroup table fill) |
+| exponent conversion for Q4_K rows / IQ2_XXS grid bytes | neutral |
+| GDN qkv and z projections in one concurrent encoder | 0.98-1.01 |
+| committing the MTP draft buffer early | 0.996-1.001 |
+| 32K draft vocabulary instead of 64K | +0.4% VI, not worth the code/EN acceptance risk |
+
+The same build on the PROD model (`...-Q2KDownPad768-MTP`, resident, 8K VI,
+paired against the pre-fix build 3ff3bf6): 44.2-44.7 -> 50.9 t/s (+14.5%),
+byte-identical output. PROD itself is unchanged.
+
+Where this leaves decode: the row kernels are bound by their per-element
+dequant arithmetic, and the byte-exact contract fixes that op sequence. Each
+remaining byte-exact item is at or below ~1%. A larger step needs a different
+accumulation order (for example SIMD-group matrix tiles for the T=2 MoE rows),
+which changes the last bits of the output: a product decision, not a bug.
