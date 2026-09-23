@@ -914,9 +914,9 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
     require_ok(gk && gv && gsel && gcnt && ds4_gpu_tensor_write(gk, 0, kc, kvn * 2) && ds4_gpu_tensor_write(gv, 0, vc, kvn * 2) &&
                ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * sel_stride * 4) && ds4_gpu_tensor_write(gcnt, 0, cnt, T * 4), "attn mm setup");
     setenv("DS4_QWEN4_NO_ATTN_MM", "1", 1);
-    require_ok(ds4_gpu_qwen4_attn_decode_tensor(go_ref, gq, ggate, gk, gv, gsel, gcnt, NULL, T, H, Hkv, D, pos0, sparse, sel_stride, 0.0625f), "attn reference");
+    require_ok(ds4_gpu_qwen4_attn_decode_tensor(go_ref, gq, ggate, gk, gv, gsel, gcnt, NULL, T, H, Hkv, D, pos0, sparse, sel_stride, 0.0625f, NULL, NULL, NULL, NULL, 0u), "attn reference");
     unsetenv("DS4_QWEN4_NO_ATTN_MM");
-    require_ok(ds4_gpu_qwen4_attn_decode_tensor(go_new, gq, ggate, gk, gv, gsel, gcnt, partial, T, H, Hkv, D, pos0, sparse, sel_stride, 0.0625f), "attn mm");
+    require_ok(ds4_gpu_qwen4_attn_decode_tensor(go_new, gq, ggate, gk, gv, gsel, gcnt, partial, T, H, Hkv, D, pos0, sparse, sel_stride, 0.0625f, NULL, NULL, NULL, NULL, 0u), "attn mm");
     float *ref = download(go_ref, qn), *got = download(go_new, qn);
     double worst = 0.0, scale = 0.0;
     for (uint64_t i = 0; i < qn; i++) {
@@ -1308,11 +1308,11 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
         ds4_gpu_tensor *vout = ds4_gpu_tensor_view(gout, (uint64_t)pos * H * D * 4, (uint64_t)H * D * 4);
         require_ok(ds4_gpu_qwen4_attn_prep_tensor(gq, ggate, gkc, gvc, giqo, gikc, vqg, vk, vv, viq, vik, gpos3,
                                                   a->base, a->size, gq_off, gk_off, giq_off,
-                                                  1, H, Hkv, D, n_rot, Hi, Di, pos, cap, (float)base, (float)eps), "attn prep");
+                                                  1, H, Hkv, D, n_rot, Hi, Di, pos, cap, (float)base, (float)eps, NULL, NULL, NULL, NULL, 0u, 0u), "attn prep");
         const uint32_t n_blocks = (pos + 1) / ratio;
         if ((pos + 1) % ratio == 0) {
             require_ok(ds4_gpu_qwen4_idx_block_key_tensor(gbk, gikc, gpos3, a->base, a->size, gik_off, n_blocks - 1, 1,
-                                                          ratio, Di, n_rot, (float)base, (float)eps), "block key");
+                                                          ratio, Di, n_rot, (float)base, (float)eps, 0u), "block key");
         }
         const bool sparse = n_blocks > k_blocks;
         if (sparse) {
@@ -1335,7 +1335,7 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
         }
         /* even positions exercise the key-split partials (main sets DS4_QWEN4_ATTN_SPLIT_KEYS=8) */
         require_ok(ds4_gpu_qwen4_attn_decode_tensor(vout, gq, ggate, gkc, gvc, gselt, gnsel, (pos % 2) ? NULL : gpart,
-                                                    1, H, Hkv, D, pos, sparse, sel_stride, scale), "attn decode");
+                                                    1, H, Hkv, D, pos, sparse, sel_stride, scale, NULL, NULL, NULL, NULL, 0u), "attn decode");
         ds4_gpu_tensor_free(vout); ds4_gpu_tensor_free(vik); ds4_gpu_tensor_free(viq);
         ds4_gpu_tensor_free(vv); ds4_gpu_tensor_free(vk); ds4_gpu_tensor_free(vqg);
     }
@@ -1447,10 +1447,10 @@ static void test_attention_rows(arena_t *a) {
         for (int i = 0; i < 14; i++) require_ok(v[i] != NULL, "rows views");
         require_ok(ds4_gpu_qwen4_attn_prep_tensor(v[5], v[6], kc[0][r], vc[0][r], v[7], ikc[0][r], v[0], v[1], v[2], v[3], v[4],
                                                   pos3[r], a->base, a->size, gq_off, gk_off, giq_off, 1, H, Hkv, D, n_rot, Hi, Di,
-                                                  pos, pos + 4, (float)base, (float)eps), "rows: prep");
+                                                  pos, pos + 4, (float)base, (float)eps, NULL, NULL, NULL, NULL, 0u, 0u), "rows: prep");
         if ((pos + 1) % ratio == 0) {
             require_ok(ds4_gpu_qwen4_idx_block_key_tensor(bk[0][r], ikc[0][r], pos3[r], a->base, a->size, gik_off, n_blocks - 1, 1,
-                                                          ratio, Di, n_rot, (float)base, (float)eps), "rows: block key");
+                                                          ratio, Di, n_rot, (float)base, (float)eps, 0u), "rows: block key");
         }
         if (sparse) {
             require_ok(ds4_gpu_qwen4_idx_score_tensor(v[9], v[10], v[7], bk[0][r], 1, n_blocks, Hi, Di, pos, ratio), "rows: score");
@@ -1458,7 +1458,7 @@ static void test_attention_rows(arena_t *a) {
             require_ok(ds4_gpu_qwen4_idx_expand_tensor(v[12], v[13], v[11], 1, k_blocks, ratio, pos, sel_stride), "rows: expand");
         }
         require_ok(ds4_gpu_qwen4_attn_decode_tensor(v[8], v[5], v[6], kc[0][r], vc[0][r], v[12], v[13], part1,
-                                                    1, H, Hkv, D, pos, sparse, sel_stride, scale), "rows: decode");
+                                                    1, H, Hkv, D, pos, sparse, sel_stride, scale, NULL, NULL, NULL, NULL, 0u), "rows: decode");
         for (int i = 0; i < 14; i++) ds4_gpu_tensor_free(v[i]);
     }
 
@@ -1466,6 +1466,7 @@ static void test_attention_rows(arena_t *a) {
     ds4_gpu_tensor *table = ds4_gpu_tensor_alloc((uint64_t)R * DS4_GPU_QWEN4_ATTN_ROW_BYTES);
     ds4_gpu_tensor *partR = upload(NULL, ds4_gpu_qwen4_attn_part_floats(R, H, D));
     ds4_gpu_qwen4_attn_row rows[4];
+    memset(rows, 0, sizeof(rows));
     for (uint32_t r = 0; r < R; r++) {
         rows[r].k_cache = kc[1][r]; rows[r].v_cache = vc[1][r]; rows[r].ik_cache = ikc[1][r]; rows[r].block_key = bk[1][r];
         rows[r].pos3 = pos3[r]; rows[r].pos = pos_of[r]; rows[r].use_sel = pos_of[r] >= sparse_pos;
@@ -1473,9 +1474,9 @@ static void test_attention_rows(arena_t *a) {
     require_ok(table && ds4_gpu_qwen4_attn_rows_stage(table, 0, rows, R, ratio), "rows: stage");
     require_ok(ds4_gpu_qwen4_attn_prep_rows_tensor(q[1], gate[1], iqn[1], gqg, gkp, gvp, giq, gik, table, 0, rows, R,
                                                    a->base, a->size, gq_off, gk_off, giq_off, H, Hkv, D, n_rot, Hi, Di,
-                                                   (float)base, (float)eps), "rows: prep rows");
+                                                   (float)base, (float)eps, 0u), "rows: prep rows");
     require_ok(ds4_gpu_qwen4_idx_block_key_rows_tensor(table, 0, rows, R, a->base, a->size, gik_off, ratio, Di, n_rot,
-                                                       (float)base, (float)eps), "rows: block key rows");
+                                                       (float)base, (float)eps, 0u), "rows: block key rows");
     require_ok(ds4_gpu_qwen4_idx_score_rows_tensor(score[1], tile_max[1], iqn[1], table, 0, rows, R, n_block_stride, Hi, Di, ratio),
                "rows: score rows");
     require_ok(ds4_gpu_qwen4_idx_select_rows_tensor(selb[1], score[1], tile_max[1], table, 0, rows, R, n_block_stride, k_blocks),
@@ -2996,7 +2997,7 @@ static int bench_hc_mix2(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_hc_
 static int bench_attn(void *ud) {
     bench_ctx *c = ud;
     return ds4_gpu_qwen4_attn_decode_tensor(c->t[6], c->t[7], c->t[7], c->t[8], c->t[9], NULL, NULL, c->n[1] ? c->t[10] : NULL,
-                                            1, 24, 2, 256, c->n[0], false, 0, 0.0625f);
+                                            1, 24, 2, 256, c->n[0], false, 0, 0.0625f, NULL, NULL, NULL, NULL, 0u);
 }
 static int bench_gdn_front(void *ud) {
     bench_ctx *c = ud;
@@ -3060,7 +3061,7 @@ static int bench_p_idx_select_1k(void *ud) { bench_ctx *c = ud; return ds4_gpu_q
 static int bench_p_attn_sparse(void *ud) {
     bench_ctx *c = ud;
     return ds4_gpu_qwen4_attn_decode_tensor(c->t[37], c->t[33], c->t[34], c->t[31], c->t[32], c->n[2] ? c->t[36] : c->t[35], c->t[38], NULL,
-                                            1024, 24, 2, 256, 262144 - 1024, true, 2052, 0.0625f);
+                                            1024, 24, 2, 256, 262144 - 1024, true, 2052, 0.0625f, NULL, NULL, NULL, NULL, 0u);
 }
 static int bench_p_gdn_r4(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_gdn_scan_tensor(c->t[15], c->t[1], c->t[11], c->t[13], c->t[14], 1024, 16, 48, 128, NULL, 0u, NULL, 0u); }
 static int bench_p_moe_mm(void *ud) {
