@@ -48130,6 +48130,13 @@ enum {
     QWEN4_K_MOE_MID_Q4K_NR1,
     QWEN4_K_MOE_DOWN,
     QWEN4_K_MOE_DOWN_MXFP4_PF,
+    QWEN4_K_MOE_MID_IQ2_NR1,
+    QWEN4_K_MOE_MID_IQ2_NR2,
+    QWEN4_K_MOE_MID_IQ2_NR4,
+    QWEN4_K_MOE_DOWN_Q4K_NR2,
+    QWEN4_K_MOE_DOWN_Q4K_NR4,
+    QWEN4_K_MOE_DOWN_Q2K_NR2,
+    QWEN4_K_MOE_DOWN_Q2K_NR4,
     QWEN4_K_MOE_MID_Q4K_GROUPED,
     QWEN4_K_MOE_DOWN_MXFP4_GROUPED,
     QWEN4_K_MOE_REDUCE,
@@ -48235,6 +48242,13 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_moe_mid_q4k_nr1",
     "kernel_qwen4_moe_down",
     "kernel_qwen4_moe_down_mxfp4_pf",
+    "kernel_qwen4_moe_mid_iq2_nr1",
+    "kernel_qwen4_moe_mid_iq2_nr2",
+    "kernel_qwen4_moe_mid_iq2_nr4",
+    "kernel_qwen4_moe_down_q4k_nr2",
+    "kernel_qwen4_moe_down_q4k_nr4",
+    "kernel_qwen4_moe_down_q2k_nr2",
+    "kernel_qwen4_moe_down_q2k_nr4",
     "kernel_qwen4_moe_mid_q4k_grouped",
     "kernel_qwen4_moe_down_mxfp4_grouped",
     "kernel_qwen4_moe_reduce",
@@ -48328,13 +48342,35 @@ static bool qwen4_moe_mv_specialize(uint32_t type) {
      * branches. Keep the original per-lane reduction order and padded stride.
      * M3 Ultra uses low-bit and MXFP4 down rows; M5 uses MXFP4 down rows. */
     const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_MV_SPECIALIZE");
+    /* M5 with IQ2_XXS gate/up and Q2_K/Q4_K down rows: the generic kernel's
+     * runtime type branches cost ~20% of the MoE (unc31 8K verify: mid
+     * 2091 -> 1598 ms, down 2186 -> 1749 ms), output byte-identical. */
     return override >= 0 ? override != 0 :
         ((type == 16u || type == 10u || type == 39u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
-        (type == 39u && ds4_gpu_device_is_m5_apple_silicon());
+        ((type == 39u || type == 16u || type == 10u || type == 12u) && ds4_gpu_device_is_m5_apple_silicon());
 }
 
 static uint32_t qwen4_moe_mv_rows(void) {
     return (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_MOE_MV_NR", 1u, 1u, 4u);
+}
+
+/* Multi-row decode MoE kernels (kernel_qwen4_moe_mid_iq2 / _down_k): rows per
+ * SIMD group for IQ2_XXS gate/up and Q4_K/Q2_K down, 0 for the one-row
+ * kernels.  Byte-identical either way.  On M5 (unc31 8K verify, 400 tokens)
+ * the down rows with word loads take 1752 -> 1137 ms; the IQ2_XXS rows are
+ * bound by their dequant arithmetic, so more rows per group lose, but one row
+ * with the grid and sign tables in threadgroup memory gains (1602 -> 1494 ms).
+ * DS4_QWEN4_MOE_MR_MID = 0/1/2/4 and DS4_QWEN4_MOE_MR_DOWN = 0/2/4 override. */
+static uint32_t qwen4_moe_mr_rows(uint32_t type) {
+    if (type != 16u && type != 12u && type != 10u) return 0u;
+    const bool m5 = ds4_gpu_device_is_m5_apple_silicon();
+    const uint64_t v = type == 16u ? ds4_gpu_env_u64("DS4_QWEN4_MOE_MR_MID", m5 ? 1u : 0u, 0u, 4u)
+                                   : ds4_gpu_env_u64("DS4_QWEN4_MOE_MR_DOWN", m5 ? 4u : 0u, 0u, 4u);
+    return v >= 4u ? 4u : v >= 2u ? 2u : v == 1u && type == 16u ? 1u : 0u;
+}
+
+static uint32_t qwen4_moe_mr_groups(void) {
+    return (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_MOE_MR_NSG", 8u, 1u, 16u);
 }
 
 static uint32_t qwen4_moe_mv_groups(uint32_t type) {
@@ -48356,7 +48392,8 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
     if (!g_initialized && !ds4_gpu_init()) return 0;
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = nil;
-        if (kernel == QWEN4_K_MOE_MID || kernel == QWEN4_K_MOE_DOWN || kernel == QWEN4_K_MOE_DOWN_MXFP4_PF) {
+        if (kernel == QWEN4_K_MOE_MID || kernel == QWEN4_K_MOE_DOWN || kernel == QWEN4_K_MOE_DOWN_MXFP4_PF ||
+            (kernel >= QWEN4_K_MOE_MID_IQ2_NR1 && kernel <= QWEN4_K_MOE_DOWN_Q2K_NR4)) {
             const qwen4_moe_args *a = args;
             const bool specialize = qwen4_moe_mv_specialize(a->weight_type);
             const uint32_t values[] = {a->weight_type, a->shared_type, specialize ? a->in_dim : 0u, specialize ? qwen4_moe_mv_rows() : 0u};
@@ -49621,11 +49658,17 @@ int ds4_gpu_qwen4_moe_mid_tensor(
     const uint32_t nsg = q4k ?
         (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_Q4K_MID_NSG", default_nsg, 1u, 8u) :
         (specialize ? qwen4_moe_mv_groups(weight_type) : 4u);
-    const uint32_t rows_per_tg = nr * nsg;
-    const int kernel = !q4k ? QWEN4_K_MOE_MID : nr == 1u ? QWEN4_K_MOE_MID_Q4K_NR1 : QWEN4_K_MOE_MID_Q4K;
+    uint32_t rows_per_tg = nr * nsg, tg_nsg = nsg;
+    int kernel = !q4k ? QWEN4_K_MOE_MID : nr == 1u ? QWEN4_K_MOE_MID_Q4K_NR1 : QWEN4_K_MOE_MID_Q4K;
+    const uint32_t mr = weight_type == 16u ? qwen4_moe_mr_rows(weight_type) : 0u;
+    if (mr) {
+        kernel = mr == 4u ? QWEN4_K_MOE_MID_IQ2_NR4 : mr == 2u ? QWEN4_K_MOE_MID_IQ2_NR2 : QWEN4_K_MOE_MID_IQ2_NR1;
+        tg_nsg = qwen4_moe_mr_groups();
+        rows_per_tg = mr * tg_nsg;
+    }
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 7,
                           MTLSizeMake((ff_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
-                          MTLSizeMake(32u * nsg, 1, 1), 0);
+                          MTLSizeMake(32u * tg_nsg, 1, 1), 0);
 }
 
 int ds4_gpu_qwen4_moe_down_tensor(
@@ -49667,6 +49710,16 @@ int ds4_gpu_qwen4_moe_down_tensor(
     const int prefetch_override = ds4_gpu_env_bool("DS4_QWEN4_MOE_DOWN_PREFETCH");
     const bool prefetch = weight_type == 39u && (ff_dim % 32u) == 0 &&
         (prefetch_override >= 0 ? prefetch_override > 0 : ds4_gpu_device_is_m5_apple_silicon());
+    /* the multi-row down rows take the lane's eight activations whole */
+    const uint32_t mr = (ff_dim % 8u) == 0 ? qwen4_moe_mr_rows(weight_type) : 0u;
+    if (mr) {
+        const int kernel = weight_type == 12u ? (mr == 4u ? QWEN4_K_MOE_DOWN_Q4K_NR4 : QWEN4_K_MOE_DOWN_Q4K_NR2)
+                                              : (mr == 4u ? QWEN4_K_MOE_DOWN_Q2K_NR4 : QWEN4_K_MOE_DOWN_Q2K_NR2);
+        const uint32_t mr_nsg = qwen4_moe_mr_groups(), mr_rows = mr * mr_nsg;
+        return qwen4_dispatch(kernel, &args, sizeof(args), b, 5,
+                              MTLSizeMake((out_dim + mr_rows - 1) / mr_rows, n_out, n_tokens),
+                              MTLSizeMake(32u * mr_nsg, 1, 1), 0);
+    }
     return qwen4_dispatch(prefetch ? QWEN4_K_MOE_DOWN_MXFP4_PF : QWEN4_K_MOE_DOWN, &args, sizeof(args), b, 5,
                           MTLSizeMake((out_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
                           MTLSizeMake(32u * nsg, 1, 1), 0);
