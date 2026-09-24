@@ -146,8 +146,9 @@ int ds4_gpu_dsv41_hc_expand4(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
 /* Decode MoE glue for one token row, byte-identical to the standalone
  * sequences: router = F32 logits matvec + softplus/sqrt + bias + canonical
  * top-k + normalized weights in one dispatch; shared gate/up = two Q8_0
- * matvecs + BF16 + SwiGLU + BF16; shared down + HC tail = Q8_0 matvec +
- * BF16 + (routed + shared) + BF16 + post/comb expand + BF16 (+ pre carry). */
+ * matvecs + BF16 + SwiGLU + BF16. The shared down projection is a rounded
+ * Q8_0 matvec before the routed experts, and the routed + shared sum with its
+ * rounding folds into ds4_gpu_dsv41_hc_expand4 (+ pre carry). */
 int ds4_gpu_dsv41_router_select(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
                                ds4_gpu_tensor *probs, ds4_gpu_tensor *logits,
                                const ds4_gpu_tensor *x,

@@ -13,7 +13,15 @@ prompt, 512 teacher-forced tokens, V4.1 alone (oMLX and watchdogs down).
 | Phase-0 configuration vs shipped defaults (`ab-final-fused.json`) | 8.98 | 11.35 | 1.2641 |
 
 Phase-0 configuration: 24 GB cache target, no layer queue under streaming, no
-async load, no #1042. Shipped defaults: auto cache (35.62 GiB budget at ctx
+async load, #1042 switched off with `DS4_METAL_DISABLE_V41_HC_FUSE`.
+
+**`DS4_METAL_DISABLE_V41_HC_FUSE` does not turn off everything from #1042.** The
+F16 `matvec_bf16` in `ds41_matmul` and the `ds41_matmul_batch` count == 1 reroute
+stay on under it (their switch is `DS4_METAL_DISABLE_V41_MATVEC_BF16`, verified
+exact on its own). The A/B rows above therefore credit #1042 minus those two.
+
+**Run counts:** each side has two runs (n = 2). The router A/B's A runs spread
+2.4 % (11.04 / 11.31), wider than its +1.4 %. Shipped defaults: auto cache (35.62 GiB budget at ctx
 8192), layer queue, async load, #1042 without the fused router.
 
 ## What was merged and how it was resolved
@@ -59,7 +67,9 @@ resolutions:
 - `--attn-fuse`.
 
 **Streaming exactness** (`--stream-control`, 65 steps after prefixes 511 and
-2047), all PASS:
+2047), all PASS. The `HC_FUSE` 8 GB run is on `2c40b6f`; the others ran on
+`2c40b6f` as well. The `MOE_FUSE`/`ROUTER_FUSE` failures in the bisect were on
+`dad0a56`, before the router became opt-in. Runs:
 - `DS4_METAL_DISABLE_V41_HC_FUSE` (everything) at 8 and 24 GB;
 - `_MOE_FUSE`, `_ATTN_FUSE` and `_MATVEC_BF16` at 8 GB;
 - router log: 1280 lines, logits identical.
@@ -129,3 +139,18 @@ ctx 32768, shipped defaults, auto cache (2644 cached experts): 8.84 t/s, hit 0.7
 wired steady 37.2 / peak 48.2 GiB, no swap, not contaminated (Phase 0 at 32K /
 24 GB: 7.85 t/s). This closes the review's open item that no run covered 32K at
 the auto cache with every feature on.
+
+## Corrections after the review (Opus, 2026-09-25)
+
+- **Merge message correction:** `8b75381` says "logits collapse in
+  ds41_graph_encode_logits". The #1042 fused logits collapse was not kept; the
+  logits use Ivan's `hc_sum_bf16` + norm. The `sinkhorn_iters == 0` mode of
+  `kernel_dsv41_hc_collapse_norm4` is exercised only by the kernel test.
+- **Review fix 1:** the `moe_shared` stage boundary's error exit now abandons
+  the async job.
+- **Review fix 2:** where Ivan's concurrent shared + routed FFN runs (resident
+  Q4_K experts, M3 Ultra only, `ds4_gpu_dsv41_parallel_ffn_supported`), the #1042
+  shared fusion now stays off in `ds41_moe_fused`, so all three MoE call sites
+  agree. This can't be exercised on the M5; the model-free
+  `--v41-moe-fuse-predicates` pins the predicate and the per-call reads of every
+  MoE switch.

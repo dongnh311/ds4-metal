@@ -100,6 +100,8 @@ int ds4_gpu_parallel_ffn_start(
         const ds4_gpu_tensor *x,
         float                 clamp);
 /* V4.1 BF16 shared expert; returns zero without arming if unavailable. */
+/* Whether ds4_gpu_dsv41_parallel_ffn_start can run on this device. */
+int ds4_gpu_dsv41_parallel_ffn_supported(void);
 int ds4_gpu_dsv41_parallel_ffn_start(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,

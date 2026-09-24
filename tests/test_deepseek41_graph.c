@@ -2287,6 +2287,59 @@ done:
 }
 #endif
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* The #1042 MoE predicates: every switch read per call (--stream-control
+ * flips them inside one process), the fused router opt-in, and the resident
+ * Q4_K layer that Ivan's concurrent FFN serves on M3 Ultra left unfused. */
+static int check_v41_moe_fuse_predicates(void) {
+    int rc = 1;
+    static const char *const envs[] = {
+        "DS4_METAL_DISABLE_V41_HC_FUSE", "DS4_METAL_DISABLE_V41_MOE_FUSE",
+        "DS4_METAL_DISABLE_V41_SHARED_FUSE", "DS4_METAL_DISABLE_V41_ROUTER_FUSE",
+        "DS4_METAL_ENABLE_V41_ROUTER_FUSE",
+    };
+    ds41_gpu_graph g = {.tp_world = 1, .streaming = true};
+    ds4_tensor q4 = {.type = DS4_TENSOR_Q4_K}, q8 = {.type = DS4_TENSOR_Q8_0},
+               f32 = {.type = DS4_TENSOR_F32}, iq2 = {.type = DS4_TENSOR_IQ2_XXS},
+               q2 = {.type = DS4_TENSOR_Q2_K};
+    ds4_layer_weights l = {0};
+    l.ffn_gate_shexp = l.ffn_up_shexp = l.ffn_down_shexp = &q8;
+    l.ffn_gate_inp = &f32;
+    l.ffn_gate_exps = l.ffn_up_exps = &iq2;
+    l.ffn_down_exps = &q2;
+    for (unsigned i = 0; i < sizeof(envs) / sizeof(envs[0]); i++) unsetenv(envs[i]);
+    REQUIRE(ds4_gpu_init());
+    REQUIRE(ds4_gpu_hc_rms_norm_mix_f16_available());
+    REQUIRE(ds41_moe_fused(&g, &l));
+    REQUIRE(!ds41_router_fused(&g, &l));
+    setenv("DS4_METAL_ENABLE_V41_ROUTER_FUSE", "1", 1);
+    REQUIRE(ds41_router_fused(&g, &l));
+    setenv("DS4_METAL_DISABLE_V41_ROUTER_FUSE", "1", 1);
+    REQUIRE(!ds41_router_fused(&g, &l) && ds41_moe_fused(&g, &l));
+    unsetenv("DS4_METAL_DISABLE_V41_ROUTER_FUSE");
+    setenv("DS4_METAL_DISABLE_V41_SHARED_FUSE", "1", 1);
+    REQUIRE(!ds41_moe_fused(&g, &l) && ds41_router_fused(&g, &l));
+    unsetenv("DS4_METAL_DISABLE_V41_SHARED_FUSE");
+    setenv("DS4_METAL_DISABLE_V41_MOE_FUSE", "1", 1);
+    REQUIRE(!ds41_moe_fused(&g, &l) && !ds41_router_fused(&g, &l));
+    unsetenv("DS4_METAL_DISABLE_V41_MOE_FUSE");
+    setenv("DS4_METAL_DISABLE_V41_HC_FUSE", "1", 1);
+    REQUIRE(!ds41_moe_fused(&g, &l) && !ds41_router_fused(&g, &l));
+    unsetenv("DS4_METAL_DISABLE_V41_HC_FUSE");
+    unsetenv("DS4_METAL_ENABLE_V41_ROUTER_FUSE");
+    /* Resident Q4_K experts: where the concurrent FFN runs, it wins. */
+    g.streaming = false;
+    l.ffn_gate_exps = l.ffn_up_exps = l.ffn_down_exps = &q4;
+    REQUIRE(ds41_moe_fused(&g, &l) == !ds4_gpu_dsv41_parallel_ffn_supported());
+    fprintf(stderr, "V4.1 MoE fuse predicates PASS (parallel FFN device: %s)\n",
+            ds4_gpu_dsv41_parallel_ffn_supported() ? "yes" : "no");
+    rc = 0;
+done:
+    for (unsigned i = 0; i < sizeof(envs) / sizeof(envs[0]); i++) unsetenv(envs[i]);
+    return rc;
+}
+#endif
+
 static int check_decode_profile_format(void) {
     int rc = 1;
     char line[256];
@@ -2319,6 +2372,8 @@ int main(int argc, char **argv) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     if (argc == 2 && !strcmp(argv[1], "--v41-fuse-switches"))
         return check_v41_fuse_switches();
+    if (argc == 2 && !strcmp(argv[1], "--v41-moe-fuse-predicates"))
+        return check_v41_moe_fuse_predicates();
 #endif
 #ifdef __APPLE__
     if (argc == 2 && !strcmp(argv[1], "--stream-control-env"))

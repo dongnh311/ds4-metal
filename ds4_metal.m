@@ -9989,6 +9989,12 @@ int ds4_gpu_parallel_ffn_start(
         0, shared_dim, x, clamp, false);
 }
 
+/* The concurrent shared + routed FFN below runs on M3 Ultra only. */
+int ds4_gpu_dsv41_parallel_ffn_supported(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    return ds4_gpu_device_name_contains("M3 Ultra") ? 1 : 0;
+}
+
 int ds4_gpu_dsv41_parallel_ffn_start(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,

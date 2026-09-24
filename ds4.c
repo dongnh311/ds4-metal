@@ -40890,6 +40890,20 @@ static bool ds41_router_fused(const ds41_gpu_graph *g, const ds4_layer_weights *
         ds41_hc_fused(g) && l->ffn_gate_inp->type == DS4_TENSOR_F32;
 }
 
+/* Ivan's concurrent shared + routed FFN (resident Q4_K experts, M3 Ultra):
+ * where it runs, the #1042 shared fusion stays off so that path is kept. */
+static bool ds41_parallel_ffn_candidate(const ds41_gpu_graph *g, const ds4_layer_weights *l) {
+    return g->tp_world == 1 && !g->streaming && !g->quality && !g->imatrix &&
+        !getenv("DS4_METAL_DISABLE_V41_SOLO_FFN_OVERLAP") &&
+        l->ffn_gate_exps->type == DS4_TENSOR_Q4_K && l->ffn_down_exps->type == DS4_TENSOR_Q4_K &&
+        l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 && l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 &&
+        !getenv("DS4_METAL_DISABLE_V41_TP_FFN_OVERLAP") &&
+        !getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") &&
+        !getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") &&
+        ds4_gpu_dsv41_parallel_ffn_supported();
+}
+
 /* Shared expert gate/up/SwiGLU as one dispatch, its down projection rounded
  * on the store, and the routed + shared sum folded into the FFN tail's
  * expand (ds41_moe_finish / ds41_graph_after_moe agree).  The down
@@ -40898,6 +40912,7 @@ static bool ds41_router_fused(const ds41_gpu_graph *g, const ds4_layer_weights *
 static bool ds41_moe_fused(const ds41_gpu_graph *g, const ds4_layer_weights *l) {
     return !getenv("DS4_METAL_DISABLE_V41_MOE_FUSE") &&
         !getenv("DS4_METAL_DISABLE_V41_SHARED_FUSE") && ds41_hc_fused(g) &&
+        !ds41_parallel_ffn_candidate(g, l) &&
         l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
         l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
         l->ffn_down_shexp->type == DS4_TENSOR_Q8_0;
@@ -41141,8 +41156,9 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     const bool shared_here = !shared_owner || g->tp_rank == (il & 1u);
     bool shared_queued = false;
 #if defined(__APPLE__)
-    /* Fused: gate/up/SwiGLU here; the down projection, the routed + shared
-     * sum and the HC expand run as one dispatch in ds41_graph_after_moe. */
+    /* Fused: gate/up/SwiGLU and the rounded down projection run here, before
+     * the routed experts; the routed + shared sum and its rounding run inside
+     * the HC expand in ds41_graph_after_moe. */
     if (fused && shared_here &&
         (!ds4_gpu_dsv41_shared_gate_up_swiglu(g->shared_mid, g->norm, m->map, m->size,
              l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
@@ -41205,7 +41221,12 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
 #endif
         return false;
     }
-    if (!ds41_stage(il, g->pos, "moe_shared")) return false;
+    if (!ds41_stage(il, g->pos, "moe_shared")) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        if (async_started) ds41_stream_async_abandon(&async_load);
+#endif
+        return false;
+    }
     bool routed_ok;
 #ifndef __APPLE__
     if (g->tp_world == 2) {
@@ -41273,6 +41294,8 @@ static bool ds41_moe_finish(ds41_gpu_graph *g, const ds4_layer_weights *l, uint3
     if (!ds41_sum_partial(g, routed, il, DS4_TP_GATE_FFN)) return false;
 #if defined(__APPLE__)
     if (ds41_moe_fused(g, l)) return true;
+#else
+    (void)l;
 #endif
     return (shared_owner || ds4_gpu_add_tensor(g->block, routed, g->shared, DS4_N_EMBD)) &&
         ds41_bf16(g->block, DS4_N_EMBD);
