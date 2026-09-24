@@ -103,7 +103,8 @@ class RunTest(unittest.TestCase):
         return phase0.run_one(fake_bin(tmp, body), "/m.gguf", os.path.join(tmp, "prompts"), tmp,
                               self.SPEC, running=running, swap=lambda: 0.0,
                               sampler=lambda: _FakeSampler(),
-                              idle_read=idle_read or (lambda: FREE_VM_STAT))
+                              idle_read=idle_read or (lambda: FREE_VM_STAT),
+                              idle_timeout=0.05, idle_interval=0.01)
 
     def csv_body(self):
         csv_line = CSV.replace("\n", "\\n")
@@ -152,6 +153,14 @@ class RunTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(SystemExit):
                 self.run_one(tmp, "exit 0\n", idle_read=lambda: IDLE_VM_STAT)
+
+    def test_waits_for_previous_run_wired_to_drain(self):
+        # Right after a ds4-bench exits the kernel still holds its Metal wiring
+        # for a few seconds; the next run must wait, not refuse.
+        with tempfile.TemporaryDirectory() as tmp:
+            reads = iter([IDLE_VM_STAT, IDLE_VM_STAT, FREE_VM_STAT])
+            row = self.run_one(tmp, self.csv_body(), idle_read=lambda: next(reads))
+            self.assertLess(row["wired_idle_gib"], wired.IDLE_WIRED_LIMIT_GIB)
 
     def test_row_carries_idle_wired(self):
         with tempfile.TemporaryDirectory() as tmp:

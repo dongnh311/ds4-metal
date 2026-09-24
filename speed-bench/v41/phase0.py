@@ -138,7 +138,8 @@ def _fail_router_log(router_log):
 
 def run_one(bin_dir, model, prompts_dir, out_dir, spec, dry_run=False,
             running=machine.ds4_running, swap=machine.swap_used_mib,
-            sampler=wired.WiredSampler, idle_read=None):
+            sampler=wired.WiredSampler, idle_read=None,
+            idle_timeout=wired.IDLE_SETTLE_S, idle_interval=2.0):
     workload, ctx, gb, gen, log_router = spec
     tag = f"{workload}-c{ctx}-g{gb}-n{gen}"
     result_path = os.path.join(out_dir, tag + ".result.json")
@@ -152,7 +153,7 @@ def run_one(bin_dir, model, prompts_dir, out_dir, spec, dry_run=False,
     if os.path.exists(result_path):
         print("phase0: skip (done)", tag)
         return None
-    idle = wired.idle_gib(read=idle_read)
+    idle = wired.wait_idle_gib(read=idle_read, timeout=idle_timeout, interval=idle_interval)
     if idle > wired.IDLE_WIRED_LIMIT_GIB:
         raise SystemExit(f"phase0: {idle:.1f} GiB wired before the run; the machine is not idle")
     busy = running()

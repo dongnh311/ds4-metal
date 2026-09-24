@@ -81,6 +81,27 @@ class IdleGibTest(unittest.TestCase):
     def test_idle_wired_limit_constant(self):
         self.assertEqual(wired.IDLE_WIRED_LIMIT_GIB, 8.0)
 
+    def _fake_time(self):
+        now = {"t": 0.0}
+        return (lambda s: now.__setitem__("t", now["t"] + s)), (lambda: now["t"])
+
+    def test_wait_idle_returns_once_wired_settles(self):
+        high = SAMPLE.replace("262144", "655360")   # 10 GiB, the previous run still tearing down
+        reads = iter([high, high, SAMPLE])
+        sleep, clock = self._fake_time()
+        got = wired.wait_idle_gib(read=lambda: next(reads), timeout=60, interval=2,
+                                  sleep=sleep, clock=clock)
+        self.assertEqual(got, 4.0)
+        self.assertEqual(clock(), 4)
+
+    def test_wait_idle_gives_up_after_timeout(self):
+        high = SAMPLE.replace("262144", "655360")
+        sleep, clock = self._fake_time()
+        got = wired.wait_idle_gib(read=lambda: high, timeout=10, interval=2,
+                                  sleep=sleep, clock=clock)
+        self.assertEqual(got, 10.0)
+        self.assertEqual(clock(), 10)
+
 
 if __name__ == "__main__":
     unittest.main()

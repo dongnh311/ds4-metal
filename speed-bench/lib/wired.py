@@ -62,6 +62,22 @@ def idle_gib(read=None):
     return parse_vm_stat(read()) / GIB
 
 
+# A Metal process that just exited keeps its wiring for a few seconds while the
+# kernel tears it down (measured 10 GiB right after a 16 GB-cache ds4-bench).
+IDLE_SETTLE_S = 120.0
+
+
+def wait_idle_gib(read=None, limit=IDLE_WIRED_LIMIT_GIB, timeout=IDLE_SETTLE_S, interval=2.0,
+                  sleep=time.sleep, clock=time.monotonic):
+    """Idle wired GiB once it drops to `limit`, or the last sample after `timeout`."""
+    deadline = clock() + timeout
+    gib = idle_gib(read)
+    while gib > limit and clock() < deadline:
+        sleep(interval)
+        gib = idle_gib(read)
+    return gib
+
+
 class WiredSampler:
     """Samples vm_stat every `interval` seconds while inside a `with` block."""
 
