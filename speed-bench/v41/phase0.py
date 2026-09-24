@@ -267,6 +267,10 @@ def _flag(row):
     return ", ".join(flags)
 
 
+def _cache_label(gb):
+    return "auto" if gb is None else gb
+
+
 def _fmt(value, spec=".2f"):
     return "—" if value is None else format(value, spec)
 
@@ -282,9 +286,11 @@ def report(rows, bytes_json, locality):
              "| pread | Engram | host gaps | hit rate | wired GiB | log | flags |",
              "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
              "| ---: | ---: | --- | --- |"]
-    for r in sorted(rows, key=lambda r: (r["workload"], r["ctx"], r["cache_gb"])):
+    # cache_gb None is the engine's auto size; it sorts after the fixed sizes.
+    for r in sorted(rows, key=lambda r: (r["workload"], r["ctx"], r["cache_gb"] is None,
+                                         r["cache_gb"] or 0)):
         lines.append(
-            f"| {r['workload']} | {r['ctx']} | {r['cache_gb']} | {_fmt(r.get('gen'), 'd')} "
+            f"| {r['workload']} | {r['ctx']} | {_cache_label(r['cache_gb'])} | {_fmt(r.get('gen'), 'd')} "
             f"| {_fmt(r.get('gen_steady_tps'))} | {_fmt(r.get('prefill_tps'))} "
             f"| {_fmt(r.get('gen_first_ms'), '.1f')} "
             f"| {_fmt(r.get('step_ms'), '.1f')} | {_fmt(r.get('gpu_busy_ms'), '.1f')} "
@@ -296,7 +302,7 @@ def report(rows, bytes_json, locality):
     best = max(clean, key=lambda r: r["gen_steady_tps"]) if clean else None
     lines += ["", "Best clean run: " + (
         f"{best['gen_steady_tps']:.2f} t/s ({best['workload']}, ctx {best['ctx']}, "
-        f"cache {best['cache_gb']} GB)" if best else "none"), ""]
+        f"cache {_cache_label(best['cache_gb'])} GB)" if best else "none"), ""]
     lines += ["## Roofline from byte accounting", "",
               f"Byte floor at {bytes_json.get('gbps', 290.0):g} GB/s: resident "
               f"{roof['resident_ms']:.1f} + routed {roof['routed_ms']:.1f} ms = "
