@@ -5,8 +5,10 @@ record  run the PROD gateway command (registry binary) and save a reference.
 check   run the same command with ds4-server from --bin and compare.
 
 Fast tier: byte-identical vi/code replies and an unchanged registry command.
---full adds decode t/s (median of 3, >= 97% of baseline), steady wired GiB
-(<= baseline + 0.5) and a long-context needle that must be found.
+--full adds steady wired GiB (<= baseline + 0.5) and a long-context needle that
+must be found. With --bin it also runs a paired speed check: PROD, branch,
+branch, PROD on fresh servers, branch mean of per-server median t/s >= 97 % of
+PROD's (without --bin it compares against the stored median of 3).
 """
 import argparse
 import contextlib
@@ -37,8 +39,9 @@ NEEDLE_KEY = "VIOLET-HARBOR-2719"
 QUESTION = "\n\nWhat is the secret passphrase stated in the text above? Answer with the passphrase only."
 NEEDLE_SOURCE = "speed-bench/promessi_sposi.txt"
 TPS_FLOOR = 0.97
-# Start-to-start drift of the same binary is 6-12 %, so decode speed is judged
-# against PROD measured interleaved in the same run, never against a stored number.
+# The same binary's decode t/s varies 6-12 % from one server start to the next
+# (the first start after idle measured slowest), so decode speed is judged against
+# PROD measured interleaved in the same run, never against a stored number.
 AB_ORDER = ("prod", "branch", "branch", "prod")
 WIRED_SLACK_GIB = 0.5
 
@@ -88,12 +91,33 @@ def make_needle(filler, chars):
 def speed_ab_failures(ab):
     """Paired speed verdict: the branch's mean of per-server medians must reach
     TPS_FLOOR of PROD's, both measured interleaved in the same gate run."""
+    for side in ("prod", "branch"):
+        if not ab.get(side):
+            return [f"paired A/B has no {side} measurement"]
     prod = statistics.fmean(ab["prod"])
     branch = statistics.fmean(ab["branch"])
     floor = prod * TPS_FLOOR
     if branch < floor:
-        return [f"decode {branch:.2f} t/s < {floor:.2f} (97% of PROD {prod:.2f}, paired A/B)"]
+        per = "/".join(f"{x:.2f}" for x in ab["branch"])
+        per_prod = "/".join(f"{x:.2f}" for x in ab["prod"])
+        return [f"decode {branch:.2f} t/s ({per}) < {floor:.2f} (97% of PROD {prod:.2f} "
+                f"({per_prod}), paired A/B; rerun once before calling it a regression)"]
     return []
+
+
+def paired_speed(bin_dir, out, port, measure=None):
+    """Interleaved PROD/branch servers: PROD runs the registry binary, the branch --bin."""
+    measure = measure or measure_server
+    tags = iter(range(len(AB_ORDER)))
+    return speed_ab(lambda which: measure(None if which == "prod" else bin_dir, out,
+                                          f"{next(tags)}-{which}", port))
+
+
+def require_idle(read=None, timeout=wired.IDLE_SETTLE_S, interval=2.0):
+    """Wait for the previous server's Metal wiring to drain; refuse if it does not."""
+    idle = wired.wait_idle_gib(read=read, timeout=timeout, interval=interval)
+    if idle > wired.IDLE_WIRED_LIMIT_GIB:
+        raise SystemExit(f"qwen_gate: {idle:.1f} GiB wired before the run; the machine is not idle")
 
 
 def speed_ab(measure, order=AB_ORDER):
@@ -187,6 +211,7 @@ def measure_server(bin_dir, out, tag, port):
     kv = os.path.join(out, "kv-ab")
     shutil.rmtree(kv, ignore_errors=True)
     os.makedirs(kv)
+    require_idle()
     cmd, cwd = registry_command(REGISTRY, bin_dir, port, kv)
     with server(cmd, cwd, port, os.path.join(out, f"server-ab-{tag}.log")) as base:
         for text in PROMPTS.values():
@@ -206,13 +231,14 @@ def check_preflight(out, baseline):
     return None
 
 
-def run(bin_dir, out, full, needle_chars, ds4_running=machine.ds4_running, idle_read=None):
+def run(bin_dir, out, full, needle_chars, ds4_running=machine.ds4_running, idle_read=None,
+        idle_timeout=wired.IDLE_SETTLE_S, idle_interval=2.0):
+    # Servers run in PROD's cwd (or --bin's): a relative KV dir would land there.
+    out = os.path.abspath(out)
     busy = ds4_running()
     if busy:
         raise SystemExit("qwen_gate: ds4 is running; the machine must be free:\n" + busy)
-    idle = wired.idle_gib(read=idle_read)
-    if idle > wired.IDLE_WIRED_LIMIT_GIB:
-        raise SystemExit(f"qwen_gate: {idle:.1f} GiB wired before the run; the machine is not idle")
+    require_idle(idle_read, idle_timeout, idle_interval)
     os.makedirs(out, exist_ok=True)
     port = int(os.environ.get("DS4_GATE_PORT", "18298"))
     kv = os.path.join(out, "kv")
@@ -241,9 +267,7 @@ def run(bin_dir, out, full, needle_chars, ds4_running=machine.ds4_running, idle_
             result["needle_prompt_tokens"] = prompt_tokens
             result["needle_hit"] = NEEDLE_KEY in reply
     if full and bin_dir is not None:
-        runs = iter(range(len(AB_ORDER)))
-        result["speed_ab"] = speed_ab(lambda which: measure_server(
-            None if which == "prod" else bin_dir, out, f"{next(runs)}-{which}", port))
+        result["speed_ab"] = paired_speed(bin_dir, out, port)
     still = ds4_running()
     if still:
         raise SystemExit("qwen_gate: another ds4 process ran during the gate; "

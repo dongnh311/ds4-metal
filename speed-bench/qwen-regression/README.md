@@ -18,4 +18,8 @@ speed-bench/qwen-regression/run.sh full
 python3 speed-bench/qwen-regression/qwen_gate.py record --out speed-bench/qwen-regression/baseline --full
 ```
 
-A failure stops DS4.1 work until it is understood (spec §4).
+A failure stops DS4.1 work until it is understood (spec §4). A paired-speed
+failure alone is rerun once first: two servers per side cancel drift over time
+but not the noise of a single server start (PROD's two servers once differed by
+5 %). Each server start waits for the previous server's Metal wiring to drain
+(up to 120 s) and refuses if it does not.

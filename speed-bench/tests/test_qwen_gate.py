@@ -12,6 +12,11 @@ import wired  # noqa: E402
 HIGH_VM_STAT = ("Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
                 "Pages free:                                    10623.\n"
                 "Pages wired down:                             600000.\n")   # ~9.16 GiB
+FREE_VM_STAT = HIGH_VM_STAT.replace("600000", "1000")
+
+
+class _Stop(Exception):
+    """Raised by a patched registry_command so run() stops before starting a server."""
 
 ENTRY = {"enabled": True, "process_cwd": "/prod/ds4-metal",
          "process_command": ["/usr/bin/env", "DS4_X=1", "/prod/ds4-metal/ds4-server", "--metal",
@@ -107,7 +112,7 @@ class RunIdleRefusalTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(SystemExit):
                 qwen_gate.run(None, tmp, False, 650_000, ds4_running=lambda: "",
-                              idle_read=lambda: HIGH_VM_STAT)
+                              idle_read=lambda: HIGH_VM_STAT, idle_timeout=0)
             # No server.log / kv dir means run() never got past the idle check.
             self.assertFalse(os.path.exists(os.path.join(tmp, "server.log")))
 
@@ -115,6 +120,54 @@ class RunIdleRefusalTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(SystemExit):
                 qwen_gate.run(None, tmp, False, 650_000, ds4_running=lambda: "9 ds4-server")
+
+
+class RunSetupTest(unittest.TestCase):
+    def setUp(self):
+        self.seen = {}
+        self.orig = qwen_gate.registry_command
+
+        def fake(registry, bin_dir, port, kv):
+            self.seen["kv"] = kv
+            raise _Stop()
+        qwen_gate.registry_command = fake
+        self.cwd = os.getcwd()
+
+    def tearDown(self):
+        qwen_gate.registry_command = self.orig
+        os.chdir(self.cwd)
+
+    def test_relative_out_gives_absolute_kv_dir(self):
+        # The server runs in PROD's cwd; a relative KV dir would land in the PROD tree.
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chdir(tmp)
+            with self.assertRaises(_Stop):
+                qwen_gate.run(None, "rel/out", False, 1000, ds4_running=lambda: "",
+                              idle_read=lambda: FREE_VM_STAT)
+            self.assertTrue(os.path.isabs(self.seen["kv"]))
+            self.assertEqual(self.seen["kv"],
+                             os.path.join(os.path.realpath(tmp), "rel", "out", "kv"))
+
+    def test_waits_for_previous_server_wiring_to_drain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reads = iter([HIGH_VM_STAT, HIGH_VM_STAT, FREE_VM_STAT])
+            with self.assertRaises(_Stop):
+                qwen_gate.run(None, tmp, False, 1000, ds4_running=lambda: "",
+                              idle_read=lambda: next(reads), idle_timeout=10, idle_interval=0.001)
+
+
+class PairedSpeedTest(unittest.TestCase):
+    def test_prod_runs_registry_binary_and_branch_runs_bin(self):
+        calls = []
+
+        def measure(bin_dir, out, tag, port):
+            calls.append((bin_dir, tag, port))
+            return [40.0, 41.0, 42.0]
+
+        ab = qwen_gate.paired_speed("/branch", "/out", 1234, measure=measure)
+        self.assertEqual(calls, [(None, "0-prod", 1234), ("/branch", "1-branch", 1234),
+                                 ("/branch", "2-branch", 1234), (None, "3-prod", 1234)])
+        self.assertEqual(ab["prod"], [41.0, 41.0])
 
 
 class CheckPreflightTest(unittest.TestCase):
@@ -164,6 +217,16 @@ class SpeedAbTest(unittest.TestCase):
         self.assertEqual(calls, ["prod", "branch", "branch", "prod"])
         self.assertEqual(ab["prod"], [41.0, 41.0])
         self.assertEqual(ab["branch"], [44.0, 44.0])
+
+    def test_empty_side_is_a_failure_not_a_crash(self):
+        failures = qwen_gate.speed_ab_failures({"prod": [43.0], "branch": []})
+        self.assertEqual(len(failures), 1)
+        self.assertIn("no branch", failures[0])
+
+    def test_failure_lists_per_server_medians(self):
+        failures = qwen_gate.speed_ab_failures({"prod": [44.1, 41.9], "branch": [40.0, 39.5]})
+        self.assertIn("44.10/41.90", failures[0])
+        self.assertIn("40.00/39.50", failures[0])
 
     def test_evaluate_prefers_paired_speed_over_stored_baseline(self):
         base = {"registry_command": ["a"], "tps_median": 42.8, "wired": {"steady_gib": 45.8}}

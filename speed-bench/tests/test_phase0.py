@@ -97,14 +97,14 @@ class RunTest(unittest.TestCase):
     SPEC = ("switch", 4096, 8, 512, False)
     TAG = "switch-c4096-g8-n512"
 
-    def run_one(self, tmp, body, running=lambda: "", idle_read=None):
+    def run_one(self, tmp, body, running=lambda: "", idle_read=None, idle_timeout=0.05):
         os.makedirs(os.path.join(tmp, "prompts"), exist_ok=True)
         open(os.path.join(tmp, "prompts", "switch.txt"), "w").close()
         return phase0.run_one(fake_bin(tmp, body), "/m.gguf", os.path.join(tmp, "prompts"), tmp,
                               self.SPEC, running=running, swap=lambda: 0.0,
                               sampler=lambda: _FakeSampler(),
                               idle_read=idle_read or (lambda: FREE_VM_STAT),
-                              idle_timeout=0.05, idle_interval=0.01)
+                              idle_timeout=idle_timeout, idle_interval=0.01)
 
     def csv_body(self):
         csv_line = CSV.replace("\n", "\\n")
@@ -159,8 +159,18 @@ class RunTest(unittest.TestCase):
         # for a few seconds; the next run must wait, not refuse.
         with tempfile.TemporaryDirectory() as tmp:
             reads = iter([IDLE_VM_STAT, IDLE_VM_STAT, FREE_VM_STAT])
-            row = self.run_one(tmp, self.csv_body(), idle_read=lambda: next(reads))
+            row = self.run_one(tmp, self.csv_body(), idle_read=lambda: next(reads), idle_timeout=10)
             self.assertLess(row["wired_idle_gib"], wired.IDLE_WIRED_LIMIT_GIB)
+
+    def test_foreign_ds4_refused_before_waiting_for_wiring(self):
+        # A running ds4 is the likelier cause of high wiring: say so at once, no 120 s wait.
+        with tempfile.TemporaryDirectory() as tmp:
+            t0 = time.monotonic()
+            with self.assertRaises(SystemExit) as cm:
+                self.run_one(tmp, "exit 0\n", running=lambda: "9 ds4-server",
+                             idle_read=lambda: IDLE_VM_STAT, idle_timeout=30)
+            self.assertIn("ds4 is running", str(cm.exception))
+            self.assertLess(time.monotonic() - t0, 5)
 
     def test_row_carries_idle_wired(self):
         with tempfile.TemporaryDirectory() as tmp:

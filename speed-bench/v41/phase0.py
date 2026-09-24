@@ -153,12 +153,12 @@ def run_one(bin_dir, model, prompts_dir, out_dir, spec, dry_run=False,
     if os.path.exists(result_path):
         print("phase0: skip (done)", tag)
         return None
-    idle = wired.wait_idle_gib(read=idle_read, timeout=idle_timeout, interval=idle_interval)
-    if idle > wired.IDLE_WIRED_LIMIT_GIB:
-        raise SystemExit(f"phase0: {idle:.1f} GiB wired before the run; the machine is not idle")
     busy = running()
     if busy:
         raise SystemExit("phase0: ds4 is running; the machine must be free:\n" + busy)
+    idle = wired.wait_idle_gib(read=idle_read, timeout=idle_timeout, interval=idle_interval)
+    if idle > wired.IDLE_WIRED_LIMIT_GIB:
+        raise SystemExit(f"phase0: {idle:.1f} GiB wired before the run; the machine is not idle")
     env = dict(os.environ)
     env.pop("DS4_V41_ROUTER_LOG", None)
     env.update(ENV)
