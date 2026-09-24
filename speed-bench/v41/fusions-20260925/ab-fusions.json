@@ -1,0 +1,45 @@
+{
+ "label": "fusions",
+ "a_tps": 11.07,
+ "b_tps": 11.280000000000001,
+ "ratio": 1.018970189701897,
+ "runs": {
+  "a": [
+   11.07,
+   11.07
+  ],
+  "b": [
+   11.33,
+   11.23
+  ]
+ },
+ "terms": {
+  "a": {
+   "step_ms": 90.6565,
+   "gpu_busy_ms": 57.1905,
+   "pread_ms": 13.424,
+   "readahead_ms": 15.224075195312501,
+   "host_ms": 4.240924804687505,
+   "decode_hit_rate": 0.8711249999999999,
+   "wired_steady_gib": 41.047264099121094
+  },
+  "b": {
+   "step_ms": 89.074,
+   "gpu_busy_ms": 55.1855,
+   "pread_ms": 13.3965,
+   "readahead_ms": 15.4306279296875,
+   "host_ms": 4.485372070312499,
+   "decode_hit_rate": 0.8711249999999999,
+   "wired_steady_gib": 41.04894256591797
+  }
+ },
+ "contaminated": false,
+ "a_env": {
+  "DS4_METAL_DISABLE_V41_HC_FUSE": "1"
+ },
+ "b_env": {},
+ "a_cache": null,
+ "b_cache": null,
+ "ctx": 8192,
+ "workload": "switch"
+}

@@ -38,6 +38,13 @@ def _mean(rows, key):
     return statistics.fmean(vals) if vals else None
 
 
+def env_mismatch(row_env, envs, side):
+    """Switches whose value in a reused run differs from what `side` asks for
+    now (keys of either side; absent means unset)."""
+    keys = set(envs["a"]) | set(envs["b"])
+    return sorted(k for k in keys if row_env.get(k) != envs[side].get(k))
+
+
 def run_ab(run, label, order=ORDER):
     """`run(side, tag_suffix)` returns one result row; sides are "a" and "b"."""
     sides = {"a": [], "b": []}
@@ -45,10 +52,18 @@ def run_ab(run, label, order=ORDER):
         sides[side].append(run(side, f"-{label}-{i}{side}"))
     a_tps, b_tps = _mean(sides["a"], "gen_steady_tps"), _mean(sides["b"], "gen_steady_tps")
     return {"label": label, "a_tps": a_tps, "b_tps": b_tps,
-            "ratio": b_tps / a_tps if a_tps else None,
+            "ratio": b_tps / a_tps if a_tps and b_tps is not None else None,
             "runs": {s: [r["gen_steady_tps"] for r in rows] for s, rows in sides.items()},
             "terms": {s: {k: _mean(rows, k) for k in TERMS} for s, rows in sides.items()},
             "contaminated": any(r.get("contaminated") for rows in sides.values() for r in rows)}
+
+
+def summary_line(result):
+    def tps(v):
+        return "n/a" if v is None else f"{v:.2f}"
+    ratio = "ratio n/a" if result["ratio"] is None else f"ratio {result['ratio']:.4f}"
+    return (f"ab: {result['label']} A {tps(result['a_tps'])} B {tps(result['b_tps'])} t/s {ratio}"
+            + (" CONTAMINATED" if result["contaminated"] else ""))
 
 
 def _cache(value):
@@ -81,9 +96,14 @@ def main():
         spec = (args.workload, args.ctx, caches[side], args.gen, False)
         row = phase0.run_one(args.bin, args.model, args.prompts, out, spec,
                              extra_env=envs[side], tag_suffix=suffix)
-        if row is None:   # finished earlier: reuse it
-            with open(os.path.join(out, phase0.run_tag(spec, suffix) + ".result.json")) as fp:
+        if row is None:   # finished earlier: reuse it, if it ran with this side's switches
+            tag = phase0.run_tag(spec, suffix)
+            with open(os.path.join(out, tag + ".result.json")) as fp:
                 row = json.load(fp)
+            stale = env_mismatch(row.get("ds4_env", {}), envs, side)
+            if stale:
+                raise SystemExit(f"ab: {tag} was run with different {', '.join(stale)}; "
+                                 "use a new --label or --out")
         return row
 
     result = run_ab(run, args.label)
@@ -93,8 +113,7 @@ def main():
     with open(path + ".tmp", "w") as fp:
         json.dump(result, fp, indent=1)
     os.replace(path + ".tmp", path)
-    print(f"ab: {args.label} A {result['a_tps']:.2f} B {result['b_tps']:.2f} t/s "
-          f"ratio {result['ratio']:.4f}" + (" CONTAMINATED" if result["contaminated"] else ""))
+    print(summary_line(result))
     return 0
 
 

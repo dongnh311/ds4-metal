@@ -1,0 +1,45 @@
+{
+ "label": "router-fused",
+ "a_tps": 11.175,
+ "b_tps": 11.335,
+ "ratio": 1.014317673378076,
+ "runs": {
+  "a": [
+   11.04,
+   11.31
+  ],
+  "b": [
+   11.33,
+   11.34
+  ]
+ },
+ "terms": {
+  "a": {
+   "step_ms": 89.89750000000001,
+   "gpu_busy_ms": 56.187,
+   "pread_ms": 13.216000000000001,
+   "readahead_ms": 15.6206748046875,
+   "host_ms": 4.296325195312498,
+   "decode_hit_rate": 0.8711249999999999,
+   "wired_steady_gib": 41.060699462890625
+  },
+  "b": {
+   "step_ms": 88.511,
+   "gpu_busy_ms": 54.9875,
+   "pread_ms": 13.3875,
+   "readahead_ms": 15.039825195312499,
+   "host_ms": 4.517674804687506,
+   "decode_hit_rate": 0.87125,
+   "wired_steady_gib": 41.054725646972656
+  }
+ },
+ "contaminated": false,
+ "a_env": {},
+ "b_env": {
+  "DS4_METAL_ENABLE_V41_ROUTER_FUSE": "1"
+ },
+ "a_cache": null,
+ "b_cache": null,
+ "ctx": 8192,
+ "workload": "switch"
+}

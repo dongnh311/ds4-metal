@@ -1,0 +1,15 @@
+tokens 40: GPU busy 55.44 ms/token, idle between buffers 51.89 ms/token
+layer_in          0.01 ms    0.0 %
+pre_attn          2.34 ms    4.2 %
+attn_project      8.54 ms   15.4 %
+attn_kv           0.40 ms    0.7 %
+attn_select       1.61 ms    2.9 %
+attn_core         2.85 ms    5.1 %
+attn_out         12.74 ms   23.0 %
+post_attn         1.15 ms    2.1 %
+moe_route         2.45 ms    4.4 %
+moe_shared        7.36 ms   13.3 %
+moe_routed       13.18 ms   23.8 %
+moe_tail          0.16 ms    0.3 %
+after_moe         0.26 ms    0.5 %
+logits            2.40 ms    4.3 %

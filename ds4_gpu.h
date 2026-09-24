@@ -100,6 +100,8 @@ int ds4_gpu_parallel_ffn_start(
         const ds4_gpu_tensor *x,
         float                 clamp);
 /* V4.1 BF16 shared expert; returns zero without arming if unavailable. */
+/* Whether ds4_gpu_dsv41_parallel_ffn_start can run on this device. */
+int ds4_gpu_dsv41_parallel_ffn_supported(void);
 int ds4_gpu_dsv41_parallel_ffn_start(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
@@ -194,6 +196,11 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 #endif
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
+/* DS4_METAL_GPU_STAGE_TIMESTAMPS (Metal): commit the batch in flight without
+ * waiting and remember it under a stage tag; the report reads the buffers' GPU
+ * start/end once the caller has waited for the token. */
+int ds4_gpu_stage_flush(const char *part, const char *stage, uint32_t layer, uint32_t pos0, uint32_t n_tokens);
+void ds4_gpu_stage_report(const char *what, uint32_t pos0, uint32_t n_tokens);
 /* Wait for committed command buffers without committing the open batch. */
 int ds4_gpu_wait_committed_commands(void);
 

@@ -1272,16 +1272,37 @@ done:
 }
 
 /* DISABLE_ENV may name several switches separated by commas (all set to 1
- * for the control session). */
-static void stream_control_env(const char *names, bool on) {
+ * for the control session). A switch must be read per call (getenv at use),
+ * or the control and candidate sessions run the same code and the check
+ * passes without testing anything. A list the buffer would cut, or one with
+ * no name, is refused. */
+static bool stream_control_env(const char *names, bool on) {
     char buf[512];
-    snprintf(buf, sizeof(buf), "%s", names);
+    const size_t n = strlen(names);
+    if (n == 0 || n >= sizeof(buf)) {
+        fprintf(stderr, "stream control: switch list must be 1..%zu characters\n", sizeof(buf) - 1);
+        return false;
+    }
+    memcpy(buf, names, n + 1);
     char *save = NULL;
+    unsigned count = 0;
     for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
         if (on) setenv(tok, "1", 1);
         else unsetenv(tok);
+        count++;
     }
+    if (count == 0) fprintf(stderr, "stream control: switch list names no switch\n");
+    return count != 0;
 }
+
+typedef enum {
+    STREAM_CONTROL_PERTURB_TOKEN,   /* feed the candidate another token */
+    STREAM_CONTROL_PERTURB_LOGITS,  /* flip one byte of the candidate's logits */
+    STREAM_CONTROL_PERTURB_STATE,   /* flip one byte of the candidate's first state span */
+} stream_control_perturb;
+
+/* Which compare caught the last stream-control mismatch (self-test). */
+static const char *g_stream_control_mismatch;
 
 /* SSD-streaming exactness at a cache that fits a 64 GB machine (the upstream
  * decode-control fixture asks for 64 GiB). The control session runs with
@@ -1290,9 +1311,10 @@ static void stream_control_env(const char *names, bool on) {
  * perturb_step >= 0 feeds the candidate a different token at that step: the
  * self-test uses it to prove the comparison can fail. quality selects the
  * engine's quality mode (layer-resident streaming). */
-static int check_stream_control(const char *path, const char *prompt_path,
-                                const char *disable, uint64_t cache_bytes,
-                                int perturb_step, bool quality) {
+static int check_stream_control_perturbed(const char *path, const char *prompt_path,
+                                          const char *disable, uint64_t cache_bytes,
+                                          int perturb_step, stream_control_perturb perturb,
+                                          bool quality) {
     ds4_engine *engine = NULL;
     ds4_session *control = NULL, *candidate = NULL;
     ds4_tokens tokens = {0};
@@ -1312,32 +1334,45 @@ static int check_stream_control(const char *path, const char *prompt_path,
         REQUIRE(ds4_session_create(&control, engine, 4096) == 0);
         REQUIRE(ds4_session_create(&candidate, engine, 4096) == 0);
         ds4_tokens input = {.v = tokens.v, .len = prefix, .cap = prefix};
-        stream_control_env(disable, true);
+        REQUIRE(stream_control_env(disable, true));
         REQUIRE(ds4_session_sync(control, &input, err, sizeof(err)) == 0);
-        stream_control_env(disable, false);
+        REQUIRE(stream_control_env(disable, false));
         REQUIRE(ds4_session_sync(candidate, &input, err, sizeof(err)) == 0);
         for (int step = 0; step <= 64; step++) {
             ds41_gpu_graph *a = &control->ds41_graph, *b = &candidate->ds41_graph;
             ds41_state_span sa[54], sb[54];
             const uint32_t n = ds41_state_spans(a, a->pos, sa);
             REQUIRE(a->pos == b->pos && n == ds41_state_spans(b, b->pos, sb));
-            REQUIRE(!memcmp(&a->history, &b->history, sizeof(a->history)));
-            REQUIRE(!memcmp(control->logits, candidate->logits, DS4_N_VOCAB * sizeof(float)));
-            for (uint32_t j = 0; j < n; j++) {
+            const char *mismatch = NULL;
+            if (memcmp(&a->history, &b->history, sizeof(a->history))) mismatch = "history";
+            else if (memcmp(control->logits, candidate->logits, DS4_N_VOCAB * sizeof(float)))
+                mismatch = "logits";
+            for (uint32_t j = 0; !mismatch && j < n; j++) {
                 REQUIRE(sa[j].bytes == sb[j].bytes);
                 if (memcmp(ds4_gpu_tensor_contents(sa[j].tensor),
-                           ds4_gpu_tensor_contents(sb[j].tensor), (size_t)sa[j].bytes)) {
-                    fprintf(stderr, "stream control state mismatch: pos=%u span=%u\n", a->pos, j);
-                    goto done;
-                }
+                           ds4_gpu_tensor_contents(sb[j].tensor), (size_t)sa[j].bytes))
+                    mismatch = "state";
+            }
+            if (mismatch) {
+                fprintf(stderr, "stream control %s mismatch: pos=%u\n", mismatch, a->pos);
+                g_stream_control_mismatch = mismatch;
+                goto done;
             }
             if (step == 64) break;
             const int token = tokens.v[prefix + step];
-            stream_control_env(disable, true);
+            REQUIRE(stream_control_env(disable, true));
             REQUIRE(ds4_session_eval(control, token, err, sizeof(err)) == 0);
-            stream_control_env(disable, false);
-            const int cand = step == perturb_step ? (token + 1) % DS4_N_VOCAB : token;
+            REQUIRE(stream_control_env(disable, false));
+            const bool plant = step == perturb_step;
+            const int cand = plant && perturb == STREAM_CONTROL_PERTURB_TOKEN ?
+                (token + 1) % DS4_N_VOCAB : token;
             REQUIRE(ds4_session_eval(candidate, cand, err, sizeof(err)) == 0);
+            if (plant && perturb == STREAM_CONTROL_PERTURB_LOGITS)
+                ((unsigned char *)candidate->logits)[0] ^= 1u;
+            if (plant && perturb == STREAM_CONTROL_PERTURB_STATE) {
+                REQUIRE(ds41_state_spans(b, b->pos, sb) != 0 && sb[0].bytes != 0);
+                ((unsigned char *)ds4_gpu_tensor_contents(sb[0].tensor))[0] ^= 1u;
+            }
         }
         fprintf(stderr, "V4.1 stream control %s%s cache=%.1f GiB prefix=%d: 65 exact "
                 "logits/history/KV states PASS\n", disable, quality ? " (quality)" : "",
@@ -1348,10 +1383,43 @@ static int check_stream_control(const char *path, const char *prompt_path,
     rc = 0;
 done:
     if (err[0]) fprintf(stderr, "%s\n", err);
-    stream_control_env(disable, false);
+    (void)stream_control_env(disable, false);
     if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
     ds4_session_free(candidate); ds4_session_free(control); ds4_engine_close(engine);
     ds4_tokens_free(&tokens); free(prompt);
+    return rc;
+}
+
+static int check_stream_control(const char *path, const char *prompt_path,
+                                const char *disable, uint64_t cache_bytes, bool quality) {
+    return check_stream_control_perturbed(path, prompt_path, disable, cache_bytes, -1,
+                                          STREAM_CONTROL_PERTURB_TOKEN, quality);
+}
+
+/* The switch list feeds every --stream-control run: a list the buffer would
+ * cut, or an empty one, must be refused rather than silently shortened. */
+static int check_stream_control_env(void) {
+    int rc = 1;
+    char long_list[700];
+    unsetenv("DS4_TEST_SC_A");
+    unsetenv("DS4_TEST_SC_B");
+    REQUIRE(stream_control_env("DS4_TEST_SC_A,DS4_TEST_SC_B", true));
+    REQUIRE(getenv("DS4_TEST_SC_A") && !strcmp(getenv("DS4_TEST_SC_A"), "1") &&
+            getenv("DS4_TEST_SC_B") && !strcmp(getenv("DS4_TEST_SC_B"), "1"));
+    REQUIRE(stream_control_env("DS4_TEST_SC_A,DS4_TEST_SC_B", false));
+    REQUIRE(!getenv("DS4_TEST_SC_A") && !getenv("DS4_TEST_SC_B"));
+    memset(long_list, 'X', sizeof(long_list) - 1);
+    long_list[sizeof(long_list) - 1] = '\0';
+    memcpy(long_list, "DS4_TEST_SC_A,", 14);
+    REQUIRE(!stream_control_env(long_list, true));
+    REQUIRE(!getenv("DS4_TEST_SC_A"));
+    REQUIRE(!stream_control_env("", true));
+    REQUIRE(!stream_control_env(",,", true));
+    fprintf(stderr, "V4.1 stream control env PASS\n");
+    rc = 0;
+done:
+    unsetenv("DS4_TEST_SC_A");
+    unsetenv("DS4_TEST_SC_B");
     return rc;
 }
 
@@ -2191,6 +2259,87 @@ done:
 }
 #endif
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* --stream-control flips a switch between two sessions of one process, so the
+ * #1042 fusion switches must be read per call, not cached on first use. */
+static int check_v41_fuse_switches(void) {
+    int rc = 1;
+    ds41_gpu_graph g = {.tp_world = 1};
+    REQUIRE(ds4_gpu_init());
+    unsetenv("DS4_METAL_DISABLE_V41_HC_FUSE");
+    unsetenv("DS4_METAL_DISABLE_V41_ATTN_FUSE");
+    const bool hc = ds41_hc_fused(&g);
+    REQUIRE(hc == (ds4_gpu_hc_rms_norm_mix_f16_available() != 0));
+    REQUIRE(ds41_attn_fused(&g) == hc);
+    setenv("DS4_METAL_DISABLE_V41_ATTN_FUSE", "1", 1);
+    REQUIRE(!ds41_attn_fused(&g));
+    unsetenv("DS4_METAL_DISABLE_V41_ATTN_FUSE");
+    setenv("DS4_METAL_DISABLE_V41_HC_FUSE", "1", 1);
+    REQUIRE(!ds41_hc_fused(&g) && !ds41_attn_fused(&g));
+    unsetenv("DS4_METAL_DISABLE_V41_HC_FUSE");
+    REQUIRE(ds41_hc_fused(&g) == hc);
+    fprintf(stderr, "V4.1 fuse switches per call PASS\n");
+    rc = 0;
+done:
+    unsetenv("DS4_METAL_DISABLE_V41_HC_FUSE");
+    unsetenv("DS4_METAL_DISABLE_V41_ATTN_FUSE");
+    return rc;
+}
+#endif
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* The #1042 MoE predicates: every switch read per call (--stream-control
+ * flips them inside one process), the fused router opt-in, and the resident
+ * Q4_K layer that Ivan's concurrent FFN serves on M3 Ultra left unfused. */
+static int check_v41_moe_fuse_predicates(void) {
+    int rc = 1;
+    static const char *const envs[] = {
+        "DS4_METAL_DISABLE_V41_HC_FUSE", "DS4_METAL_DISABLE_V41_MOE_FUSE",
+        "DS4_METAL_DISABLE_V41_SHARED_FUSE", "DS4_METAL_DISABLE_V41_ROUTER_FUSE",
+        "DS4_METAL_ENABLE_V41_ROUTER_FUSE",
+    };
+    ds41_gpu_graph g = {.tp_world = 1, .streaming = true};
+    ds4_tensor q4 = {.type = DS4_TENSOR_Q4_K}, q8 = {.type = DS4_TENSOR_Q8_0},
+               f32 = {.type = DS4_TENSOR_F32}, iq2 = {.type = DS4_TENSOR_IQ2_XXS},
+               q2 = {.type = DS4_TENSOR_Q2_K};
+    ds4_layer_weights l = {0};
+    l.ffn_gate_shexp = l.ffn_up_shexp = l.ffn_down_shexp = &q8;
+    l.ffn_gate_inp = &f32;
+    l.ffn_gate_exps = l.ffn_up_exps = &iq2;
+    l.ffn_down_exps = &q2;
+    for (unsigned i = 0; i < sizeof(envs) / sizeof(envs[0]); i++) unsetenv(envs[i]);
+    REQUIRE(ds4_gpu_init());
+    REQUIRE(ds4_gpu_hc_rms_norm_mix_f16_available());
+    REQUIRE(ds41_moe_fused(&g, &l));
+    REQUIRE(!ds41_router_fused(&g, &l));
+    setenv("DS4_METAL_ENABLE_V41_ROUTER_FUSE", "1", 1);
+    REQUIRE(ds41_router_fused(&g, &l));
+    setenv("DS4_METAL_DISABLE_V41_ROUTER_FUSE", "1", 1);
+    REQUIRE(!ds41_router_fused(&g, &l) && ds41_moe_fused(&g, &l));
+    unsetenv("DS4_METAL_DISABLE_V41_ROUTER_FUSE");
+    setenv("DS4_METAL_DISABLE_V41_SHARED_FUSE", "1", 1);
+    REQUIRE(!ds41_moe_fused(&g, &l) && ds41_router_fused(&g, &l));
+    unsetenv("DS4_METAL_DISABLE_V41_SHARED_FUSE");
+    setenv("DS4_METAL_DISABLE_V41_MOE_FUSE", "1", 1);
+    REQUIRE(!ds41_moe_fused(&g, &l) && !ds41_router_fused(&g, &l));
+    unsetenv("DS4_METAL_DISABLE_V41_MOE_FUSE");
+    setenv("DS4_METAL_DISABLE_V41_HC_FUSE", "1", 1);
+    REQUIRE(!ds41_moe_fused(&g, &l) && !ds41_router_fused(&g, &l));
+    unsetenv("DS4_METAL_DISABLE_V41_HC_FUSE");
+    unsetenv("DS4_METAL_ENABLE_V41_ROUTER_FUSE");
+    /* Resident Q4_K experts: where the concurrent FFN runs, it wins. */
+    g.streaming = false;
+    l.ffn_gate_exps = l.ffn_up_exps = l.ffn_down_exps = &q4;
+    REQUIRE(ds41_moe_fused(&g, &l) == !ds4_gpu_dsv41_parallel_ffn_supported());
+    fprintf(stderr, "V4.1 MoE fuse predicates PASS (parallel FFN device: %s)\n",
+            ds4_gpu_dsv41_parallel_ffn_supported() ? "yes" : "no");
+    rc = 0;
+done:
+    for (unsigned i = 0; i < sizeof(envs) / sizeof(envs[0]); i++) unsetenv(envs[i]);
+    return rc;
+}
+#endif
+
 static int check_decode_profile_format(void) {
     int rc = 1;
     char line[256];
@@ -2220,6 +2369,16 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--stream-async-abandon"))
         return check_stream_async_abandon();
 #endif
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (argc == 2 && !strcmp(argv[1], "--v41-fuse-switches"))
+        return check_v41_fuse_switches();
+    if (argc == 2 && !strcmp(argv[1], "--v41-moe-fuse-predicates"))
+        return check_v41_moe_fuse_predicates();
+#endif
+#ifdef __APPLE__
+    if (argc == 2 && !strcmp(argv[1], "--stream-control-env"))
+        return check_stream_control_env();
+#endif
 #ifdef __APPLE__
     if (argc == 2 && !strcmp(argv[1], "--engram-reads")) return test_parallel_engram();
     if (argc == 4 && !strcmp(argv[2], "--engram-parallel"))
@@ -2235,17 +2394,31 @@ int main(int argc, char **argv) {
             return 2;
         }
         return check_stream_control(argv[1], argv[3], argv[4],
-                                    (uint64_t)(gib * 1073741824.0), -1, false);
+                                    (uint64_t)(gib * 1073741824.0), false);
     }
     if (argc == 5 && !strcmp(argv[2], "--stream-control-quality"))
-        return check_stream_control(argv[1], argv[3], argv[4], UINT64_C(8) << 30, -1, true);
+        return check_stream_control(argv[1], argv[3], argv[4], UINT64_C(8) << 30, true);
     if (argc == 4 && !strcmp(argv[2], "--stream-control-selftest")) {
-        /* A no-op switch plus a planted token change: the check must FAIL. */
-        const int rc = check_stream_control(argv[1], argv[3], "DS4_TEST_STREAM_CONTROL_NOOP",
-                                            UINT64_C(8) << 30, 3, false);
-        fprintf(stderr, "V4.1 stream control self-test: %s\n",
-                rc ? "planted difference detected PASS" : "difference NOT detected FAIL");
-        return rc ? 0 : 1;
+        /* A no-op switch plus one planted difference per run: a changed token,
+         * one flipped logits byte, one flipped KV-state byte. Each run must
+         * FAIL, caught by its own compare. */
+        static const struct { stream_control_perturb kind; const char *caught; } runs[] = {
+            {STREAM_CONTROL_PERTURB_TOKEN, "history"},
+            {STREAM_CONTROL_PERTURB_LOGITS, "logits"},
+            {STREAM_CONTROL_PERTURB_STATE, "state"},
+        };
+        int failed = 0;
+        for (unsigned i = 0; i < sizeof(runs) / sizeof(runs[0]); i++) {
+            g_stream_control_mismatch = NULL;
+            const int rc = check_stream_control_perturbed(argv[1], argv[3],
+                "DS4_TEST_STREAM_CONTROL_NOOP", UINT64_C(8) << 30, 3, runs[i].kind, false);
+            const bool ok = rc != 0 && g_stream_control_mismatch &&
+                !strcmp(g_stream_control_mismatch, runs[i].caught);
+            fprintf(stderr, "V4.1 stream control self-test %s: %s\n", runs[i].caught,
+                    ok ? "planted difference detected PASS" : "difference NOT detected FAIL");
+            failed |= !ok;
+        }
+        return failed;
     }
 #endif
 

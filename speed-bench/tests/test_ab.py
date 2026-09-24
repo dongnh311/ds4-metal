@@ -39,5 +39,20 @@ class AbTest(unittest.TestCase):
             ab.parse_env(["NOEQUALS"])
 
 
+class AbReuseTest(unittest.TestCase):
+    def test_env_mismatch_names_stale_keys(self):
+        want = {"a": {"DS4_X": "1"}, "b": {}}
+        # a reused B run recorded with A's switch set is stale
+        self.assertEqual(ab.env_mismatch({"DS4_X": "1"}, want, "b"), ["DS4_X"])
+        self.assertEqual(ab.env_mismatch({"DS4_X": "1", "DS4_OTHER": "2"}, want, "a"), [])
+        self.assertEqual(ab.env_mismatch({}, want, "a"), ["DS4_X"])
+
+    def test_summary_line_without_a_side(self):
+        res = ab.run_ab(lambda side, suffix: row(10.0, gen_steady_tps=0.0 if side == "a" else 10.0),
+                        "z")
+        self.assertIsNone(res["ratio"])
+        self.assertIn("ratio n/a", ab.summary_line(res))
+
+
 if __name__ == "__main__":
     unittest.main()

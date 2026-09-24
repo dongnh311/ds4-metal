@@ -334,6 +334,14 @@ class ReportTest(unittest.TestCase):
 
 
 class AbHelpersTest(unittest.TestCase):
+    def test_report_orders_auto_cache_rows(self):
+        base = {"workload": "switch", "ctx": 8192, "gen": 512, "gen_steady_tps": 9.0,
+                "contaminated": False, "swap_delta_mib": 0.0}
+        rows = [dict(base, cache_gb=24), dict(base, cache_gb=None)]
+        bytes_json = {"per_token": {"resident": 0, "embedding_row": 0, "routed": 0}, "gbps": 290.0}
+        text = phase0.report(rows, bytes_json, [])
+        self.assertIn("| switch | 8192 | auto |", text)
+
     def test_bench_cmd_auto_cache_omits_flag(self):
         cmd = phase0.bench_cmd("/b", "/m.gguf", "/p.txt", 8192, 512, None, "/o.csv")
         self.assertNotIn("--ssd-streaming-cache-experts", cmd)
