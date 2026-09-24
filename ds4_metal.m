@@ -11748,6 +11748,15 @@ static int ds4_gpu_flash_attn_stage_profile_boundary(
     return *cbp != nil && owned == 0;
 }
 
+/* Wait for the command buffers already committed, leaving the open batch (and
+ * its transient buffers) alone. Their streaming-cache entries leave the
+ * in-flight set, which only a host wait refreshes. */
+int ds4_gpu_wait_committed_commands(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if ([g_pending_cbs count] == 0) return 1;
+    return ds4_gpu_wait_pending_command_buffers("committed command buffers");
+}
+
 int ds4_gpu_synchronize(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (g_batch_cb) return ds4_gpu_end_commands();

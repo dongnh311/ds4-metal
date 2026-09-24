@@ -40963,6 +40963,19 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     metal_graph_selected_async_load async_load = {0};
     bool async_started = false;
     if (ds41_stream_async_load(g)) {
+        /* Queued layers leave earlier command buffers unwaited, and the expert
+         * cache counts their entries in flight until a host wait. Below twice
+         * one token's routed working set those entries crowd the cache: the
+         * worker would evict only entries this token has not used yet (the
+         * hot ones), or find no victim and reach the cache's in-flight wait
+         * off the main thread. There, wait for the committed work first (the
+         * open batch holds this layer's attention and router). Larger caches
+         * always keep idle victims and skip the wait, which costs the GPU a
+         * host wake-up per layer. */
+        const uint32_t budget = ds4_gpu_stream_expert_cache_budget_for_expert_size(
+            gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD);
+        if (budget < 2u * DS4_N_LAYER * DS4_N_EXPERT_USED &&
+            !ds4_gpu_wait_committed_commands()) return false;
         uint64_t selected_event = 0;
         if (!ds4_gpu_signal_selected_readback_ready(&selected_event)) return false;
         if (!metal_graph_selected_async_load_start_tensor(&async_load, g->selected, m, l, il,
