@@ -1,0 +1,45 @@
+{
+ "label": "split-low",
+ "a_tps": 10.280000000000001,
+ "b_tps": 10.265,
+ "ratio": 0.9985408560311283,
+ "runs": {
+  "a": [
+   10.42,
+   10.14
+  ],
+  "b": [
+   10.25,
+   10.28
+  ]
+ },
+ "terms": {
+  "a": {
+   "step_ms": 97.568,
+   "gpu_busy_ms": 58.0225,
+   "pread_ms": 16.9315,
+   "readahead_ms": 17.710080078125,
+   "host_ms": 4.325919921874998,
+   "decode_hit_rate": 0.7957916666666667,
+   "wired_steady_gib": 29.259307861328125
+  },
+  "b": {
+   "step_ms": 97.767,
+   "gpu_busy_ms": 62.365,
+   "pread_ms": 18.3275,
+   "readahead_ms": 17.9920927734375,
+   "host_ms": -1.5060927734374978,
+   "decode_hit_rate": 0.7957916666666667,
+   "wired_steady_gib": 29.27016830444336
+  }
+ },
+ "contaminated": false,
+ "a_env": {
+  "DS4_METAL_DISABLE_V41_SPLIT_LOW": "1"
+ },
+ "b_env": {},
+ "a_cache": 24,
+ "b_cache": 24,
+ "ctx": 8192,
+ "workload": "switch"
+}

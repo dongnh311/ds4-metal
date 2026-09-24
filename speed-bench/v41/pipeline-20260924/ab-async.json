@@ -1,0 +1,45 @@
+{
+ "label": "async",
+ "a_tps": 9.65,
+ "b_tps": 10.055,
+ "ratio": 1.0419689119170983,
+ "runs": {
+  "a": [
+   9.73,
+   9.57
+  ],
+  "b": [
+   10.16,
+   9.95
+  ]
+ },
+ "terms": {
+  "a": {
+   "step_ms": 104.11449999999999,
+   "gpu_busy_ms": 57.56,
+   "pread_ms": 16.9075,
+   "readahead_ms": 17.867541015625,
+   "host_ms": 11.197458984374999,
+   "decode_hit_rate": 0.7957916666666667,
+   "wired_steady_gib": 29.259170532226562
+  },
+  "b": {
+   "step_ms": 99.846,
+   "gpu_busy_ms": 59.355000000000004,
+   "pread_ms": 16.987000000000002,
+   "readahead_ms": 18.2756181640625,
+   "host_ms": 4.652381835937504,
+   "decode_hit_rate": 0.7957916666666667,
+   "wired_steady_gib": 29.257781982421875
+  }
+ },
+ "contaminated": false,
+ "a_env": {
+  "DS4_METAL_DISABLE_V41_ASYNC_LOAD": "1"
+ },
+ "b_env": {},
+ "a_cache": 24,
+ "b_cache": 24,
+ "ctx": 8192,
+ "workload": "switch"
+}

@@ -244,6 +244,20 @@ class RunTest(unittest.TestCase):
             self.assertTrue(os.path.exists(router_log + ".failed"))
 
 
+    def test_extra_env_and_tag_suffix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "prompts"), exist_ok=True)
+            open(os.path.join(tmp, "prompts", "switch.txt"), "w").close()
+            row = phase0.run_one(fake_bin(tmp, self.csv_body()), "/m.gguf",
+                                 os.path.join(tmp, "prompts"), tmp, self.SPEC,
+                                 running=lambda: "", swap=lambda: 0.0,
+                                 sampler=lambda: _FakeSampler(),
+                                 idle_read=lambda: FREE_VM_STAT, idle_timeout=0.05,
+                                 idle_interval=0.01, extra_env={"DS4_TEST_AB": "on"},
+                                 tag_suffix="-x-1b")
+            self.assertEqual(row["ds4_env"]["DS4_TEST_AB"], "on")
+            self.assertTrue(os.path.exists(os.path.join(tmp, self.TAG + "-x-1b.result.json")))
+
 class _FakeSampler:
     def __init__(self):
         self.interval = 0.03
@@ -317,6 +331,27 @@ class ReportTest(unittest.TestCase):
         self.assertIn("| yes |", text)         # code row has a router log
         # The code row is faster but has a router log, so it must not win "best clean".
         self.assertIn("10.00 t/s (switch", text)
+
+
+class AbHelpersTest(unittest.TestCase):
+    def test_bench_cmd_auto_cache_omits_flag(self):
+        cmd = phase0.bench_cmd("/b", "/m.gguf", "/p.txt", 8192, 512, None, "/o.csv")
+        self.assertNotIn("--ssd-streaming-cache-experts", cmd)
+        self.assertIn("--ssd-streaming", cmd)
+
+    def test_run_tag(self):
+        self.assertEqual(phase0.run_tag(("switch", 8192, None, 512, False), "-q-0a"),
+                         "switch-c8192-gauto-n512-q-0a")
+        self.assertEqual(phase0.run_tag(("switch", 8192, 24, 512, False)),
+                         "switch-c8192-g24-n512")
+
+    def test_parse_readahead_takes_last_summary(self):
+        text = ("ds4:   streaming expert timing total selected_calls=20480 read_avg=1.1 "
+                "readahead_calls=5 readahead_avg=0.1 readahead_total=100.0 readahead_gib=1.0\n"
+                "ds4:   streaming expert timing total selected_calls=20480 read_avg=1.1 "
+                "readahead_calls=9 readahead_avg=0.1 readahead_total=8948.464 readahead_gib=232.62\n")
+        self.assertAlmostEqual(phase0.parse_readahead(text), 8948.464)
+        self.assertIsNone(phase0.parse_readahead("nothing"))
 
 
 if __name__ == "__main__":

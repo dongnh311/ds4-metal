@@ -1,0 +1,43 @@
+{
+ "label": "cache-32",
+ "a_tps": 9.22,
+ "b_tps": 9.535,
+ "ratio": 1.034164859002169,
+ "runs": {
+  "a": [
+   9.22,
+   9.22
+  ],
+  "b": [
+   9.53,
+   9.54
+  ]
+ },
+ "terms": {
+  "a": {
+   "step_ms": 108.8605,
+   "gpu_busy_ms": 56.559,
+   "pread_ms": 17.025,
+   "readahead_ms": 16.9658369140625,
+   "host_ms": 17.749163085937504,
+   "decode_hit_rate": 0.7957916666666667,
+   "wired_steady_gib": 29.23415756225586
+  },
+  "b": {
+   "step_ms": 105.357,
+   "gpu_busy_ms": 56.274,
+   "pread_ms": 14.35,
+   "readahead_ms": 15.936853515625,
+   "host_ms": 18.231646484375002,
+   "decode_hit_rate": 0.8517083333333333,
+   "wired_steady_gib": 37.25139617919922
+  }
+ },
+ "contaminated": false,
+ "a_env": {},
+ "b_env": {},
+ "a_cache": 24,
+ "b_cache": 32,
+ "ctx": 8192,
+ "workload": "switch"
+}

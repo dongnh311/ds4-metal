@@ -1,0 +1,45 @@
+{
+ "label": "async-readahead-off",
+ "a_tps": 10.13,
+ "b_tps": 9.88,
+ "ratio": 0.9753208292201382,
+ "runs": {
+  "a": [
+   10.13,
+   10.13
+  ],
+  "b": [
+   9.88,
+   9.88
+  ]
+ },
+ "terms": {
+  "a": {
+   "step_ms": 99.108,
+   "gpu_busy_ms": 59.034,
+   "pread_ms": 16.967,
+   "readahead_ms": 17.8342783203125,
+   "host_ms": 4.686721679687505,
+   "decode_hit_rate": 0.7957916666666667,
+   "wired_steady_gib": 29.260177612304688
+  },
+  "b": {
+   "step_ms": 101.71350000000001,
+   "gpu_busy_ms": 59.548500000000004,
+   "pread_ms": 35.4855,
+   "readahead_ms": 0.0,
+   "host_ms": 6.111500000000001,
+   "decode_hit_rate": 0.7957916666666667,
+   "wired_steady_gib": 29.261619567871094
+  }
+ },
+ "contaminated": false,
+ "a_env": {},
+ "b_env": {
+  "DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD": "1"
+ },
+ "a_cache": 24,
+ "b_cache": 24,
+ "ctx": 8192,
+ "workload": "switch"
+}
