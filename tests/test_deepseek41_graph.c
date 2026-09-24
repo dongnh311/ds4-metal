@@ -2259,6 +2259,34 @@ done:
 }
 #endif
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* --stream-control flips a switch between two sessions of one process, so the
+ * #1042 fusion switches must be read per call, not cached on first use. */
+static int check_v41_fuse_switches(void) {
+    int rc = 1;
+    ds41_gpu_graph g = {.tp_world = 1};
+    REQUIRE(ds4_gpu_init());
+    unsetenv("DS4_METAL_DISABLE_V41_HC_FUSE");
+    unsetenv("DS4_METAL_DISABLE_V41_ATTN_FUSE");
+    const bool hc = ds41_hc_fused(&g);
+    REQUIRE(hc == (ds4_gpu_hc_rms_norm_mix_f16_available() != 0));
+    REQUIRE(ds41_attn_fused(&g) == hc);
+    setenv("DS4_METAL_DISABLE_V41_ATTN_FUSE", "1", 1);
+    REQUIRE(!ds41_attn_fused(&g));
+    unsetenv("DS4_METAL_DISABLE_V41_ATTN_FUSE");
+    setenv("DS4_METAL_DISABLE_V41_HC_FUSE", "1", 1);
+    REQUIRE(!ds41_hc_fused(&g) && !ds41_attn_fused(&g));
+    unsetenv("DS4_METAL_DISABLE_V41_HC_FUSE");
+    REQUIRE(ds41_hc_fused(&g) == hc);
+    fprintf(stderr, "V4.1 fuse switches per call PASS\n");
+    rc = 0;
+done:
+    unsetenv("DS4_METAL_DISABLE_V41_HC_FUSE");
+    unsetenv("DS4_METAL_DISABLE_V41_ATTN_FUSE");
+    return rc;
+}
+#endif
+
 static int check_decode_profile_format(void) {
     int rc = 1;
     char line[256];
@@ -2287,6 +2315,10 @@ int main(int argc, char **argv) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     if (argc == 2 && !strcmp(argv[1], "--stream-async-abandon"))
         return check_stream_async_abandon();
+#endif
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (argc == 2 && !strcmp(argv[1], "--v41-fuse-switches"))
+        return check_v41_fuse_switches();
 #endif
 #ifdef __APPLE__
     if (argc == 2 && !strcmp(argv[1], "--stream-control-env"))

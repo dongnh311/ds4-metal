@@ -40551,12 +40551,10 @@ static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
             weight->abs_offset, weight->dim[0], weight->dim[1], in) != 0;
     /* Round on the store instead of a rounding dispatch over the result
      * (upstream #1042; Q8_0 takes the fused path above, this covers F16). */
-    static int fused = -1;
-    if (fused < 0) {
-        fused = getenv("DS4_METAL_DISABLE_V41_MATVEC_BF16") == NULL &&
-            getenv("DS4_METAL_V41_SKIP_BF16") == NULL;
-    }
-    if (round && fused) {
+    /* Switches are read per call: --stream-control flips them between two
+     * sessions of one process. */
+    if (round && !getenv("DS4_METAL_DISABLE_V41_MATVEC_BF16") &&
+        !getenv("DS4_METAL_V41_SKIP_BF16")) {
         const int rc = ds4_gpu_dsv41_matvec_bf16(out, m->map, m->size, weight->abs_offset,
             weight->type, (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], in);
         if (rc) return rc > 0;
@@ -40872,22 +40870,18 @@ static bool ds41_attention_select(ds41_gpu_graph *g, const ds4_model *m,
  * and issue 6 + 5.  Single box only; the TP graph keeps the unfused
  * sequences. */
 static bool ds41_hc_fused(const ds41_gpu_graph *g) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        enabled = getenv("DS4_METAL_DISABLE_V41_HC_FUSE") == NULL &&
-            ds4_gpu_hc_rms_norm_mix_f16_available() != 0;
-    }
-    return enabled && g->tp_world == 1;
+    /* The device capability is fixed; the switch is read per call so
+     * --stream-control can flip it between two sessions of one process. */
+    static int available = -1;
+    if (available < 0) available = ds4_gpu_hc_rms_norm_mix_f16_available() != 0;
+    return available && g->tp_world == 1 && !getenv("DS4_METAL_DISABLE_V41_HC_FUSE");
 }
 
 /* Router matvec + select as one (two on pre-M5) dispatch. */
 static bool ds41_router_fused(const ds41_gpu_graph *g, const ds4_layer_weights *l) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        enabled = getenv("DS4_METAL_DISABLE_V41_MOE_FUSE") == NULL &&
-            getenv("DS4_METAL_DISABLE_V41_ROUTER_FUSE") == NULL;
-    }
-    return enabled && ds41_hc_fused(g) && l->ffn_gate_inp->type == DS4_TENSOR_F32;
+    return !getenv("DS4_METAL_DISABLE_V41_MOE_FUSE") &&
+        !getenv("DS4_METAL_DISABLE_V41_ROUTER_FUSE") &&
+        ds41_hc_fused(g) && l->ffn_gate_inp->type == DS4_TENSOR_F32;
 }
 
 /* Shared expert gate/up/SwiGLU as one dispatch, its down projection rounded
@@ -40896,12 +40890,8 @@ static bool ds41_router_fused(const ds41_gpu_graph *g, const ds4_layer_weights *
  * projection runs BEFORE the routed experts: a fused tail that read
  * shared_mid after them saw clobbered values on the M3 Ultra. */
 static bool ds41_moe_fused(const ds41_gpu_graph *g, const ds4_layer_weights *l) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        enabled = getenv("DS4_METAL_DISABLE_V41_MOE_FUSE") == NULL &&
-            getenv("DS4_METAL_DISABLE_V41_SHARED_FUSE") == NULL;
-    }
-    return enabled && ds41_hc_fused(g) &&
+    return !getenv("DS4_METAL_DISABLE_V41_MOE_FUSE") &&
+        !getenv("DS4_METAL_DISABLE_V41_SHARED_FUSE") && ds41_hc_fused(g) &&
         l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
         l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
         l->ffn_down_shexp->type == DS4_TENSOR_Q8_0;
@@ -40913,9 +40903,7 @@ static bool ds41_moe_fused(const ds41_gpu_graph *g, const ds4_layer_weights *l) 
  * its store.  Byte-identical to the standalone sequences
  * (tests/test_deepseek41_metal --attn-fuse). */
 static bool ds41_attn_fused(const ds41_gpu_graph *g) {
-    static int enabled = -1;
-    if (enabled < 0) enabled = getenv("DS4_METAL_DISABLE_V41_ATTN_FUSE") == NULL;
-    return enabled && ds41_hc_fused(g);
+    return !getenv("DS4_METAL_DISABLE_V41_ATTN_FUSE") && ds41_hc_fused(g);
 }
 #endif
 
