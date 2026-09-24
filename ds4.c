@@ -40932,6 +40932,16 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
            ds41_bf16(g->block, DS4_N_EMBD);
 }
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* Solo streaming decode: hand the selected ids to the async-load worker as
+ * soon as the router is on the GPU, so misses are read while the shared
+ * expert runs (the V4-Flash metal_graph_selected_async_load_* path). */
+static bool ds41_stream_async_load(const ds41_gpu_graph *g) {
+    return g->streaming && !g->quality && !g->imatrix && g->tp_world == 1 &&
+        !getenv("DS4_METAL_DISABLE_V41_ASYNC_LOAD");
+}
+#endif
+
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
     uint64_t gate_row = 0, down_row = 0;
@@ -40949,6 +40959,20 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    metal_graph_selected_async_load async_load = {0};
+    bool async_started = false;
+    if (ds41_stream_async_load(g)) {
+        uint64_t selected_event = 0;
+        if (!ds4_gpu_signal_selected_readback_ready(&selected_event)) return false;
+        if (!metal_graph_selected_async_load_start_tensor(&async_load, g->selected, m, l, il,
+                selected_event, gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD)) return false;
+        async_started = true;
+        /* Early commit: the router and everything before it start on the GPU
+         * now, so the worker's event wait ends before the shared expert. */
+        if (!ds4_gpu_flush_commands()) return false;
+    }
+#endif
     const bool shared_here = !shared_owner || g->tp_rank == (il & 1u);
     bool shared_queued = false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -41006,6 +41030,24 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, g->tp_rank * (DS4_N_EXPERT / 2u),
             DS4_N_EXPERT / 2u, DS4_SWIGLU_CLAMP_EXP, g->norm, il, 1, NULL);
     } else
+#endif
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (async_started) {
+        const bool flush_ok = ds4_gpu_flush_commands() != 0;
+        bool finish_ok = metal_graph_selected_async_load_finish(&async_load);
+        if (!finish_ok && async_load.ids_ok) {
+            /* The worker may not wait on in-flight cache entries; this thread
+             * may, so stage the same load synchronously. */
+            const ds4_gpu_stream_expert_table retry =
+                graph_stream_expert_table_make(m, l, il, gate_row * DS4_N_FF_EXP,
+                                               down_row * DS4_N_EMBD);
+            finish_ok = ds4_gpu_stream_expert_cache_begin_selected_load(
+                            &retry, async_load.selected_ids, DS4_N_EXPERT_USED) != 0 &&
+                        ds4_gpu_routed_moe_set_selected_override(
+                            async_load.selected_ids, DS4_N_EXPERT_USED) != 0;
+        }
+        if (!flush_ok || !finish_ok) return false;
+    }
 #endif
     routed_ok = ds4_gpu_routed_moe_one_tensor(routed, g->gate, g->up, g->mid, g->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,

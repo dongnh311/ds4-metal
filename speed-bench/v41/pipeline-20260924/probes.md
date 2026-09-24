@@ -33,3 +33,10 @@ A side (24 GB, default): GPU 56.6, pread 17.0, readahead 16.9, host 17.7 ms/toke
 | Step | Switch | A t/s | B t/s | Ratio | B GPU | B pread | B readahead | B host | Kept |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | b queue | `DS4_METAL_DISABLE_V41_STREAM_DECODE_QUEUE` | 8.92 | 9.53 | 1.0684 | 58.5 | 17.1 | 17.7 | 11.4 | yes |
+| c1 async load | `DS4_METAL_DISABLE_V41_ASYNC_LOAD` | 9.65 | 10.05 | 1.0420 | 59.4 | 17.0 | 18.3 | 4.7 | yes |
+| c1 re-check: readahead off (async on) | `DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD` (B) | 10.13 | 9.88 | 0.9753 | 59.6 | 35.5 | 0.0 | 6.1 | no: `readahead_verdict = keep`, Task 7 skipped |
+
+Under the async load, pread + readahead (about 35 ms/token) stay on the critical path: the
+worker starts only one shared-expert time earlier. The c1 gain comes from dropping the
+selected-id readback wait and host work (host 11.2 -> 4.7 ms/token). The timing counters
+include the worker's time, so `host_ms` is a residual, not main-thread time.
