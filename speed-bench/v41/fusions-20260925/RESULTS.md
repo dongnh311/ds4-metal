@@ -154,3 +154,10 @@ the auto cache with every feature on.
   agree. This can't be exercised on the M5; the model-free
   `--v41-moe-fuse-predicates` pins the predicate and the per-call reads of every
   MoE switch.
+
+## Checks on the review-fix commit `51b59a8`
+
+- `--stream-control`: `DS4_METAL_DISABLE_V41_HC_FUSE` at 8 and 24 GB and `_MOE_FUSE` at 8 GB, PASS.
+- `--stream-control-quality DS4_METAL_DISABLE_V41_HC_FUSE`: both prefixes PASS. The #1042 predicates do not look at `quality`, so layer-resident streaming runs the fused paths too; this run shows it is exact there. It takes about 2 h.
+- Kernel tests `--hc-fuse`, `--moe-fuse`, `--attn-fuse`: byte-identical.
+- Qwen fast tier: PASS.
