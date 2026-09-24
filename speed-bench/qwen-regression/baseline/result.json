@@ -1,0 +1,50 @@
+{
+ "registry_command": [
+  "/usr/bin/env",
+  "DS4_QWEN4_STREAM_FULL_LAYERS=32",
+  "DS4_QWEN4_PLE_PREFETCH_FULL=0",
+  "DS4_QWEN4_MTP_DRAFT_VOCAB=/Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-draft-vocab-vi-en-code-64k.txt",
+  "DS4_QWEN4_KV_GROW=1",
+  "/Users/dongnh/.local/share/ai-gateway/ds4-metal/ds4-server",
+  "--metal",
+  "-m",
+  "/Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q4KDownPad768-DenseQ4Kselimat-MTP.gguf",
+  "--ple",
+  "/Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+  "-c",
+  "262144",
+  "--prefill-chunk",
+  "2048",
+  "--mtp",
+  "--ssd-streaming",
+  "--ssd-streaming-cache-experts",
+  "6GB",
+  "--kv-disk-dir",
+  "KV",
+  "--kv-disk-space-mb",
+  "32768",
+  "--kv-cache-cold-max-tokens",
+  "262144",
+  "--host",
+  "127.0.0.1",
+  "--port",
+  "PORT"
+ ],
+ "replies": {
+  "vi": "Người dùng hỏi bằng tiếng Việt: \"Giải thích ngắn gọn cách bộ nhớ đệm KV giúp mô hình ngôn ngữ sinh văn bản nhanh hơn.\" Cần trả lời ngắn gọn, tiếng Việt. Nội dung: KV cache trong attention của transformer autoregressive. Khi sinh token mới, thay vì tính lại Key/Value cho toàn bộ prefix, lưu K,V của các token đã tính từ các lớp trước, chỉ tính Q,K,V cho token mới, dùng cache để attention với toàn bộ ngữ cảnh. Giảm chi phí từ O(n^2) hoặc O(n) per token xuống chỉ tính token mới, tăng tốc decode, đổi bộ nhớ lấy tốc độ. Có thể nhắc hạn chế bộ nhớ tăng theo độ dài ngữ cảnh.\n---\nBộ nhớ đệm KV (Key–Value cache) giúp mô hình ngôn ngữ sinh văn bản nhanh hơn bằng cách **lưu lại các vector Key và Value của các token đã xử lý trước đó** trong các lớp attention.\n\nKhi sinh token mới:\n- Mô hình chỉ cần tính **Query, Key, Value cho token hiện tại**.\n- Thay vì tính lại Key/Value cho toàn bộ đoạn văn bản đã có, nó dùng **KV cache** để truy cập ngay các giá trị cũ.\n- Nhờ đó giảm đáng kể phép tính attention ở mỗi bước sinh.\n\nNói ngắn gọn: **KV cache đổi bộ nhớ lấy tốc độ**, giúp sinh token nhanh hơn nhiều, đặc biệt khi ngữ cảnh dài.",
+  "code": "We need answer user: \"Write a Python function that returns the n-th Fibonacci number iteratively, with a docstring and two doctests.\" Need produce code likely. Need final answer concise but complete. Need ensure docstring and two doctests. Need decide indexing: n-th Fibonacci number. Common: fib(0)=0, fib(1)=1. Iterative. Include doctests: >>> fib(0) 0, >>> fib(10) 55 maybe. Need maybe handle negative? Could raise ValueError. Need docstring with Args/Returns/Raises. Need two doctests exactly? Could include two examples. Need ensure doctests pass. Let's craft function:\n\ndef fibonacci(n: int) -> int:\n    \"\"\"Return the n-th Fibonacci number iteratively.\n\n    The sequence is defined as F(0)=0, F(1)=1, and F(n)=F(n-1)+F(n-2) for n>=2.\n\n    Args:\n        n: A non-negative integer index.\n\n    Returns:\n        The n-th Fibonacci number.\n\n    Raises:\n        ValueError: If n is negative.\n\n    Examples:\n        >>> fibonacci(0)\n        0\n        >>> fibonacci(10)\n        55\n    \"\"\"\n    if n < 0: raise ValueError...\n    a,b=0,1\n    for _ in range\n---\n"
+ },
+ "tps": [
+  42.80215486528656,
+  42.05502833495315,
+  43.223960456137405
+ ],
+ "tps_median": 42.80215486528656,
+ "wired": {
+  "steady_gib": 45.80049133300781,
+  "peak_gib": 46.912078857421875,
+  "n": 42
+ },
+ "needle_prompt_tokens": 214672,
+ "needle_hit": true
+}
