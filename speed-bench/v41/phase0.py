@@ -46,6 +46,7 @@ SWAP_LIMIT_MIB = 256.0
 DECODE_MARGIN_S = 1.0
 FIELDS = ["workload", "ctx", "cache_gb", "gen", "prefill_tps", "gen_tps", "gen_steady_tps",
           "gen_first_ms", "step_ms", "gpu_busy_ms", "pread_ms", "engram_ms", "host_gap_ms",
+          "readahead_ms", "host_ms",
           "pread_mib", "hits", "misses", "decode_hit_rate", "cache_experts", "cache_hit_rate",
           "wired_steady_gib", "wired_peak_gib", "wired_window", "wired_idle_gib",
           "swap_delta_mib", "contaminated", "router_log"]
@@ -77,11 +78,26 @@ def build_prompts(root, chars=PROMPT_CHARS, chunk=CHUNK):
 
 
 def bench_cmd(bin_dir, model, prompt, ctx, gen, cache_gb, csv_path):
-    return [os.path.join(bin_dir, "ds4-bench"), "--metal", "-m", model,
-            "--prompt-file", prompt, "--ctx-start", str(ctx), "--ctx-max", str(ctx),
-            "--gen-tokens", str(gen), "--teacher-forced-decode",
-            "--ssd-streaming", "--ssd-streaming-cache-experts", f"{cache_gb}GB",
-            "--csv", csv_path]
+    cmd = [os.path.join(bin_dir, "ds4-bench"), "--metal", "-m", model,
+           "--prompt-file", prompt, "--ctx-start", str(ctx), "--ctx-max", str(ctx),
+           "--gen-tokens", str(gen), "--teacher-forced-decode", "--ssd-streaming"]
+    if cache_gb is not None:   # None: let the engine size the cache itself
+        cmd += ["--ssd-streaming-cache-experts", f"{cache_gb}GB"]
+    return cmd + ["--csv", csv_path]
+
+
+def run_tag(spec, tag_suffix=""):
+    workload, ctx, gb, gen, _ = spec
+    return f"{workload}-c{ctx}-g{'auto' if gb is None else gb}-n{gen}{tag_suffix}"
+
+
+# F_RDADVISE time is outside the timed pread, so the raw host gap includes it.
+TIMING_RE = re.compile(r"streaming expert timing total .*?readahead_total=([\d.]+)")
+
+
+def parse_readahead(text):
+    rows = TIMING_RE.findall(text)
+    return float(rows[-1]) if rows else None
 
 
 def parse_profile(text):
@@ -139,9 +155,9 @@ def _fail_router_log(router_log):
 def run_one(bin_dir, model, prompts_dir, out_dir, spec, dry_run=False,
             running=machine.ds4_running, swap=machine.swap_used_mib,
             sampler=wired.WiredSampler, idle_read=None,
-            idle_timeout=wired.IDLE_SETTLE_S, idle_interval=2.0):
+            idle_timeout=wired.IDLE_SETTLE_S, idle_interval=2.0, extra_env=None, tag_suffix=""):
     workload, ctx, gb, gen, log_router = spec
-    tag = f"{workload}-c{ctx}-g{gb}-n{gen}"
+    tag = run_tag(spec, tag_suffix)
     result_path = os.path.join(out_dir, tag + ".result.json")
     csv_path = os.path.join(out_dir, tag + ".csv")
     router_log = os.path.join(out_dir, tag + ".router.log") if log_router else None
@@ -162,6 +178,7 @@ def run_one(bin_dir, model, prompts_dir, out_dir, spec, dry_run=False,
     env = dict(os.environ)
     env.pop("DS4_V41_ROUTER_LOG", None)
     env.update(ENV)
+    env.update(extra_env or {})
     if router_log:
         env["DS4_V41_ROUTER_LOG"] = router_log
     stderr_path = os.path.join(out_dir, tag + ".stderr")
@@ -214,6 +231,10 @@ def run_one(bin_dir, model, prompts_dir, out_dir, spec, dry_run=False,
     row["router_log"] = router_log
     row["wired_idle_gib"] = idle
     row["ds4_env"] = {k: v for k, v in env.items() if k.startswith("DS4_")}
+    ra = parse_readahead(stderr)
+    if ra is not None and row.get("host_gap_ms") is not None and gen > 0:
+        row["readahead_ms"] = ra / gen
+        row["host_ms"] = row["host_gap_ms"] - row["readahead_ms"]
     tmp_path = result_path + ".tmp"
     with open(tmp_path, "w") as fp:
         json.dump(row, fp, indent=1)
