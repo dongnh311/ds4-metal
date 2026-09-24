@@ -40877,9 +40877,15 @@ static bool ds41_hc_fused(const ds41_gpu_graph *g) {
     return available && g->tp_world == 1 && !getenv("DS4_METAL_DISABLE_V41_HC_FUSE");
 }
 
-/* Router matvec + select as one (two on pre-M5) dispatch. */
+/* Router matvec + select as one (two on pre-M5) dispatch. Opt-in: on an
+ * exact score tie at the top-k boundary the fused select keeps the lower
+ * expert index (score desc, idx asc) while the standalone argsort can keep
+ * the other one, so the selected set, the weights and the logits differ.
+ * Seen once in ~5200 layer steps (promessi_sposi, pos 2053, layer 12:
+ * experts 281 vs 282). Everything else here is byte-identical. */
 static bool ds41_router_fused(const ds41_gpu_graph *g, const ds4_layer_weights *l) {
-    return !getenv("DS4_METAL_DISABLE_V41_MOE_FUSE") &&
+    return getenv("DS4_METAL_ENABLE_V41_ROUTER_FUSE") &&
+        !getenv("DS4_METAL_DISABLE_V41_MOE_FUSE") &&
         !getenv("DS4_METAL_DISABLE_V41_ROUTER_FUSE") &&
         ds41_hc_fused(g) && l->ffn_gate_inp->type == DS4_TENSOR_F32;
 }
