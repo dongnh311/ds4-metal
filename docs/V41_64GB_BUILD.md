@@ -16,9 +16,16 @@ correctness oracle (§9); target decided after Phase 0 (§7).
 
 1. `ds4 --ssd-streaming` loads V4.1-Flash Q2 on this box **zero-swap**, inside
    the machine wire limits (§1).
-2. Decode meets the **target chosen at the end of Phase 0** (§7). Until then
-   the bands in §2.3 are reporting bands, not commitments. Below 10 t/s after
-   the cache, sync and Metal work → re-profile.
+2. Decode reaches **≥ 20 t/s (band 5)** single-stream at 8K context on the
+   Phase-0 `switch` workload, **without lowering model quality** (user
+   decision 2026-09-24, option (c) of
+   `speed-bench/v41/phase0-20260924/RESULTS.md`; measured start 9.04 t/s).
+   Levers in order: lossless runtime work first (host gaps / per-layer sync,
+   cache size and policy, pread overlap, Metal; §8 steps 3–6, worth up to
+   ~19.6 t/s on paper), then speculative decoding with exact verification
+   (DSpark/MTP, §8 step 8). Cheaper non-routed weights (§8 step 9) are a last
+   resort and need the user's approval plus the §9 quality gate. Below 10 t/s
+   after the cache, sync and Metal work → re-profile.
 3. Passes **ds4-eval core**, a real **agent smoke**, and the official-API
    quality fixtures (§9).
 4. **Qwen3.8 regression green** (§4).
@@ -32,15 +39,22 @@ Non-goals: big-machine / TP (Ivan's lane); rebuilding the Q2 GGUF ourselves
 - **Upstream sync done 2026-09-23** on `feature/ds4.1-flash`: `ec56a05` merges
   `antirez/main` 0aaea5a (25 commits), `d3bf293` merges Ivan's
   `ds41f-nondspark-optimizations` 4f9a2e0. Ivan's `main` had nothing newer
-  than 8db1d1d. `make all` is clean. **Tests are pending** and run only when
-  the machine is free (the GPU is shared with other benchmark sessions).
+  than 8db1d1d. `make all` is clean. Tests done 2026-09-24: the sync's unit
+  targets pass and the Qwen full tier is green against the PROD baseline
+  (paired A/B speed check, `speed-bench/qwen-regression/`).
 - Static review of the sync: the Qwen compute path is untouched
   (`metal/qwen4.metal` unchanged; shared kernels and host functions only gained
   parameters that default to the old behavior; the new softplus series only
   reaches the DS4/V4.1/GLM router). Qwen-visible change: `d31089d` fixes Qwen
   tool-content streaming in `ds4_server.c`.
-- **Disk:** 395 GiB free; the Q2 GGUF is 341 GiB → fits with ~54 GiB spare.
-  Phase 0(b) is unblocked.
+- **Disk:** the Q2 GGUF (341 GiB) is downloaded to
+  `~/orca/workspaces/ds4-metal-data/gguf/`. About 65 GiB stays free (the unc31
+  Qwen GGUF was removed; it is on HF). Keep ≥ 40 GiB free: macOS swap files
+  live on the same disk.
+- **Phase 0(b) DONE 2026-09-24:** Qwen baseline and full tier green; Q2
+  downloaded and pinned; 16 clean runs; best 9.04 t/s (ctx 8K, 24 GB cache).
+  Results and the measured roofline: `speed-bench/v41/phase0-20260924/RESULTS.md`.
+  Target chosen: ≥ 20 t/s without quality loss (DoD 2).
 - **Branches:** work on `feature/ds4.1-flash` (off `develop`), merge to
   `develop`, deploy only via `prod/<feature>-YYYYMMDD` cut from `develop`
   (`deploy-ai-gateway.sh`). v1's `main` / `scallop` wording is retired:
@@ -60,15 +74,16 @@ Non-goals: big-machine / TP (Ivan's lane); rebuilding the Q2 GGUF ourselves
 
 ## 2. Performance: roofline, anchors, bands
 
-### 2.1 Per-token decode budget (estimate — Phase 0 replaces it)
+### 2.1 Per-token decode budget (estimate, with the Phase 0 measurement)
 
-| Term | Size / token | Time / token |
-| --- | --- | --- |
-| Non-routed resident weights (8.79 GiB floor − 1.23 GiB `token_embd`) | ~7.6 GiB | ≥ 28 ms at 290 GB/s |
-| Routed experts actually used (142.38 GiB × 6/384) | 2.22 GiB | ≥ 8 ms |
-| Router → load host sync, 40 layers × ~0.3 ms (Qwen measured, pre-gate) | — | ~12 ms |
-| Misses at ~10 GB/s: 98 % hit / 93 % hit | ~45 / ~160 MiB | ~5 / ~17 ms |
-| Engram: 48 random 264-byte rows, parallel reads | tiny | ~1 ms |
+| Term | Size / token | Time / token (estimate) | Measured (Phase 0, ctx 8K, 24 GB) |
+| --- | --- | --- | --- |
+| Non-routed resident weights (8.79 GiB floor − 1.23 GiB `token_embd`) | ~7.6 GiB (measured 8.14: +0.59 GiB Engram projections) | ≥ 28 ms at 290 GB/s | byte floor 30.2 ms |
+| Routed experts actually used (142.38 GiB × 6/384) | 2.22 GiB | ≥ 8 ms | byte floor 8.2 ms; GPU busy for both rows 57.0 ms (1.48× floor) |
+| Router → load host sync, 40 layers × ~0.3 ms (Qwen measured, pre-gate) | — | ~12 ms | host gaps 37.0 ms (residual) |
+| Misses at ~10 GB/s: 98 % hit / 93 % hit | ~45 / ~160 MiB | ~5 / ~17 ms | pread 16.6 ms at 0.795 hit |
+| Engram: 48 random 264-byte rows, parallel reads | tiny | ~1 ms | 0.6 ms |
+| **Total** | | 54–66 ms | **111.1 ms = 9.04 t/s** |
 
 Ideal total ≈ 54 ms at 98 % hit (**≈ 19 t/s**) or ≈ 66 ms at 93 % (≈ 15 t/s).
 Real kernels do not run at the byte floor (the Qwen MoE runs ~3.5× over it;
@@ -124,6 +139,11 @@ mmap-backed model view on first GPU use, so more mapped expert views means
 more wired memory and more pressure. Consequences:
 
 - Start at **8–16 GB** and pick the size by a sweep. Do not maximize hit rate.
+  *Phase 0(b) (2026-09-24) did not reproduce this on V4.1:* with pread slots
+  decode rose monotonically 4 → 24 GB (5.6 → 9.0 t/s at 8K), wired grew only
+  by the cache size, and 16 → 24 GB still gained 3 %. The target also includes
+  a 7.12 GiB prefill reserve (8 GB = 95 experts). The sweep continues at 32 GB
+  (§8 step 3).
 - Load experts with `pread` into bounded slot buffers. **Never** bind
   mmap-backed expert views.
 - The constraint is **wired memory**. Measure it with `vm_stat` "Pages wired
@@ -234,6 +254,10 @@ Upstream branches not merged yet (each needs its own decision):
      replaces the §2.1 estimate.
 - **Output:** a measured roofline, the chosen target (DoD 2) and an ordered
   lever list. Review it with the user before §8 step 3.
+  **Done 2026-09-24:** `speed-bench/v41/phase0-20260924/RESULTS.md` (roofline
+  §2, cache §3, locality §4, lever list §5, target options §6). The measured
+  resident floor is 9.38 GiB, not the 0(a) 8.79 GiB: 0(a) left out the Engram
+  projection weights.
 
 ## 8. Work plan
 
@@ -242,7 +266,8 @@ with the Qwen full tier.
 
 0. **Sync** (done) and record the Qwen baseline.
 1. **Phase 0(b)** (§7).
-2. **Set the target** (user decision, from the §7 output).
+2. **Set the target** (user decision, from the §7 output). Done 2026-09-24:
+   ≥ 20 t/s without quality loss (DoD 2).
 3. **Memory and cache policy for 64 GB:**
    - Small cache (§3.1), filled by slot `pread`.
    - No mmap-backed expert views.
