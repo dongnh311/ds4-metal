@@ -47,3 +47,5 @@ __pycache__/
 /speed-bench/kv-gate/*.stderr
 /speed-bench/kv-gate/*/frontier_*.json
 speed-bench/fp8-flat-gate/
+/speed-bench/qwen-regression/last-*/
+/speed-bench/qwen-regression/baseline/server.log

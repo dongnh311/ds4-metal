@@ -1,0 +1,26 @@
+We need answer user: "Write a Python function that returns the n-th Fibonacci number iteratively, with a docstring and two doctests." Need produce code likely. Need final answer concise but complete. Need ensure docstring and two doctests. Need decide indexing: n-th Fibonacci number. Common: fib(0)=0, fib(1)=1. Iterative. Include doctests: >>> fib(0) 0, >>> fib(10) 55 maybe. Need maybe handle negative? Could raise ValueError. Need docstring with Args/Returns/Raises. Need two doctests exactly? Could include two examples. Need ensure doctests pass. Let's craft function:
+
+def fibonacci(n: int) -> int:
+    """Return the n-th Fibonacci number iteratively.
+
+    The sequence is defined as F(0)=0, F(1)=1, and F(n)=F(n-1)+F(n-2) for n>=2.
+
+    Args:
+        n: A non-negative integer index.
+
+    Returns:
+        The n-th Fibonacci number.
+
+    Raises:
+        ValueError: If n is negative.
+
+    Examples:
+        >>> fibonacci(0)
+        0
+        >>> fibonacci(10)
+        55
+    """
+    if n < 0: raise ValueError...
+    a,b=0,1
+    for _ in range
+---

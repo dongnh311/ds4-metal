@@ -1,0 +1,10 @@
+Người dùng hỏi bằng tiếng Việt: "Giải thích ngắn gọn cách bộ nhớ đệm KV giúp mô hình ngôn ngữ sinh văn bản nhanh hơn." Cần trả lời ngắn gọn, tiếng Việt. Nội dung: KV cache trong attention của transformer autoregressive. Khi sinh token mới, thay vì tính lại Key/Value cho toàn bộ prefix, lưu K,V của các token đã tính từ các lớp trước, chỉ tính Q,K,V cho token mới, dùng cache để attention với toàn bộ ngữ cảnh. Giảm chi phí từ O(n^2) hoặc O(n) per token xuống chỉ tính token mới, tăng tốc decode, đổi bộ nhớ lấy tốc độ. Có thể nhắc hạn chế bộ nhớ tăng theo độ dài ngữ cảnh.
+---
+Bộ nhớ đệm KV (Key–Value cache) giúp mô hình ngôn ngữ sinh văn bản nhanh hơn bằng cách **lưu lại các vector Key và Value của các token đã xử lý trước đó** trong các lớp attention.
+
+Khi sinh token mới:
+- Mô hình chỉ cần tính **Query, Key, Value cho token hiện tại**.
+- Thay vì tính lại Key/Value cho toàn bộ đoạn văn bản đã có, nó dùng **KV cache** để truy cập ngay các giá trị cũ.
+- Nhờ đó giảm đáng kể phép tính attention ở mỗi bước sinh.
+
+Nói ngắn gọn: **KV cache đổi bộ nhớ lấy tốc độ**, giúp sinh token nhanh hơn nhiều, đặc biệt khi ngữ cảnh dài.

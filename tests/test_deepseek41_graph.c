@@ -1206,7 +1206,72 @@ done:
     return rc;
 }
 
-static int check_decoder_suffix(const char *path, const char *prompt_path) {
+/* Compare complete live state while decode crosses ring and compressor
+ * boundaries. A diagnostic switch selects the control path on the same model;
+ * the candidate uses the default implementation, also checked in SSD mode. */
+static int check_decode_control(const char *path, const char *prompt_path, bool streaming, const char *disable) {
+    ds4_engine *engine = NULL;
+    ds4_session *control = NULL, *candidate = NULL;
+    ds4_tokens tokens = {0};
+    char *prompt = NULL, err[256] = "";
+    size_t prompt_bytes;
+    int rc = 1;
+    ds4_engine_options opt = {.model_path = path, .backend = DS4_BACKEND_METAL,
+        .context_size = 4096, .power_percent = 100, .ssd_streaming = streaming,
+        .ssd_streaming_cache_bytes = UINT64_C(64) << 30};
+    REQUIRE(imatrix_read_text_file(prompt_path, &prompt, &prompt_bytes));
+    REQUIRE(ds4_engine_open(&engine, &opt) == 0);
+    ds4_tokenize_text(engine, prompt, &tokens);
+    REQUIRE(tokens.len > 2112);
+    const int prefixes[] = {511, 2047};
+    for (unsigned pass = 0; pass < sizeof(prefixes) / sizeof(prefixes[0]); pass++) {
+        const int prefix = prefixes[pass];
+        REQUIRE(ds4_session_create(&control, engine, 4096) == 0);
+        REQUIRE(ds4_session_create(&candidate, engine, 4096) == 0);
+        ds4_tokens input = {.v = tokens.v, .len = prefix, .cap = prefix};
+        setenv(disable, "1", 1);
+        REQUIRE(ds4_session_sync(control, &input, err, sizeof(err)) == 0);
+        unsetenv(disable);
+        REQUIRE(ds4_session_sync(candidate, &input, err, sizeof(err)) == 0);
+        for (int step = 0; step <= 64; step++) {
+            ds41_gpu_graph *a = &control->ds41_graph, *b = &candidate->ds41_graph;
+            ds41_state_span sa[54], sb[54];
+            const uint32_t n = ds41_state_spans(a, a->pos, sa);
+            REQUIRE(a->pos == b->pos && n == ds41_state_spans(b, b->pos, sb));
+            REQUIRE(!memcmp(&a->history, &b->history, sizeof(a->history)));
+            REQUIRE(!memcmp(control->logits, candidate->logits, DS4_N_VOCAB * sizeof(float)));
+            for (uint32_t j = 0; j < n; j++) {
+                REQUIRE(sa[j].bytes == sb[j].bytes);
+                if (memcmp(ds4_gpu_tensor_contents(sa[j].tensor),
+                           ds4_gpu_tensor_contents(sb[j].tensor), (size_t)sa[j].bytes)) {
+                    fprintf(stderr, "decode queue state mismatch: pos=%u span=%u\n", a->pos, j);
+                    goto done;
+                }
+            }
+            if (step == 64) break;
+            const int token = tokens.v[prefix + step];
+            setenv(disable, "1", 1);
+            REQUIRE(ds4_session_eval(control, token, err, sizeof(err)) == 0);
+            unsetenv(disable);
+            REQUIRE(ds4_session_eval(candidate, token, err, sizeof(err)) == 0);
+        }
+        fprintf(stderr, "V4.1 decode control %s %s prefix=%d: 65 exact logits/history/KV states PASS\n",
+            disable,
+            streaming ? "SSD" : "resident", prefix);
+        ds4_session_free(candidate); candidate = NULL;
+        ds4_session_free(control); control = NULL;
+    }
+    rc = 0;
+done:
+    if (err[0]) fprintf(stderr, "%s\n", err);
+    unsetenv(disable);
+    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    ds4_session_free(candidate); ds4_session_free(control); ds4_engine_close(engine);
+    ds4_tokens_free(&tokens); free(prompt);
+    return rc;
+}
+
+static int check_decoder_suffix(const char *path, const char *prompt_path, bool short_chunks, bool streaming) {
     ds4_engine *engine = NULL;
     ds4_session *control = NULL, *candidate = NULL;
     ds4_tokens tokens = {0};
@@ -1214,11 +1279,14 @@ static int check_decoder_suffix(const char *path, const char *prompt_path) {
     size_t prompt_bytes;
     int rc = 1;
     ds4_engine_options opt = {.model_path = path, .backend = DS4_BACKEND_METAL,
-        .context_size = 18432, .power_percent = 100, .ssd_streaming = true,
+        .context_size = 18432, .power_percent = 100, .ssd_streaming = streaming,
         .ssd_streaming_cache_bytes = UINT64_C(64) << 30};
-    /* Hold arithmetic fixed to isolate dependency pruning from GEMM tiling. */
-    setenv("DS4_METAL_DISABLE_V41_BATCH_MOE", "1", 1);
-    setenv("DS4_METAL_DISABLE_V41_BATCH_ATTN", "1", 1);
+    /* The short-chunk path preserves full matrix tiles, so exercise the
+     * production batched arithmetic as well as its live KV frontier. */
+    if (!short_chunks) {
+        setenv("DS4_METAL_DISABLE_V41_BATCH_MOE", "1", 1);
+        setenv("DS4_METAL_DISABLE_V41_BATCH_ATTN", "1", 1);
+    }
     REQUIRE(imatrix_read_text_file(prompt_path, &prompt, &prompt_bytes));
     REQUIRE(ds4_engine_open(&engine, &opt) == 0);
     ds4_encode_chat_prompt(engine, NULL, prompt, DS4_THINK_NONE, &tokens);
@@ -1227,11 +1295,16 @@ static int check_decoder_suffix(const char *path, const char *prompt_path) {
     REQUIRE(ds4_session_create(&candidate, engine, 18432) == 0);
     ds41_gpu_graph *a = &control->ds41_graph, *b = &candidate->ds41_graph;
     for (uint32_t pass = 0; pass < 2; pass++) {
-        const uint32_t start = a->pos, count = 8192;
+        const uint32_t start = a->pos, count = short_chunks ? (pass ? 7956u : 3072u) : 8192u;
         setenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX", "1", 1);
         double t0 = now_sec();
+        const uint32_t prefix = short_chunks ? count - count % 2048u : count;
         REQUIRE(ds41_graph_prefill(a, &engine->model, &engine->weights,
-            tokens.v + start, count, NULL, NULL, (int)(start + count), NULL, NULL));
+            tokens.v + start, prefix, NULL, NULL, (int)(start + count), NULL, NULL));
+        if (prefix < count)
+            REQUIRE(ds41_graph_prefill(a, &engine->model, &engine->weights,
+                tokens.v + start + prefix, count - prefix, NULL, NULL,
+                (int)(start + count), NULL, NULL));
         const double reference = now_sec() - t0;
         unsetenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
         t0 = now_sec();
@@ -1863,7 +1936,189 @@ done:
     return rc;
 }
 
+#ifdef __APPLE__
+/* Exercise read ordering and failures without loading a model or using Metal. */
+static int test_parallel_engram(void) {
+    ds4_engram_table tables[2] = {{.fd = -1}, {.fd = -1}};
+    enum { ROWS = 64, REQUESTS = 6 * 2 * DS4_ENGRAM_COLS };
+    uint32_t ids[REQUESTS];
+    const size_t capacity = REQUESTS * DS4_ENGRAM_DIM * sizeof(float);
+    float *actual = malloc(capacity + 16), *expected = malloc(capacity);
+    int rc = 1;
+    REQUIRE(actual && expected);
+    for (unsigned t = 0; t < 2; t++) {
+        char path[] = "/tmp/ds41-engram-read-XXXXXX";
+        tables[t] = (ds4_engram_table){.fd = mkstemp(path), .offset = 37u + t, .rows = ROWS};
+        REQUIRE(tables[t].fd >= 0);
+        REQUIRE(unlink(path) == 0);
+        for (unsigned row = 0; row < ROWS; row++) {
+            uint8_t raw[DS4_ENGRAM_ROW_BYTES];
+            memset(raw, 127, sizeof(raw));
+            for (unsigned j = 0; j < DS4_ENGRAM_DIM; j++) raw[j] = (j + row + t * 17u) % 126u;
+            REQUIRE(pwrite(tables[t].fd, raw, sizeof(raw),
+                (off_t)(tables[t].offset + row * sizeof(raw))) == sizeof(raw));
+        }
+    }
+    for (unsigned i = 0; i < REQUESTS; i++) ids[i] = (i * 17u + i / 7u) % ROWS;
+    for (unsigned rows = 1; rows <= 6; rows++) {
+        const size_t count = rows * 2u * DS4_ENGRAM_COLS;
+        memset(actual, 0xa5, capacity + 16);
+        for (size_t i = 0; i < count; i++)
+            REQUIRE(ds4_engram_read(&tables[(i / DS4_ENGRAM_COLS) % 2], ids + i, 1,
+                                  expected + i * DS4_ENGRAM_DIM));
+        REQUIRE(ds41_engram_parallel(tables, ids, actual, rows));
+        REQUIRE(!memcmp(actual, expected, count * DS4_ENGRAM_DIM * sizeof(float)));
+        const uint8_t *guard = (const uint8_t *)actual + count * DS4_ENGRAM_DIM * sizeof(float);
+        for (unsigned i = 0; i < 16; i++) REQUIRE(guard[i] == 0xa5);
+    }
+    ids[0] = ROWS;
+    REQUIRE(!ds41_engram_parallel(tables, ids, actual, 6));
+    ids[0] = 0;
+    REQUIRE(ftruncate(tables[1].fd, 0) == 0);
+    REQUIRE(!ds41_engram_parallel(tables, ids, actual, 6));
+    fprintf(stderr, "V4.1 parallel Engram: 1–6 rows, exact bytes, output guards and read failures PASS\n");
+    rc = 0;
+done:
+    for (unsigned t = 0; t < 2; t++) ds4_engram_table_close(&tables[t]);
+    free(actual); free(expected);
+    return rc;
+}
+
+#endif
+
+static int check_router_log_format(void) {
+    int rc = 1;
+    char line[128];
+    const int32_t ids[6] = {5, 17, 383, 0, 1, 2};
+    FILE *fp = tmpfile();
+    REQUIRE(fp);
+    ds41_router_log_write(fp, 42, ids, 2, 3);
+    rewind(fp);
+    REQUIRE(fgets(line, sizeof(line), fp) && !strcmp(line, "42 0 5 17 383\n"));
+    REQUIRE(fgets(line, sizeof(line), fp) && !strcmp(line, "42 1 0 1 2\n"));
+    REQUIRE(!fgets(line, sizeof(line), fp));
+    /* An unwritable path disables the logger once; decode must not care. */
+    setenv("DS4_V41_ROUTER_LOG", "/nonexistent-dir/router.log", 1);
+    REQUIRE(!ds41_router_log_on());
+    REQUIRE(!ds41_router_log_on());
+    unsetenv("DS4_V41_ROUTER_LOG");
+    fprintf(stderr, "V4.1 router log format PASS\n");
+    rc = 0;
+done:
+    unsetenv("DS4_V41_ROUTER_LOG");
+    if (fp) fclose(fp);
+    return rc;
+}
+
+#ifdef __APPLE__
+static int check_router_log(const char *path, const char *prompt_path) {
+    ds4_engine *engine = NULL;
+    ds4_session *control = NULL, *candidate = NULL;
+    ds4_tokens tokens = {0};
+    char *prompt = NULL, err[256] = "", log_path[] = "/tmp/ds41_router_log_XXXXXX";
+    size_t prompt_bytes;
+    FILE *fp = NULL;
+    uint32_t lines = 0;
+    int rc = 1;
+    enum { PREFIX = 511, STEPS = 32 };
+    const int fd = mkstemp(log_path);
+    ds4_engine_options opt = {.model_path = path, .backend = DS4_BACKEND_METAL,
+        .context_size = 4096, .power_percent = 100, .ssd_streaming = true,
+        .ssd_streaming_cache_bytes = UINT64_C(8) << 30};
+    REQUIRE(fd >= 0);
+    close(fd);
+    unsetenv("DS4_V41_ROUTER_LOG");
+    REQUIRE(imatrix_read_text_file(prompt_path, &prompt, &prompt_bytes));
+    REQUIRE(ds4_engine_open(&engine, &opt) == 0);
+    ds4_tokenize_text(engine, prompt, &tokens);
+    REQUIRE(tokens.len > PREFIX + 1 + STEPS);
+    REQUIRE(ds4_session_create(&control, engine, 4096) == 0);
+    REQUIRE(ds4_session_create(&candidate, engine, 4096) == 0);
+    ds4_tokens input = {.v = tokens.v, .len = PREFIX, .cap = PREFIX};
+    REQUIRE(ds4_session_sync(control, &input, err, sizeof(err)) == 0);
+    REQUIRE(ds4_session_sync(candidate, &input, err, sizeof(err)) == 0);
+    /* Exercise the single-token prefill fallback with the log ON: it must not
+     * be recorded as a decoded token. */
+    ds4_tokens input2 = {.v = tokens.v, .len = PREFIX + 1, .cap = PREFIX + 1};
+    unsetenv("DS4_V41_ROUTER_LOG");
+    REQUIRE(ds4_session_sync(control, &input2, err, sizeof(err)) == 0);
+    setenv("DS4_V41_ROUTER_LOG", log_path, 1);
+    REQUIRE(ds4_session_sync(candidate, &input2, err, sizeof(err)) == 0);
+    for (int step = 0; step < STEPS; step++) {
+        const int token = tokens.v[PREFIX + 1 + step];
+        unsetenv("DS4_V41_ROUTER_LOG");
+        REQUIRE(ds4_session_eval(control, token, err, sizeof(err)) == 0);
+        setenv("DS4_V41_ROUTER_LOG", log_path, 1);
+        REQUIRE(ds4_session_eval(candidate, token, err, sizeof(err)) == 0);
+        REQUIRE(!memcmp(control->logits, candidate->logits, DS4_N_VOCAB * sizeof(float)));
+    }
+    unsetenv("DS4_V41_ROUTER_LOG");
+    REQUIRE((fp = fopen(log_path, "r")) != NULL);
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        if (line[0] == '#') continue;
+        unsigned pos, layer;
+        int e[6];
+        const int n = sscanf(line, "%u %u %d %d %d %d %d %d", &pos, &layer,
+                             &e[0], &e[1], &e[2], &e[3], &e[4], &e[5]);
+        REQUIRE(n == 2 + (int)DS4_N_EXPERT_USED && layer == lines % DS4_N_LAYER);
+        REQUIRE(pos == (unsigned)(PREFIX + 1) + lines / DS4_N_LAYER);
+        for (int i = 0; i < n - 2; i++) {
+            REQUIRE(e[i] >= 0 && (uint32_t)e[i] < DS4_N_EXPERT);
+            for (int j = 0; j < i; j++) REQUIRE(e[i] != e[j]);
+        }
+        lines++;
+    }
+    REQUIRE(lines == (uint32_t)STEPS * DS4_N_LAYER);
+    fprintf(stderr, "V4.1 router log: %u lines; logits identical with and without it PASS\n", lines);
+    rc = 0;
+done:
+    if (err[0]) fprintf(stderr, "%s\n", err);
+    unsetenv("DS4_V41_ROUTER_LOG");
+    if (fp) fclose(fp);
+    unlink(log_path);
+    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    ds4_session_free(candidate); ds4_session_free(control); ds4_engine_close(engine);
+    ds4_tokens_free(&tokens); free(prompt);
+    return rc;
+}
+#endif
+
+static int check_decode_profile_format(void) {
+    int rc = 1;
+    char line[256];
+    const ds41_decode_profile p = {.tokens = 2, .step_ms = 200.0, .engram_ms = 2.0,
+        .gpu_ms = 120.0, .pread_ms = 30.0, .pread_bytes = UINT64_C(6) << 20,
+        .hits = 100, .misses = 20};
+    FILE *fp = tmpfile();
+    REQUIRE(fp);
+    ds41_decode_profile_print(fp, &p);
+    rewind(fp);
+    REQUIRE(fgets(line, sizeof(line), fp));
+    REQUIRE(!strcmp(line, "ds4: V4.1 decode profile: tokens=2 step_ms=100.000 engram_ms=1.000 "
+                          "gpu_busy_ms=60.000 pread_ms=15.000 pread_mib=3.000 hits=50.00 misses=10.00\n"));
+    fprintf(stderr, "V4.1 decode profile format PASS\n");
+    rc = 0;
+done:
+    if (fp) fclose(fp);
+    return rc;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--decode-profile-format"))
+        return check_decode_profile_format();
+    if (argc == 2 && !strcmp(argv[1], "--router-log-format"))
+        return check_router_log_format();
+#ifdef __APPLE__
+    if (argc == 2 && !strcmp(argv[1], "--engram-reads")) return test_parallel_engram();
+    if (argc == 4 && !strcmp(argv[2], "--engram-parallel"))
+        return check_decode_control(argv[1], argv[3], false, "DS4_METAL_DISABLE_V41_ENGRAM_PARALLEL");
+    if (argc == 4 && !strcmp(argv[2], "--engram-parallel-ssd"))
+        return check_decode_control(argv[1], argv[3], true, "DS4_METAL_DISABLE_V41_ENGRAM_PARALLEL");
+    if (argc == 4 && !strcmp(argv[2], "--router-log"))
+        return check_router_log(argv[1], argv[3]);
+#endif
+
     if (argc == 2 && !strcmp(argv[1], "--batch-admission"))
         return check_batch_admission();
     if (argc == 3 && !strcmp(argv[2], "--batch-head"))
@@ -1944,8 +2199,20 @@ int main(int argc, char **argv) {
         return check_prefill_alias_fallback(argv[1], argv[3]);
     if (argc == 4 && !strcmp(argv[2], "--chunk-prefill"))
         return check_wide_prefill(argv[1], argv[3], false, false, "DS4_METAL_DISABLE_V41_WIDE_CHUNK");
+    if (argc == 4 && !strcmp(argv[2], "--q8-bf16-fusion"))
+        return check_decode_control(argv[1], argv[3], false, "DS4_METAL_DISABLE_V41_Q8_BF16_FUSION");
+    if (argc == 4 && !strcmp(argv[2], "--q8-bf16-fusion-ssd"))
+        return check_decode_control(argv[1], argv[3], true, "DS4_METAL_DISABLE_V41_Q8_BF16_FUSION");
+    if (argc == 4 && !strcmp(argv[2], "--decode-queue"))
+        return check_decode_control(argv[1], argv[3], false, "DS4_METAL_DISABLE_V41_SOLO_DECODE_QUEUE");
+    if (argc == 4 && !strcmp(argv[2], "--decode-queue-ssd"))
+        return check_decode_control(argv[1], argv[3], true, "DS4_METAL_DISABLE_V41_SOLO_DECODE_QUEUE");
     if (argc == 4 && !strcmp(argv[2], "--decoder-suffix"))
-        return check_decoder_suffix(argv[1], argv[3]);
+        return check_decoder_suffix(argv[1], argv[3], false, true);
+    if (argc == 4 && !strcmp(argv[2], "--short-decoder-suffix"))
+        return check_decoder_suffix(argv[1], argv[3], true, false);
+    if (argc == 4 && !strcmp(argv[2], "--short-decoder-suffix-ssd"))
+        return check_decoder_suffix(argv[1], argv[3], true, true);
     if (argc == 4 && !strcmp(argv[2], "--sweep-partitions"))
         return check_sweep_partitions(argv[1], argv[3]);
     if (argc == 4 && !strcmp(argv[2], "--deferred-decoder"))
@@ -1978,6 +2245,9 @@ int main(int argc, char **argv) {
                         "--prefill-alias-fallback PROMPT_FILE | "
                         "--sweep-partitions PROMPT_FILE | "
                         "--deferred-decoder PROMPT_FILE | "
+                        "--engram-reads | --engram-parallel PROMPT_FILE | --engram-parallel-ssd PROMPT_FILE | "
+                        "--decode-queue PROMPT_FILE | --decode-queue-ssd PROMPT_FILE | "
+                        "--q8-bf16-fusion PROMPT_FILE | --q8-bf16-fusion-ssd PROMPT_FILE | "
                         "--decoder-suffix PROMPT_FILE | --session-accounting | --memory-plan | "
                         "RENDERED_PROMPT [GENERATE])\n", argv[0]);
         return 2;
