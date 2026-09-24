@@ -26,6 +26,14 @@ correctness oracle (§9); target decided after Phase 0 (§7).
    (DSpark/MTP, §8 step 8). Cheaper non-routed weights (§8 step 9) are a last
    resort and need the user's approval plus the §9 quality gate. Below 10 t/s
    after the cache, sync and Metal work → re-profile.
+   *How it is measured:* `ds4-bench --ssd-streaming` on the Phase-0 `switch`
+   prompt, ctx 8192, 512 generated tokens, cache target recorded, warm file
+   cache (not the first run after boot; nothing else using memory), the
+   Phase-0 diagnostics env (profiling on, as for the 9.04 start), interleaved
+   A/B against the previous build. Runtime-only levers are compared with `--teacher-forced-decode`,
+   like the 9.04 t/s start. Speculative decoding is judged free-running (greedy),
+   because teacher forcing changes acceptance. That result is reported next to
+   the teacher-forced rate of the same build.
 3. Passes **ds4-eval core**, a real **agent smoke**, and the official-API
    quality fixtures (§9).
 4. **Qwen3.8 regression green** (§4).
@@ -41,7 +49,10 @@ Non-goals: big-machine / TP (Ivan's lane); rebuilding the Q2 GGUF ourselves
   `ds41f-nondspark-optimizations` 4f9a2e0. Ivan's `main` had nothing newer
   than 8db1d1d. `make all` is clean. Tests done 2026-09-24: the sync's unit
   targets pass and the Qwen full tier is green against the PROD baseline
-  (paired A/B speed check, `speed-bench/qwen-regression/`).
+  (paired A/B speed check, `speed-bench/qwen-regression/`). **Open:** the
+  upstream `--engram-parallel-ssd` exact check cannot run on 64 GB (its fixture
+  asks for a 64 GiB cache and two sessions), so the Engram resolution in
+  `d3bf293` has no exactness check on this box yet.
 - Static review of the sync: the Qwen compute path is untouched
   (`metal/qwen4.metal` unchanged; shared kernels and host functions only gained
   parameters that default to the old behavior; the new softplus series only
@@ -80,10 +91,10 @@ Non-goals: big-machine / TP (Ivan's lane); rebuilding the Q2 GGUF ourselves
 | --- | --- | --- | --- |
 | Non-routed resident weights (8.79 GiB floor − 1.23 GiB `token_embd`) | ~7.6 GiB (measured 8.14: +0.59 GiB Engram projections) | ≥ 28 ms at 290 GB/s | byte floor 30.2 ms |
 | Routed experts actually used (142.38 GiB × 6/384) | 2.22 GiB | ≥ 8 ms | byte floor 8.2 ms; GPU busy for both rows 57.0 ms (1.48× floor) |
-| Router → load host sync, 40 layers × ~0.3 ms (Qwen measured, pre-gate) | — | ~12 ms | host gaps 37.0 ms (residual) |
-| Misses at ~10 GB/s: 98 % hit / 93 % hit | ~45 / ~160 MiB | ~5 / ~17 ms | pread 16.6 ms at 0.795 hit |
+| Router → load host sync, 40 layers × ~0.3 ms (Qwen measured, pre-gate) | — | ~12 ms | other host work 19.5 ms (residual) |
+| Misses at ~10 GB/s: 98 % hit / 93 % hit | ~45 / ~160 MiB | ~5 / ~17 ms | miss path 34.1 ms at 0.796 hit: `F_RDADVISE` readahead 17.5 + pread 16.6, 465 MiB/token from a warm OS file cache (27 GiB/s) |
 | Engram: 48 random 264-byte rows, parallel reads | tiny | ~1 ms | 0.6 ms |
-| **Total** | | 54–66 ms | **111.1 ms = 9.04 t/s** |
+| **Total** | | 54–66 ms | **111.1 ms/token (bench 9.04 t/s)** |
 
 Ideal total ≈ 54 ms at 98 % hit (**≈ 19 t/s**) or ≈ 66 ms at 93 % (≈ 15 t/s).
 Real kernels do not run at the byte floor (the Qwen MoE runs ~3.5× over it;
@@ -128,7 +139,10 @@ routed experts, top-6, alignment 16384.
 | Engram | ~8 | ~189 GiB | disk-only, read per token |
 
 Cross-check: routed + non-routed = 151.2 GiB ≈ the documented 151.77 GiB main.
-**It will load and run on 64 GB.**
+**It will load and run on 64 GB.** Phase 0(b) byte accounting of the
+downloaded file puts the floor at **9.38 GiB**: the table above left out
+0.59 GiB of Engram projection weights. 9.38 + 142.38 = 151.76 GiB matches the
+documented main size (`speed-bench/v41/phase0-20260924/bytes.json`).
 
 ### 3.1 Correction: the expert cache is small
 
@@ -139,11 +153,12 @@ mmap-backed model view on first GPU use, so more mapped expert views means
 more wired memory and more pressure. Consequences:
 
 - Start at **8–16 GB** and pick the size by a sweep. Do not maximize hit rate.
-  *Phase 0(b) (2026-09-24) did not reproduce this on V4.1:* with pread slots
-  decode rose monotonically 4 → 24 GB (5.6 → 9.0 t/s at 8K), wired grew only
-  by the cache size, and 16 → 24 GB still gained 3 %. The target also includes
-  a 7.12 GiB prefill reserve (8 GB = 95 experts). The sweep continues at 32 GB
-  (§8 step 3).
+  *Phase 0(b) (2026-09-24) on V4.1 is consistent with #810 up to 16/24 GB:*
+  decode rose monotonically 4 → 24 GB (5.6 → 9.0 t/s at 8K). 32 GB, where #810
+  fell, is untested. Wired memory grew only by the cache size, so there was no
+  #638 mmap-wiring penalty. The target also includes a 7.12 GiB prefill reserve
+  (8 GB = 95 experts). A bigger wired cache leaves less OS file cache for the
+  misses, so measure 32 GB before assuming it helps (§8 step 3).
 - Load experts with `pread` into bounded slot buffers. **Never** bind
   mmap-backed expert views.
 - The constraint is **wired memory**. Measure it with `vm_stat` "Pages wired
