@@ -439,6 +439,7 @@ int main(void) {
     const int tp_port = tp_port_from_env();
     ds4_engine_options opt = {
         .model_path = model,
+        .ple_path = getenv("DS4_TEST_PLE"),
         .backend = DS4_BACKEND_METAL,
         .n_threads = 1,
         .context_size = context_size,
