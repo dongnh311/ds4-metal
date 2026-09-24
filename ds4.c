@@ -40856,6 +40856,32 @@ static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
         ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm);
 }
 
+/* DS4_METAL_GPU_STAGE_TIMESTAMPS (upstream #828's non-blocking stage timer,
+ * adapted to this graph): each boundary commits the batch as its own tagged
+ * command buffer without waiting, and ds4_gpu_stage_report prints their GPU
+ * times after the token (DS4_METAL_GPU_STAGE_TIMESTAMPS_DETAIL: per buffer;
+ * speed-bench/v41/stages.py removes the overlap). Boundaries sit before every
+ * other flush in the layer so no stage's work lands in an untagged buffer.
+ * Off, the layer is one uninterrupted stream. */
+static bool ds41_stage_on(void) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_METAL_GPU_STAGE_TIMESTAMPS") != NULL;
+    return on != 0;
+#else
+    return false;
+#endif
+}
+
+static bool ds41_stage(uint32_t il, uint32_t pos, const char *stage) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (ds41_stage_on()) return ds4_gpu_stage_flush("v41", stage, il, pos, 1) != 0;
+#else
+    (void)il; (void)pos; (void)stage;
+#endif
+    return true;
+}
+
 static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, bool projected) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
@@ -40884,12 +40910,15 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     } else
 #endif
     if (!projected && !ds41_attention_project(g, m, l)) return false;
+    if (!projected && !ds41_stage(il, pos, "attn_project")) return false;
     if (!ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) ||
         !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
         !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) ||
         !ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
                              g->kv, 0, 512u * 4u) ||
-        !ds41_attention_select(g, m, l, il)) return false;
+        !ds41_stage(il, pos, "attn_kv") ||
+        !ds41_attention_select(g, m, l, il) ||
+        !ds41_stage(il, pos, "attn_select")) return false;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
     bool direct_stage = false;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
@@ -40918,7 +40947,8 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     }
     if (!attention_ok ||
         !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
-        !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
+        !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true) ||
+        !ds41_stage(il, pos, "attn_core")) return false;
     if (projected) return true;
     ds4_gpu_tensor *out = g->block;
     if (g->tp_world == 2) {
@@ -40929,7 +40959,8 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     }
     return ds41_attention_output(g, m, l, out) &&
            ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
-           ds41_bf16(g->block, DS4_N_EMBD);
+           ds41_bf16(g->block, DS4_N_EMBD) &&
+           ds41_stage(il, pos, "attn_out");
 }
 
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
@@ -40968,6 +40999,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
+    if (!ds41_stage(il, g->pos, "moe_route")) return false;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     metal_graph_selected_async_load async_load = {0};
     bool async_started = false;
@@ -41049,6 +41081,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
 #endif
         return false;
     }
+    if (!ds41_stage(il, g->pos, "moe_shared")) return false;
     bool routed_ok;
 #ifndef __APPLE__
     if (g->tp_world == 2) {
@@ -41092,7 +41125,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (shared_queued && !ds4_gpu_dsv41_shared_join()) return false;
 #endif
-    if (!routed_ok) return false;
+    if (!routed_ok || !ds41_stage(il, g->pos, "moe_routed")) return false;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     if (parallel && !ds4_gpu_parallel_ffn_finish()) return false;
 #endif
@@ -41472,8 +41505,12 @@ static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
 
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
                             const ds4_layer_weights *l, uint32_t il, int token) {
-    return ds41_graph_before_moe(g, m, l, il) && ds41_moe(g, m, l, il, (uint32_t)token) &&
-        ds41_graph_after_moe(g);
+    return ds41_stage(il, g->pos, "layer_in") &&
+        ds41_graph_before_attention(g, m, l, il) && ds41_stage(il, g->pos, "pre_attn") &&
+        ds41_attention(g, m, l, il, false) &&
+        ds41_graph_after_attention(g, m, l) && ds41_stage(il, g->pos, "post_attn") &&
+        ds41_moe(g, m, l, il, (uint32_t)token) && ds41_stage(il, g->pos, "moe_tail") &&
+        ds41_graph_after_moe(g) && ds41_stage(il, g->pos, "after_moe");
 }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -41811,7 +41848,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         /* The vocabulary head depends only on the final layer. Submit it
          * before the drain, avoiding a CPU round trip between GPU producers. */
         if (ok && queued_logits && il + 1u == DS4_N_LAYER)
-            ok = ds41_graph_encode_logits(g, m, w);
+            ok = ds41_graph_encode_logits(g, m, w) && ds41_stage(il + 1u, g->pos, "logits");
         if (drain && !ds4_gpu_end_commands()) ok = false;
         /* Feed the GPU while the CPU encodes the next resident solo layer. */
         if (ok && !drain && g->tp_world == 1 && !ds4_gpu_flush_commands()) ok = false;
@@ -41827,6 +41864,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (ok && log_route) ds41_router_log_flush(g->pos);
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (ds41_stage_on()) ds4_gpu_stage_report("decode", g->pos, 1);
+#endif
     if (ok && logits) ok = queued_logits ?
         ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0 :
         ds41_graph_logits(g, m, w, logits);
