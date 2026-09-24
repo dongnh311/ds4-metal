@@ -2168,6 +2168,29 @@ done:
 }
 #endif
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* ds41_moe_partial error exits after the async-load start: an unfinished job
+ * blocks every later start (the worker's done flag stays set), so the exit
+ * must hand it to ds41_stream_async_abandon. Model-free: with no model the
+ * worker finishes the job at once with ok == false. */
+static int check_stream_async_abandon(void) {
+    int rc = 1;
+    int32_t dummy = 0;
+    ds4_gpu_tensor *router = (ds4_gpu_tensor *)(void *)&dummy;
+    metal_graph_selected_async_load job = {0}, blocked = {0}, next = {0};
+    REQUIRE(metal_graph_selected_async_load_start_tensor(&job, router, NULL, NULL, 0, 1, 1, 1));
+    REQUIRE(!metal_graph_selected_async_load_start_tensor(&blocked, router, NULL, NULL, 0, 1, 1, 1));
+    ds41_stream_async_abandon(&job);
+    REQUIRE(!job.active);
+    REQUIRE(metal_graph_selected_async_load_start_tensor(&next, router, NULL, NULL, 0, 1, 1, 1));
+    REQUIRE(!metal_graph_selected_async_load_finish(&next));
+    fprintf(stderr, "V4.1 stream async abandon PASS\n");
+    rc = 0;
+done:
+    return rc;
+}
+#endif
+
 static int check_decode_profile_format(void) {
     int rc = 1;
     char line[256];
@@ -2193,6 +2216,10 @@ int main(int argc, char **argv) {
         return check_decode_profile_format();
     if (argc == 2 && !strcmp(argv[1], "--router-log-format"))
         return check_router_log_format();
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (argc == 2 && !strcmp(argv[1], "--stream-async-abandon"))
+        return check_stream_async_abandon();
+#endif
 #ifdef __APPLE__
     if (argc == 2 && !strcmp(argv[1], "--engram-reads")) return test_parallel_engram();
     if (argc == 4 && !strcmp(argv[2], "--engram-parallel"))

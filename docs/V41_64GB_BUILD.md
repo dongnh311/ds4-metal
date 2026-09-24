@@ -67,7 +67,8 @@ Non-goals: big-machine / TP (Ivan's lane); rebuilding the Q2 GGUF ourselves
   Target chosen: ≥ 20 t/s without quality loss (DoD 2).
 - **Sub-project 1 (streaming decode pipeline) DONE 2026-09-24: 11.12 t/s**
   at ctx 8K with the shipped defaults (x1.2336 over the Phase-0
-  configuration, bit-exact). Decode layers stay queued under streaming and
+  configuration, bit-exact; the pipeline code alone is about x1.11, the rest
+  is the auto cache vs Phase 0's 24 GB point). Decode layers stay queued under streaming and
   missed experts load on the async worker. Readahead stays on, the V4.1 split
   threshold stays at 3, and the auto cache is unchanged. The >= 12 t/s
   sub-project target was not met.

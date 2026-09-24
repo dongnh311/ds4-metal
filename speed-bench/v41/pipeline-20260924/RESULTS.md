@@ -14,8 +14,12 @@ Single-stream DeepSeek-V4.1-Flash Q2 decode on the M5 Pro 64 GB (ctx 8192,
 | A | Phase-0 configuration: 24 GB cache, no queue under streaming, no async load | 9.01 (9.00, 9.02) |
 | B | Shipped defaults: auto cache (35.62 GiB budget, 3075 experts), queue + async load | **11.12** (11.10, 11.13) |
 
-Ratio **x1.2336** (`ab-final3.json`). Every change is bit-exact against its
-switch. The sub-project target (>= 12 t/s) is **not met**: 11.12 t/s.
+Ratio **x1.2336** (`ab-final3.json`). Part of it is the cache: B runs the
+engine's auto cache (35.62 GiB budget, already the default before this work)
+and A the Phase-0 24 GB point. The pipeline code alone gives about x1.11
+(1.0684 x 1.0420 from the per-step A/Bs), and x1.145 at 24 GB in the grid.
+Every change is bit-exact against its switch. The sub-project target
+(>= 12 t/s) is **not met**: 11.12 t/s.
 
 ## Setup
 
@@ -151,9 +155,11 @@ experts.
   logits, history and every KV/state span for 65 steps after prefixes 511 and
   2047):
   - both switches together at 8 and 24 GB;
-  - async at 4 GB;
-  - each switch alone at 8 GB (before the fix);
-  - queue in quality mode.
+  - async at 4 GB.
+
+  Earlier binaries in this branch also passed each switch alone at 8 GB
+  (before the fix) and the queue switch in quality mode (`3435bb6`; quality
+  mode turns off both features).
 
   Router log: 1280 lines, logits identical with and without it.
 - **Qwen.** Fast tier PASS on the final binary. Full tier PASS on the final

@@ -40940,6 +40940,15 @@ static bool ds41_stream_async_load(const ds41_gpu_graph *g) {
     return g->streaming && !g->quality && !g->imatrix && g->tp_world == 1 &&
         !getenv("DS4_METAL_DISABLE_V41_ASYNC_LOAD");
 }
+
+/* Error exit after the async start: wait for the worker, so it is not left
+ * staging loads into the cache and the next start is not refused, and drop
+ * any selected-id override the worker or the retry installed, so the next
+ * routed MoE reads its own ids. */
+static void ds41_stream_async_abandon(metal_graph_selected_async_load *job) {
+    if (job->active) (void)metal_graph_selected_async_load_finish(job);
+    (void)ds4_gpu_routed_moe_set_selected_override(NULL, 0);
+}
 #endif
 
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
@@ -40983,7 +40992,10 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         async_started = true;
         /* Early commit: the router and everything before it start on the GPU
          * now, so the worker's event wait ends before the shared expert. */
-        if (!ds4_gpu_flush_commands()) return false;
+        if (!ds4_gpu_flush_commands()) {
+            ds41_stream_async_abandon(&async_load);
+            return false;
+        }
     }
 #endif
     const bool shared_here = !shared_owner || g->tp_rank == (il & 1u);
@@ -41031,7 +41043,12 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         !ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
                               DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) ||
         !ds41_bf16(g->shared_mid, DS4_N_FF_EXP) ||
-        !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) return false;
+        !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        if (async_started) ds41_stream_async_abandon(&async_load);
+#endif
+        return false;
+    }
     bool routed_ok;
 #ifndef __APPLE__
     if (g->tp_world == 2) {
@@ -41059,7 +41076,10 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                         ds4_gpu_routed_moe_set_selected_override(
                             async_load.selected_ids, DS4_N_EXPERT_USED) != 0;
         }
-        if (!flush_ok || !finish_ok) return false;
+        if (!flush_ok || !finish_ok) {
+            ds41_stream_async_abandon(&async_load);
+            return false;
+        }
     }
 #endif
     routed_ok = ds4_gpu_routed_moe_one_tensor(routed, g->gate, g->up, g->mid, g->experts,
@@ -41750,10 +41770,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
 #if defined(__APPLE__)
     queue_layers |= g->tp_world == 1 && !g->streaming && !g->imatrix &&
         !getenv("DS4_METAL_DISABLE_V41_SOLO_DECODE_QUEUE");
-    /* Streaming keeps its selected-id readback inside each routed MoE; that
-     * wait already bounds queued work, so the end-of-layer drain is dropped
-     * (antirez #1034 shape). Quality mode maps one layer at a time and keeps
-     * the drain. */
+    /* Streaming waits inside each routed MoE, on the selected-id readback or,
+     * with the async load, on the worker that waits for the router's event;
+     * that bounds queued work, so the end-of-layer drain is dropped (antirez
+     * #1034 shape). Quality mode maps one layer at a time and keeps the
+     * drain. */
     queue_layers |= g->tp_world == 1 && g->streaming && !g->quality && !g->imatrix &&
         !getenv("DS4_METAL_DISABLE_V41_STREAM_DECODE_QUEUE");
 #endif
