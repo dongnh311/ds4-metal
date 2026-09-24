@@ -6,7 +6,7 @@ read from the gateway registry (`~/.local/ai-gateway/runtime-registry.json`).
 | Tier | When | Checks |
 | --- | --- | --- |
 | fast | every commit touching shared runtime code | `make test-qwen4-kernels test-qwen4-q2`; vi/code replies byte-identical to `baseline/`; registry command unchanged |
-| full | end of every phase, before merging to `develop` | fast + decode t/s median of 3 ≥ 97 % of baseline, steady wired ≤ baseline + 0.5 GiB (`vm_stat`), long-context needle found |
+| full | end of every phase, before merging to `develop` | fast + decode t/s ≥ 97 % of PROD measured in the same run (interleaved PROD, branch, branch, PROD; a stored number cannot resolve 3 % under 6–12 % start-to-start drift), steady wired ≤ baseline + 0.5 GiB (`vm_stat`), long-context needle found |
 
 Both tiers need the machine free: the PROD gateway's ds4 backend and every
 other ds4 process must be stopped, and the user must agree to the run.

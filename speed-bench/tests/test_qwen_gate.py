@@ -143,5 +143,42 @@ class NeedleSourceTest(unittest.TestCase):
         self.assertEqual(qwen_gate.NEEDLE_SOURCE, "speed-bench/promessi_sposi.txt")
 
 
+class SpeedAbTest(unittest.TestCase):
+    def test_equal_speeds_pass(self):
+        ab = {"prod": [43.92, 42.88], "branch": [43.31, 44.01]}
+        self.assertEqual(qwen_gate.speed_ab_failures(ab), [])
+
+    def test_slower_branch_fails(self):
+        failures = qwen_gate.speed_ab_failures({"prod": [43.0, 43.0], "branch": [40.0, 41.0]})
+        self.assertEqual(len(failures), 1)
+        self.assertIn("paired A/B", failures[0])
+
+    def test_interleaved_order_and_medians(self):
+        calls = []
+
+        def measure(which):
+            calls.append(which)
+            return [40.0, 42.0, 41.0] if which == "prod" else [44.0, 43.0, 45.0]
+
+        ab = qwen_gate.speed_ab(measure)
+        self.assertEqual(calls, ["prod", "branch", "branch", "prod"])
+        self.assertEqual(ab["prod"], [41.0, 41.0])
+        self.assertEqual(ab["branch"], [44.0, 44.0])
+
+    def test_evaluate_prefers_paired_speed_over_stored_baseline(self):
+        base = {"registry_command": ["a"], "tps_median": 42.8, "wired": {"steady_gib": 45.8}}
+        cur = {"registry_command": ["a"], "tps_median": 38.7, "wired": {"steady_gib": 45.8},
+               "needle_hit": True, "speed_ab": {"prod": [43.9, 42.9], "branch": [43.3, 44.0]}}
+        self.assertEqual(qwen_gate.evaluate(base, cur), [])
+
+    def test_evaluate_reports_paired_speed_failure(self):
+        base = {"registry_command": ["a"], "tps_median": 42.8, "wired": {"steady_gib": 45.8}}
+        cur = {"registry_command": ["a"], "tps_median": 44.0, "wired": {"steady_gib": 45.8},
+               "needle_hit": True, "speed_ab": {"prod": [44.0, 44.0], "branch": [40.0, 40.0]}}
+        failures = qwen_gate.evaluate(base, cur)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("paired A/B", failures[0])
+
+
 if __name__ == "__main__":
     unittest.main()

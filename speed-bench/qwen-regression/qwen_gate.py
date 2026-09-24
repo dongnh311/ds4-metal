@@ -37,6 +37,9 @@ NEEDLE_KEY = "VIOLET-HARBOR-2719"
 QUESTION = "\n\nWhat is the secret passphrase stated in the text above? Answer with the passphrase only."
 NEEDLE_SOURCE = "speed-bench/promessi_sposi.txt"
 TPS_FLOOR = 0.97
+# Start-to-start drift of the same binary is 6-12 %, so decode speed is judged
+# against PROD measured interleaved in the same run, never against a stored number.
+AB_ORDER = ("prod", "branch", "branch", "prod")
 WIRED_SLACK_GIB = 0.5
 
 
@@ -82,6 +85,28 @@ def make_needle(filler, chars):
     return body[:mid] + NEEDLE + "\n" + body[mid:] + QUESTION
 
 
+def speed_ab_failures(ab):
+    """Paired speed verdict: the branch's mean of per-server medians must reach
+    TPS_FLOOR of PROD's, both measured interleaved in the same gate run."""
+    prod = statistics.fmean(ab["prod"])
+    branch = statistics.fmean(ab["branch"])
+    floor = prod * TPS_FLOOR
+    if branch < floor:
+        return [f"decode {branch:.2f} t/s < {floor:.2f} (97% of PROD {prod:.2f}, paired A/B)"]
+    return []
+
+
+def speed_ab(measure, order=AB_ORDER):
+    """Run `measure(which)` in the interleaved order; which is "prod" or "branch" and
+    measure returns the timed t/s list of one fresh server. Returns per-server medians."""
+    ab = {"prod": [], "branch": [], "runs": []}
+    for which in order:
+        tps = measure(which)
+        ab[which].append(statistics.median(tps))
+        ab["runs"].append({"bin": which, "tps": tps})
+    return ab
+
+
 def evaluate(baseline, current):
     """Failure messages; an empty list means the gate passes."""
     failures = []
@@ -92,7 +117,9 @@ def evaluate(baseline, current):
             (not baseline.get("tps_median") or not baseline.get("wired")):
         failures.append("baseline lacks full-tier data; re-record with --full")
         return failures
-    if baseline.get("tps_median") and current.get("tps_median") is not None:
+    if current.get("speed_ab"):
+        failures += speed_ab_failures(current["speed_ab"])
+    elif baseline.get("tps_median") and current.get("tps_median") is not None:
         floor = baseline["tps_median"] * TPS_FLOOR
         if current["tps_median"] < floor:
             failures.append(f"decode {current['tps_median']:.2f} t/s < {floor:.2f} (97% of baseline)")
@@ -146,6 +173,29 @@ def chat(base, text, max_tokens):
     return reply, usage.get("completion_tokens", 0), usage.get("prompt_tokens", 0), seconds
 
 
+def timed_tps(base):
+    """Three timed runs of the code prompt; completion tokens per wall second."""
+    tps = []
+    for _ in range(3):
+        _, n, _, seconds = chat(base, PROMPTS["code"], 300)
+        tps.append(n / seconds)
+    return tps
+
+
+def measure_server(bin_dir, out, tag, port):
+    """One fresh server (PROD when bin_dir is None): vi + code warm-up, then timed_tps."""
+    kv = os.path.join(out, "kv-ab")
+    shutil.rmtree(kv, ignore_errors=True)
+    os.makedirs(kv)
+    cmd, cwd = registry_command(REGISTRY, bin_dir, port, kv)
+    with server(cmd, cwd, port, os.path.join(out, f"server-ab-{tag}.log")) as base:
+        for text in PROMPTS.values():
+            chat(base, text, 300)
+        tps = timed_tps(base)
+    shutil.rmtree(kv, ignore_errors=True)
+    return tps
+
+
 def check_preflight(out, baseline):
     """Refusal message for `check`, or None when it is safe to start a server.
     Both checks run before any server is started."""
@@ -180,11 +230,8 @@ def run(bin_dir, out, full, needle_chars, ds4_running=machine.ds4_running, idle_
                 fp.write(reply)
             result["replies"][name] = reply
         if full:
-            tps = []
             with wired.WiredSampler() as ws:
-                for _ in range(3):
-                    _, n, _, seconds = chat(base, PROMPTS["code"], 300)
-                    tps.append(n / seconds)
+                tps = timed_tps(base)
             result["tps"] = tps
             result["tps_median"] = statistics.median(tps)
             result["wired"] = ws.summary()
@@ -193,6 +240,10 @@ def run(bin_dir, out, full, needle_chars, ds4_running=machine.ds4_running, idle_
             reply, _, prompt_tokens, _ = chat(base, prompt, 512)
             result["needle_prompt_tokens"] = prompt_tokens
             result["needle_hit"] = NEEDLE_KEY in reply
+    if full and bin_dir is not None:
+        runs = iter(range(len(AB_ORDER)))
+        result["speed_ab"] = speed_ab(lambda which: measure_server(
+            None if which == "prod" else bin_dir, out, f"{next(runs)}-{which}", port))
     still = ds4_running()
     if still:
         raise SystemExit("qwen_gate: another ds4 process ran during the gate; "
@@ -215,7 +266,7 @@ def main():
     chk.add_argument("--out", required=True)
     for p in (rec, chk):
         p.add_argument("--full", action="store_true")
-        p.add_argument("--needle-chars", type=int, default=650_000)
+        p.add_argument("--needle-chars", type=int, default=730_000)
     args = ap.parse_args()
     if args.mode == "record":
         run(None, args.out, args.full, args.needle_chars)
