@@ -65,6 +65,13 @@ Non-goals: big-machine / TP (Ivan's lane); rebuilding the Q2 GGUF ourselves
   downloaded and pinned; 16 clean runs; best 9.04 t/s (ctx 8K, 24 GB cache).
   Results and the measured roofline: `speed-bench/v41/phase0-20260924/RESULTS.md`.
   Target chosen: ≥ 20 t/s without quality loss (DoD 2).
+- **Sub-project 1 (streaming decode pipeline) DONE 2026-09-24: 11.12 t/s**
+  at ctx 8K with the shipped defaults (x1.2336 over the Phase-0
+  configuration, bit-exact). Decode layers stay queued under streaming and
+  missed experts load on the async worker. Readahead stays on, the V4.1 split
+  threshold stays at 3, and the auto cache is unchanged. The >= 12 t/s
+  sub-project target was not met.
+  Results: `speed-bench/v41/pipeline-20260924/RESULTS.md`.
 - **Branches:** work on `feature/ds4.1-flash` (off `develop`), merge to
   `develop`, deploy only via `prod/<feature>-YYYYMMDD` cut from `develop`
   (`deploy-ai-gateway.sh`). v1's `main` / `scallop` wording is retired:
@@ -84,16 +91,16 @@ Non-goals: big-machine / TP (Ivan's lane); rebuilding the Q2 GGUF ourselves
 
 ## 2. Performance: roofline, anchors, bands
 
-### 2.1 Per-token decode budget (estimate, with the Phase 0 measurement)
+### 2.1 Per-token decode budget (estimate, with the Phase 0 and Phase 1 measurements)
 
-| Term | Size / token | Time / token (estimate) | Measured (Phase 0, ctx 8K, 24 GB) |
-| --- | --- | --- | --- |
-| Non-routed resident weights (8.79 GiB floor − 1.23 GiB `token_embd`) | ~7.6 GiB (measured 8.14: +0.59 GiB Engram projections) | ≥ 28 ms at 290 GB/s | byte floor 30.2 ms |
-| Routed experts actually used (142.38 GiB × 6/384) | 2.22 GiB | ≥ 8 ms | byte floor 8.2 ms; GPU busy for both rows 57.0 ms (1.48× floor) |
-| Router → load host sync, 40 layers × ~0.3 ms (Qwen measured, pre-gate) | — | ~12 ms | other host work 19.5 ms (residual) |
-| Misses at ~10 GB/s: 98 % hit / 93 % hit | ~45 / ~160 MiB | ~5 / ~17 ms | miss path 34.1 ms at 0.796 hit: `F_RDADVISE` readahead 17.5 + pread 16.6, 465 MiB/token from a warm OS file cache (27 GiB/s) |
-| Engram: 48 random 264-byte rows, parallel reads | tiny | ~1 ms | 0.6 ms |
-| **Total** | | 54–66 ms | **111.1 ms/token (bench 9.04 t/s)** |
+| Term | Size / token | Time / token (estimate) | Measured (Phase 0, ctx 8K, 24 GB) | Measured (Phase 1, ctx 8K, auto cache) |
+| --- | --- | --- | --- | --- |
+| Non-routed resident weights (8.79 GiB floor − 1.23 GiB `token_embd`) | ~7.6 GiB (measured 8.14: +0.59 GiB Engram projections) | ≥ 28 ms at 290 GB/s | byte floor 30.2 ms | — |
+| Routed experts actually used (142.38 GiB × 6/384) | 2.22 GiB | ≥ 8 ms | byte floor 8.2 ms; GPU busy for both rows 57.0 ms (1.48× floor) | GPU busy 57.0 ms |
+| Router → load host sync, 40 layers × ~0.3 ms (Qwen measured, pre-gate) | — | ~12 ms | other host work 19.5 ms (residual) | 4.0 ms (queued layers, async load) |
+| Misses at ~10 GB/s: 98 % hit / 93 % hit | ~45 / ~160 MiB | ~5 / ~17 ms | miss path 34.1 ms at 0.796 hit: `F_RDADVISE` readahead 17.5 + pread 16.6, 465 MiB/token from a warm OS file cache (27 GiB/s) | 28.7 ms at 0.87 hit: readahead 15.5 + pread 13.2 (worker time included) |
+| Engram: 48 random 264-byte rows, parallel reads | tiny | ~1 ms | 0.6 ms | 0.6 ms |
+| **Total** | | 54–66 ms | **111.1 ms/token (bench 9.04 t/s)** | **90.3 ms/token (11.12 t/s)** |
 
 Ideal total ≈ 54 ms at 98 % hit (**≈ 19 t/s**) or ≈ 66 ms at 93 % (≈ 15 t/s).
 Real kernels do not run at the byte floor (the Qwen MoE runs ~3.5× over it;
