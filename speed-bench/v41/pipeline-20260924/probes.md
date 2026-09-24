@@ -35,8 +35,14 @@ A side (24 GB, default): GPU 56.6, pread 17.0, readahead 16.9, host 17.7 ms/toke
 | b queue | `DS4_METAL_DISABLE_V41_STREAM_DECODE_QUEUE` | 8.92 | 9.53 | 1.0684 | 58.5 | 17.1 | 17.7 | 11.4 | yes |
 | c1 async load | `DS4_METAL_DISABLE_V41_ASYNC_LOAD` | 9.65 | 10.05 | 1.0420 | 59.4 | 17.0 | 18.3 | 4.7 | yes |
 | c1 re-check: readahead off (async on) | `DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD` (B) | 10.13 | 9.88 | 0.9753 | 59.6 | 35.5 | 0.0 | 6.1 | no: `readahead_verdict = keep`, Task 7 skipped |
+| c2 split from 1 miss | `DS4_METAL_DISABLE_V41_SPLIT_LOW` | 10.28 | 10.27 | 0.9985 | 62.4 | 18.3 | 18.0 | -1.5 | no: reverted |
 
 Under the async load, pread + readahead (about 35 ms/token) stay on the critical path: the
 worker starts only one shared-expert time earlier. The c1 gain comes from dropping the
 selected-id readback wait and host work (host 11.2 -> 4.7 ms/token). The timing counters
 include the worker's time, so `host_ms` is a residual, not main-thread time.
+
+c2 did split (14273 split layers per run vs 2472 at threshold 3), but GPU busy rose
+4.3 ms/token (58.0 -> 62.4), which cancels the pread overlap: the extra command stage and
+second routed bind cost what upstream's comment predicts. The code was reverted; the A/B
+summary stays here as the record.
