@@ -49,10 +49,9 @@ Non-goals: big-machine / TP (Ivan's lane); rebuilding the Q2 GGUF ourselves
   `ds41f-nondspark-optimizations` 4f9a2e0. Ivan's `main` had nothing newer
   than 8db1d1d. `make all` is clean. Tests done 2026-09-24: the sync's unit
   targets pass and the Qwen full tier is green against the PROD baseline
-  (paired A/B speed check, `speed-bench/qwen-regression/`). **Open:** the
-  upstream `--engram-parallel-ssd` exact check cannot run on 64 GB (its fixture
-  asks for a 64 GiB cache and two sessions), so the Engram resolution in
-  `d3bf293` has no exactness check on this box yet.
+  (paired A/B speed check, `speed-bench/qwen-regression/`). The Engram
+  resolution in `d3bf293` passes the 64 GB streaming exact check
+  (`--stream-control ... DS4_METAL_DISABLE_V41_ENGRAM_PARALLEL 8`, 2026-09-24).
 - Static review of the sync: the Qwen compute path is untouched
   (`metal/qwen4.metal` unchanged; shared kernels and host functions only gained
   parameters that default to the old behavior; the new softplus series only
