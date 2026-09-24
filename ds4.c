@@ -41695,6 +41695,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
 #if defined(__APPLE__)
     queue_layers |= g->tp_world == 1 && !g->streaming && !g->imatrix &&
         !getenv("DS4_METAL_DISABLE_V41_SOLO_DECODE_QUEUE");
+    /* Streaming keeps its selected-id readback inside each routed MoE; that
+     * wait already bounds queued work, so the end-of-layer drain is dropped
+     * (antirez #1034 shape). Quality mode maps one layer at a time and keeps
+     * the drain. */
+    queue_layers |= g->tp_world == 1 && g->streaming && !g->quality && !g->imatrix &&
+        !getenv("DS4_METAL_DISABLE_V41_STREAM_DECODE_QUEUE");
 #endif
     const bool queued_logits = queue_layers && !layer_resident && logits &&
         !getenv("DS4_METAL_DISABLE_V41_QUEUED_HEAD");
@@ -41722,7 +41728,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         g->engram_rows = engram_input;
         /* Separate Engram inputs let resident layers remain queued until the
          * completed token reaches the CPU.
-         * Solo streaming and imatrix collection retain their per-layer drain. */
+         * Quality streaming and imatrix collection retain their per-layer drain. */
         const bool drain = !queue_layers ||
             (il == 13 && getenv("DS4_METAL_DISABLE_V41_ENGRAM_INPUTS")) ||
             il + 1u == DS4_N_LAYER;

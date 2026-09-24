@@ -27,3 +27,9 @@ A side (24 GB, default): GPU 56.6, pread 17.0, readahead 16.9, host 17.7 ms/toke
   No row is refused: decode-window wired peak <= 45.4 GiB, no swap growth. A 48 GB
   target does not fit `vm.user_wire_limit` (52.48 GiB) with the 7.12 GiB prefill reserve,
   so 40 GB is the largest practical target at ctx 8192.
+
+## Runtime steps (A = feature switched off, B = on; 24 GB target)
+
+| Step | Switch | A t/s | B t/s | Ratio | B GPU | B pread | B readahead | B host | Kept |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| b queue | `DS4_METAL_DISABLE_V41_STREAM_DECODE_QUEUE` | 8.92 | 9.53 | 1.0684 | 58.5 | 17.1 | 17.7 | 11.4 | yes |
