@@ -1271,6 +1271,90 @@ done:
     return rc;
 }
 
+/* DISABLE_ENV may name several switches separated by commas (all set to 1
+ * for the control session). */
+static void stream_control_env(const char *names, bool on) {
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s", names);
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        if (on) setenv(tok, "1", 1);
+        else unsetenv(tok);
+    }
+}
+
+/* SSD-streaming exactness at a cache that fits a 64 GB machine (the upstream
+ * decode-control fixture asks for 64 GiB). The control session runs with
+ * `disable` set and the candidate without it; logits, history and every live
+ * state span must match bit for bit for 65 decode steps after two prefixes.
+ * perturb_step >= 0 feeds the candidate a different token at that step: the
+ * self-test uses it to prove the comparison can fail. quality selects the
+ * engine's quality mode (layer-resident streaming). */
+static int check_stream_control(const char *path, const char *prompt_path,
+                                const char *disable, uint64_t cache_bytes,
+                                int perturb_step, bool quality) {
+    ds4_engine *engine = NULL;
+    ds4_session *control = NULL, *candidate = NULL;
+    ds4_tokens tokens = {0};
+    char *prompt = NULL, err[256] = "";
+    size_t prompt_bytes;
+    int rc = 1;
+    ds4_engine_options opt = {.model_path = path, .backend = DS4_BACKEND_METAL,
+        .context_size = 4096, .power_percent = 100, .ssd_streaming = true,
+        .ssd_streaming_cache_bytes = cache_bytes, .quality = quality};
+    REQUIRE(imatrix_read_text_file(prompt_path, &prompt, &prompt_bytes));
+    REQUIRE(ds4_engine_open(&engine, &opt) == 0);
+    ds4_tokenize_text(engine, prompt, &tokens);
+    REQUIRE(tokens.len > 2112);
+    const int prefixes[] = {511, 2047};
+    for (unsigned pass = 0; pass < sizeof(prefixes) / sizeof(prefixes[0]); pass++) {
+        const int prefix = prefixes[pass];
+        REQUIRE(ds4_session_create(&control, engine, 4096) == 0);
+        REQUIRE(ds4_session_create(&candidate, engine, 4096) == 0);
+        ds4_tokens input = {.v = tokens.v, .len = prefix, .cap = prefix};
+        stream_control_env(disable, true);
+        REQUIRE(ds4_session_sync(control, &input, err, sizeof(err)) == 0);
+        stream_control_env(disable, false);
+        REQUIRE(ds4_session_sync(candidate, &input, err, sizeof(err)) == 0);
+        for (int step = 0; step <= 64; step++) {
+            ds41_gpu_graph *a = &control->ds41_graph, *b = &candidate->ds41_graph;
+            ds41_state_span sa[54], sb[54];
+            const uint32_t n = ds41_state_spans(a, a->pos, sa);
+            REQUIRE(a->pos == b->pos && n == ds41_state_spans(b, b->pos, sb));
+            REQUIRE(!memcmp(&a->history, &b->history, sizeof(a->history)));
+            REQUIRE(!memcmp(control->logits, candidate->logits, DS4_N_VOCAB * sizeof(float)));
+            for (uint32_t j = 0; j < n; j++) {
+                REQUIRE(sa[j].bytes == sb[j].bytes);
+                if (memcmp(ds4_gpu_tensor_contents(sa[j].tensor),
+                           ds4_gpu_tensor_contents(sb[j].tensor), (size_t)sa[j].bytes)) {
+                    fprintf(stderr, "stream control state mismatch: pos=%u span=%u\n", a->pos, j);
+                    goto done;
+                }
+            }
+            if (step == 64) break;
+            const int token = tokens.v[prefix + step];
+            stream_control_env(disable, true);
+            REQUIRE(ds4_session_eval(control, token, err, sizeof(err)) == 0);
+            stream_control_env(disable, false);
+            const int cand = step == perturb_step ? (token + 1) % DS4_N_VOCAB : token;
+            REQUIRE(ds4_session_eval(candidate, cand, err, sizeof(err)) == 0);
+        }
+        fprintf(stderr, "V4.1 stream control %s%s cache=%.1f GiB prefix=%d: 65 exact "
+                "logits/history/KV states PASS\n", disable, quality ? " (quality)" : "",
+                (double)cache_bytes / 1073741824.0, prefix);
+        ds4_session_free(candidate); candidate = NULL;
+        ds4_session_free(control); control = NULL;
+    }
+    rc = 0;
+done:
+    if (err[0]) fprintf(stderr, "%s\n", err);
+    stream_control_env(disable, false);
+    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    ds4_session_free(candidate); ds4_session_free(control); ds4_engine_close(engine);
+    ds4_tokens_free(&tokens); free(prompt);
+    return rc;
+}
+
 static int check_decoder_suffix(const char *path, const char *prompt_path, bool short_chunks, bool streaming) {
     ds4_engine *engine = NULL;
     ds4_session *control = NULL, *candidate = NULL;
@@ -2117,6 +2201,25 @@ int main(int argc, char **argv) {
         return check_decode_control(argv[1], argv[3], true, "DS4_METAL_DISABLE_V41_ENGRAM_PARALLEL");
     if (argc == 4 && !strcmp(argv[2], "--router-log"))
         return check_router_log(argv[1], argv[3]);
+    if ((argc == 5 || argc == 6) && !strcmp(argv[2], "--stream-control")) {
+        const double gib = argc == 6 ? atof(argv[5]) : 8.0;
+        if (!(gib > 0.0)) {
+            fprintf(stderr, "--stream-control: cache GiB must be positive\n");
+            return 2;
+        }
+        return check_stream_control(argv[1], argv[3], argv[4],
+                                    (uint64_t)(gib * 1073741824.0), -1, false);
+    }
+    if (argc == 5 && !strcmp(argv[2], "--stream-control-quality"))
+        return check_stream_control(argv[1], argv[3], argv[4], UINT64_C(8) << 30, -1, true);
+    if (argc == 4 && !strcmp(argv[2], "--stream-control-selftest")) {
+        /* A no-op switch plus a planted token change: the check must FAIL. */
+        const int rc = check_stream_control(argv[1], argv[3], "DS4_TEST_STREAM_CONTROL_NOOP",
+                                            UINT64_C(8) << 30, 3, false);
+        fprintf(stderr, "V4.1 stream control self-test: %s\n",
+                rc ? "planted difference detected PASS" : "difference NOT detected FAIL");
+        return rc ? 0 : 1;
+    }
 #endif
 
     if (argc == 2 && !strcmp(argv[1], "--batch-admission"))
@@ -2248,7 +2351,10 @@ int main(int argc, char **argv) {
                         "--engram-reads | --engram-parallel PROMPT_FILE | --engram-parallel-ssd PROMPT_FILE | "
                         "--decode-queue PROMPT_FILE | --decode-queue-ssd PROMPT_FILE | "
                         "--q8-bf16-fusion PROMPT_FILE | --q8-bf16-fusion-ssd PROMPT_FILE | "
-                        "--decoder-suffix PROMPT_FILE | --session-accounting | --memory-plan | "
+                        "--decoder-suffix PROMPT_FILE | "
+                        "--router-log PROMPT_FILE | --stream-control PROMPT_FILE DISABLE_ENV [CACHE_GIB] | "
+                        "--stream-control-quality PROMPT_FILE DISABLE_ENV | --stream-control-selftest PROMPT_FILE | "
+                        "--session-accounting | --memory-plan | "
                         "RENDERED_PROMPT [GENERATE])\n", argv[0]);
         return 2;
     }
