@@ -14001,6 +14001,7 @@ decode_again:
     };
     ds4_tokens think_forced = {0};
     int think_forced_next = 0;
+    bool think_budget_pending = false;
 
     server_generation_enter(s);
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
@@ -14163,16 +14164,18 @@ decode_again:
                     dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
                 }
             }
-            bool think_budget_fire = false;
+            /* An open tool call inside the reasoning delays the close, but only
+             * up to twice the budget, so a quoted marker cannot disable the cap. */
             if (think_budget_due(&tb, thinking.inside) &&
-                !(j->req.has_tools && think_budget_tool_open(text.ptr))) {
+                !(j->req.has_tools && think_budget_tool_open(text.ptr) &&
+                  tb.used - tb.limit < tb.limit)) {
                 tb.fired = true;
-                think_budget_fire = true;
+                think_budget_pending = true;
             }
             if (was_thinking && !thinking.inside) {
                 server_log(DS4_LOG_GENERATION,
                            "ds4-server: chat ctx=%s thinking closed after %d tokens%s",
-                           ctx_span, tb.used, tb.fired ? " (budget)" : "");
+                           ctx_span, tb.used, think_forced.len > 0 ? " (budget)" : "");
             }
 
             size_t stop_pos = 0, stop_len = 0;
@@ -14340,19 +14343,6 @@ decode_again:
                 stop_decode = true;
                 break;
             }
-            if (think_budget_fire) {
-                /* Cut the rest of this block (the kept < ntok rewind below)
-                 * and close the reasoning on the next iterations. */
-                char *suffix = think_budget_suffix_text(s->think_budget_message);
-                ds4_tokenize_rendered_chat(s->engine, suffix, &think_forced);
-                free(suffix);
-                think_forced_next = 0;
-                server_log(DS4_LOG_GENERATION,
-                           "ds4-server: chat ctx=%s thinking budget reached %d tokens; forced close (%d tokens)",
-                           ctx_span, tb.used, think_forced.len);
-                trace_event(s, trace_id, "thinking budget reached %d tokens; forced close", tb.used);
-                break;
-            }
             const bool next_greedy = !thinking.inside &&
                 dsml_decode_state_is_tool(dsml_tracker.decode) &&
                 !dsml_decode_state_uses_payload_sampling(dsml_tracker.decode);
@@ -14376,6 +14366,22 @@ decode_again:
             } else {
                 trace_event(s, trace_id, "speculative boundary: kept=%d discarded=%d resample=%d",
                             kept, ntok - kept, resample);
+            }
+        }
+        if (think_budget_pending && !stop_decode) {
+            think_budget_pending = false;
+            /* The budget ran out inside this block. Close the reasoning on the
+             * next iterations, after the block, so no rewind is needed on any
+             * model family: the cap is exceeded by at most the rest of one block. */
+            if (thinking.inside && completion < max_tokens) {
+                char *suffix = think_budget_suffix_text(s->think_budget_message);
+                ds4_tokenize_rendered_chat(s->engine, suffix, &think_forced);
+                free(suffix);
+                think_forced_next = 0;
+                server_log(DS4_LOG_GENERATION,
+                           "ds4-server: chat ctx=%s thinking budget reached %d tokens; forced close (%d tokens)",
+                           ctx_span, tb.used, think_forced.len);
+                trace_event(s, trace_id, "thinking budget reached %d tokens; forced close", tb.used);
             }
         }
         if (stop_decode) break;
@@ -18473,6 +18479,21 @@ static void test_think_budget_request_fields(void) {
     request_init(&r, REQ_CHAT, 128);
     TEST_ASSERT(r.think_budget == 0);
     request_free(&r);
+}
+
+static void test_think_budget_options(void) {
+    char *default_argv[] = {"ds4-server"};
+    server_config defaults = parse_options(1, default_argv);
+    TEST_ASSERT(defaults.think_budget == 0);
+    TEST_ASSERT(defaults.think_budget_message == NULL);
+
+    char *custom_argv[] = {
+        "ds4-server", "--think-budget", "4096", "--think-budget-message", "Wrap up now."
+    };
+    server_config custom = parse_options(5, custom_argv);
+    TEST_ASSERT(custom.think_budget == 4096);
+    TEST_ASSERT(custom.think_budget_message &&
+                !strcmp(custom.think_budget_message, "Wrap up now."));
 }
 
 static void test_render_think_max_prompt_prefix(void) {
@@ -23164,6 +23185,7 @@ static void ds4_server_unit_tests_run(void) {
     test_think_budget_tool_open();
     test_think_budget_suffix_text();
     test_think_budget_request_fields();
+    test_think_budget_options();
     test_render_think_max_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();

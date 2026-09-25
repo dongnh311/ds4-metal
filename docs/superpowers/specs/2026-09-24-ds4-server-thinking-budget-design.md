@@ -1,6 +1,7 @@
 # ds4-server: hard thinking budget — design
 
 Date: 2026-09-24. Status: design approved in conversation (approach A, sections 1-4); pending spec review.
+Amended 2026-09-25 after the final review: block-end close, open-tool slack bound.
 Base: branch `think-budget` from develop 2152f86 (includes the DS4.1 merge).
 
 ## Problem
@@ -45,6 +46,8 @@ Request fields (all optional, integer > 0 to take effect):
 - Anthropic `/v1/messages`: `thinking.budget_tokens` (sent by Claude Code).
 - OpenAI `/v1/chat/completions`: top-level `thinking_budget`, or `chat_template_kwargs.thinking_budget`.
 - Responses `/v1/responses`: top-level `thinking_budget`.
+- `/v1/completions` uses only the server flag; the request fields above apply to Chat, Responses and
+  Anthropic requests.
 
 Effective budget = the smaller of the server ceiling and the request value, counting only values > 0.
 Neither set = unlimited (today's behaviour). The budget applies only when the request's think mode is
@@ -57,10 +60,11 @@ In `generate_job_inner`'s decode loop (ds4_server.c):
 
 1. After `thinking_state_feed` for each kept token, add one to the count if the model is still inside
    `<think>` (the token that closes `</think>` itself is not counted).
-2. When the count reaches the effective budget, the model is still inside `<think>`, and no tool call is
-   open inside the reasoning: keep that token, stop processing the current MTP block (the existing
-   `kept < ntok` path rewinds the session to `block_start + kept` via `server_generation_rewind`), and
-   queue the forced suffix.
+2. When the count reaches the effective budget inside `<think>` (and no tool call is open inside the
+   reasoning, see step 6), the budget-spending token and the rest of its MTP block are processed
+   normally. After the block, the forced suffix is queued only if the model is still inside `<think>`,
+   the pass is not stopping, and `completion < max_tokens`. No rewind is needed on any model family; the
+   reasoning overshoots the budget by at most the rest of one block.
 3. Forced suffix = `"\n\n" + message + "\n</think>\n\n"`, tokenized once per request with
    `ds4_tokenize_rendered_chat` so `</think>` maps to the vocabulary's `think_end_id`.
 4. The next loop iterations consume the queue instead of sampling: each forced token is evaluated with
@@ -69,8 +73,9 @@ In `generate_job_inner`'s decode loop (ds4_server.c):
    updates, stop scanning), in chunks of at most the block capacity (17). The `</think>` token flips the
    stream from reasoning to content exactly as a model-generated one would.
 5. Sampling resumes from the logits after the last forced token; MTP drafting resumes on the next cycle.
-6. If a tool call is open inside the reasoning when the budget is reached, the close is deferred until
-   that block ends, so tool syntax is never cut.
+6. If a tool call is open inside the reasoning when the budget is reached, the close waits until that
+   tool block ends, so tool syntax is not cut, but at most until 2N reasoning tokens, so a quoted marker
+   cannot disable the cap.
 
 Logging: `thinking budget reached N tokens; forced close` when it fires, and a `thinking closed after K
 tokens` line whenever reasoning ends (naturally or forced), which the measurement step reads.
