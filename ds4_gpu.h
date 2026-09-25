@@ -3610,6 +3610,11 @@ int ds4_gpu_qwen4_stream_stage_layer(
         uint32_t n_expert, uint32_t in_dim, uint32_t ff_dim, uint32_t out_dim,
         uint32_t seed_tokens);
 void ds4_gpu_qwen4_stream_stage_clear(void);
+/* qwen4 prefill residency (DS4_QWEN4_PREFILL_MODE): while the scope is open,
+ * new command buffers use a residency set of the mapped model views. A no-op
+ * before macOS 15 or when the set cannot be built. */
+void ds4_gpu_prefill_residency_begin(void);
+void ds4_gpu_prefill_residency_end(void);
 int ds4_gpu_qwen4_moe_mid_grouped_tensor(
         ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts, uint32_t list_cap,

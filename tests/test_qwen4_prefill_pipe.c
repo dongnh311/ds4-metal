@@ -148,7 +148,14 @@ static void check_pipe_prompt_end(void) {
     CHECK(!p.slot[0].reader_pending && !p.slot[1].reader_pending);
 }
 
+static void check_role_default(void) {
+    ds4_qwen4_gpu_graph *g = xcalloc(1, sizeof(*g));
+    CHECK(g->prefill_role == QWEN4_PREFILL_ROLE_NONE);
+    free(g);
+}
+
 int main(void) {
+    check_role_default();
     check_mode_parse();
     check_policy();
     check_prompt_end();

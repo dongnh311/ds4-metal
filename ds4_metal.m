@@ -941,6 +941,7 @@ typedef struct {
 
 static ds4_gpu_model_view g_model_views[DS4_METAL_MAX_MODEL_VIEWS];
 static uint32_t g_model_view_count;
+static uint64_t g_model_view_gen;   /* bumped whenever the model views change */
 
 enum {
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER = 80,
@@ -1386,6 +1387,69 @@ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *labe
     return 1;
 }
 
+/* qwen4 prefill residency (DS4_QWEN4_PREFILL_MODE). Under --ssd-streaming the
+ * model views are in no residency set, so the driver revalidates them lazily
+ * and a command buffer can start hundreds of ms after its commit (17 s of a
+ * 36K-token prefill). While a prefill scope is open, new command buffers use a
+ * set of the mapped views. The set is only committed, never requested and never
+ * added to the queue, so decode and every other command buffer run as before. */
+static id g_prefill_residency_set;
+static uint64_t g_prefill_residency_gen = UINT64_MAX;
+static int g_prefill_residency_scope;
+static int g_prefill_residency_warned;
+
+static id ds4_gpu_prefill_residency_set(void) {
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        if (g_prefill_residency_set && g_prefill_residency_gen == g_model_view_gen) {
+            return g_prefill_residency_set;
+        }
+        g_prefill_residency_set = nil;
+        if (!g_device || g_model_view_count == 0) return nil;
+        MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
+        desc.label = @"ds4_qwen4_prefill";
+        desc.initialCapacity = g_model_view_count;
+        NSError *error = nil;
+        id<MTLResidencySet> set = [g_device newResidencySetWithDescriptor:desc error:&error];
+        if (!set) {
+            if (!g_prefill_residency_warned) {
+                g_prefill_residency_warned = 1;
+                fprintf(stderr, "ds4: qwen4 prefill residency set creation failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+            }
+            return nil;
+        }
+        for (uint32_t i = 0; i < g_model_view_count; i++) {
+            [set addAllocation:g_model_views[i].buffer];
+        }
+        [set commit];
+        g_prefill_residency_set = set;
+        g_prefill_residency_gen = g_model_view_gen;
+        return set;
+    }
+#endif
+    return nil;
+}
+
+void ds4_gpu_prefill_residency_begin(void) {
+    g_prefill_residency_scope = g_initialized && ds4_gpu_prefill_residency_set() != nil;
+}
+
+void ds4_gpu_prefill_residency_end(void) {
+    g_prefill_residency_scope = 0;
+}
+
+static void ds4_gpu_prefill_residency_attach(id<MTLCommandBuffer> cb) {
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        if (cb && g_prefill_residency_scope && g_prefill_residency_set &&
+            [cb respondsToSelector:@selector(useResidencySet:)]) {
+            [cb useResidencySet:g_prefill_residency_set];
+        }
+    }
+#endif
+}
+
 static id<MTLCommandBuffer> ds4_gpu_new_command_buffer(void) {
     static int initialized;
     static int use_unretained;
@@ -1393,10 +1457,10 @@ static id<MTLCommandBuffer> ds4_gpu_new_command_buffer(void) {
         use_unretained = getenv("DS4_METAL_UNRETAINED_COMMAND_BUFFERS") != NULL;
         initialized = 1;
     }
-    if (use_unretained) {
-        return [g_queue commandBufferWithUnretainedReferences];
-    }
-    return [g_queue commandBuffer];
+    id<MTLCommandBuffer> cb = use_unretained ? [g_queue commandBufferWithUnretainedReferences]
+                                             : [g_queue commandBuffer];
+    ds4_gpu_prefill_residency_attach(cb);
+    return cb;
 }
 
 static uint64_t ds4_gpu_exact_view_cache_limit_bytes(void) {
@@ -1592,9 +1656,34 @@ static uint64_t g_gpu_idle_groups, g_gpu_idle_acc_cbs;
 static double g_gpu_tl_first, g_gpu_tl_last_end, g_gpu_tl_busy;
 static int g_gpu_tl_open;
 
+/* Whole-run accounting (DS4_METAL_GPU_IDLE), printed once at exit: the union
+ * of GPU busy intervals over the first-start..last-end span, and the launch
+ * latency (commit to GPUStartTime) of waited command buffers that had nothing
+ * queued ahead of them. This is how the prefill launch latency was found. */
+static double g_gpu_run_first, g_gpu_run_last_end, g_gpu_run_busy, g_gpu_run_launch;
+static uint64_t g_gpu_run_cbs, g_gpu_run_launch_n;
+
+static void ds4_gpu_run_report(void) {
+    const double span = g_gpu_run_last_end - g_gpu_run_first;
+    fprintf(stderr, "ds4: gpu run: %llu cbs, span %.1f ms, busy %.1f ms, idle %.1f ms (%.1f%%), "
+            "launch %.1f ms over %llu waits\n",
+            (unsigned long long)g_gpu_run_cbs, span * 1e3, g_gpu_run_busy * 1e3,
+            (span - g_gpu_run_busy) * 1e3, span > 0.0 ? 100.0 * (span - g_gpu_run_busy) / span : 0.0,
+            g_gpu_run_launch * 1e3, (unsigned long long)g_gpu_run_launch_n);
+}
+
 static void ds4_gpu_idle_note_cb(id<MTLCommandBuffer> cb) {
     const double st = cb.GPUStartTime, en = cb.GPUEndTime;
     if (en <= st) return;
+    if (g_gpu_run_cbs++ == 0) {
+        g_gpu_run_first = st;
+        g_gpu_run_last_end = st;
+        atexit(ds4_gpu_run_report);
+    }
+    if (en > g_gpu_run_last_end) {
+        g_gpu_run_busy += en - (st > g_gpu_run_last_end ? st : g_gpu_run_last_end);
+        g_gpu_run_last_end = en;
+    }
     if (!g_gpu_tl_open) {
         g_gpu_tl_first = st; g_gpu_tl_last_end = st; g_gpu_tl_busy = 0.0; g_gpu_tl_open = 1;
     }
@@ -1676,6 +1765,8 @@ static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, con
     if (!owned) return 1;
 
     const double t_commit = ds4_gpu_now_ms();
+    const double h_commit = ds4_gpu_host_seconds();
+    const BOOL had_pending = [g_pending_cbs count] != 0;
     [cb commit];
     int ok = ds4_gpu_wait_pending_command_buffers(label);
     if (!ds4_gpu_wait_command_buffer(cb, label)) {
@@ -1685,6 +1776,10 @@ static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, con
     if (g_gpu_idle_prof > 0) {
         ds4_gpu_idle_note_cb(cb);
         ds4_gpu_idle_end_group();
+        if (!had_pending && cb.GPUStartTime > 0.0) {
+            g_gpu_run_launch += cb.GPUStartTime - h_commit;
+            g_gpu_run_launch_n++;
+        }
     }
     if (getenv("DS4_METAL_CB_TIMES")) {
         const double t_done = ds4_gpu_now_ms();
@@ -2190,6 +2285,7 @@ static void ds4_gpu_model_views_clear(void) {
         g_model_views[i].bytes = 0;
     }
     g_model_view_count = 0;
+    g_model_view_gen++;
 }
 
 static void ds4_gpu_model_views_remove_map(const void *model_map) {
@@ -2201,6 +2297,7 @@ static void ds4_gpu_model_views_remove_map(const void *model_map) {
     for (uint32_t i = kept; i < g_model_view_count; i++)
         g_model_views[i] = (ds4_gpu_model_view){0};
     g_model_view_count = kept;
+    g_model_view_gen++;
 }
 
 static void ds4_gpu_model_residency_clear(void) {
@@ -2412,6 +2509,7 @@ static int ds4_gpu_add_model_view_range(
         g_model_views[g_model_view_count].model_offset = page_model_offset + off;
         g_model_views[g_model_view_count].bytes = view_bytes;
         g_model_view_count++;
+        g_model_view_gen++;
 
         g_model_wrap_count++;
         g_model_wrap_bytes += view_bytes;
@@ -11881,6 +11979,9 @@ void ds4_gpu_cleanup(void) {
             g_stream_expert_cache_batch_seq = 0;
         }
         (void)ds4_gpu_wait_pending_command_buffers("cleanup");
+        g_prefill_residency_scope = 0;
+        g_prefill_residency_set = nil;
+        g_prefill_residency_gen = UINT64_MAX;
         if (ds4_gpu_stream_expert_timing_summary_enabled() &&
             getenv("DS4_METAL_MEMORY_REPORT") == NULL) {
             ds4_gpu_print_memory_report("at cleanup");
