@@ -13995,6 +13995,12 @@ decode_again:
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
     dsml_tracker.model_syntax = j->req.model_syntax;
+    think_budget_state tb = {
+        .limit = !s->batched_mode && ds4_think_mode_enabled(j->req.think_mode) ?
+            think_budget_effective(s->think_budget, j->req.think_budget) : 0,
+    };
+    ds4_tokens think_forced = {0};
+    int think_forced_next = 0;
 
     server_generation_enter(s);
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
@@ -14026,64 +14032,78 @@ decode_again:
             temperature = 0.0f;
         }
         const int eos_token = ds4_token_eos(s->engine);
-        int token = j->req.ignore_eos ?
-            ds4_session_argmax_ignoring_eos(slot->session,
-                                            j->req.think_mode) :
-            ds4_session_sample(slot->session, temperature, top_k,
-                               top_p, min_p, &rng);
-        if (token < 0) {
-            finish = "error";
-            snprintf(err, sizeof(err), "failed to select a non-EOS token");
-            break;
-        }
-        if (ds4_token_is_stop_for_think_mode(s->engine,
-                                             token,
-                                             j->req.think_mode)) {
-            finish = "stop";
-            stop_detail = "stop token";
-            stop_token = token;
-            break;
-        }
-
+        int token = -1;
         int toks[17];
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
-        if (!s->batched_mode &&
-            ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL)
-        {
-            if (j->req.ignore_eos) {
-                ntok = ds4_session_eval_speculative_argmax_ignoring_eos(
-                    slot->session, token, max_tokens - completion,
-                    eos_token, j->req.think_mode,
-                    toks, (int)(sizeof(toks) / sizeof(toks[0])),
-                    err, sizeof(err));
-            } else {
-                ntok = ds4_session_eval_speculative(
-                    slot->session, token, max_tokens - completion,
-                    eos_token, temperature, top_k, top_p, min_p, &rng,
-                    toks, (int)(sizeof(toks) / sizeof(toks[0])),
-                    err, sizeof(err));
-            }
-            if (ntok < 0) {
-                finish = "error";
-                break;
-            }
-        } else if (s->batched_mode && s->qwen4_batch_mtp &&
-                   max_tokens - completion >= 2 && !j->req.ignore_eos &&
-                   (!ds4_engine_mtp_exact_sampling(s->engine) || temperature == 0.0f) &&
-                   getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
-            if (server_eval_tokens(s, slot, token, true, toks, &ntok, err, sizeof(err)) != 0) {
-                finish = "error";
-                break;
-            }
-        } else {
+        if (think_forced_next < think_forced.len) {
+            /* Forced thinking close: feed the queued suffix one token per
+             * iteration through the plain eval path; the per-token body below
+             * streams it exactly like a sampled token. */
+            token = think_forced.v[think_forced_next++];
             if (server_eval_token(s, slot, token, err, sizeof(err)) != 0) {
                 finish = "error";
                 break;
             }
             toks[0] = token;
             ntok = 1;
+        } else {
+            token = j->req.ignore_eos ?
+                ds4_session_argmax_ignoring_eos(slot->session,
+                                                j->req.think_mode) :
+                ds4_session_sample(slot->session, temperature, top_k,
+                                   top_p, min_p, &rng);
+            if (token < 0) {
+                finish = "error";
+                snprintf(err, sizeof(err), "failed to select a non-EOS token");
+                break;
+            }
+            if (ds4_token_is_stop_for_think_mode(s->engine,
+                                                 token,
+                                                 j->req.think_mode)) {
+                finish = "stop";
+                stop_detail = "stop token";
+                stop_token = token;
+                break;
+            }
+
+            if (!s->batched_mode &&
+                ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+                getenv("DS4_MTP_SPEC_DISABLE") == NULL)
+            {
+                if (j->req.ignore_eos) {
+                    ntok = ds4_session_eval_speculative_argmax_ignoring_eos(
+                        slot->session, token, max_tokens - completion,
+                        eos_token, j->req.think_mode,
+                        toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                        err, sizeof(err));
+                } else {
+                    ntok = ds4_session_eval_speculative(
+                        slot->session, token, max_tokens - completion,
+                        eos_token, temperature, top_k, top_p, min_p, &rng,
+                        toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                        err, sizeof(err));
+                }
+                if (ntok < 0) {
+                    finish = "error";
+                    break;
+                }
+            } else if (s->batched_mode && s->qwen4_batch_mtp &&
+                       max_tokens - completion >= 2 && !j->req.ignore_eos &&
+                       (!ds4_engine_mtp_exact_sampling(s->engine) || temperature == 0.0f) &&
+                       getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+                if (server_eval_tokens(s, slot, token, true, toks, &ntok, err, sizeof(err)) != 0) {
+                    finish = "error";
+                    break;
+                }
+            } else {
+                if (server_eval_token(s, slot, token, err, sizeof(err)) != 0) {
+                    finish = "error";
+                    break;
+                }
+                toks[0] = token;
+                ntok = 1;
+            }
         }
 
         if (ntok == 0) {
@@ -14142,6 +14162,17 @@ decode_again:
                     }
                     dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
                 }
+            }
+            bool think_budget_fire = false;
+            if (think_budget_due(&tb, thinking.inside) &&
+                !(j->req.has_tools && think_budget_tool_open(text.ptr))) {
+                tb.fired = true;
+                think_budget_fire = true;
+            }
+            if (was_thinking && !thinking.inside) {
+                server_log(DS4_LOG_GENERATION,
+                           "ds4-server: chat ctx=%s thinking closed after %d tokens%s",
+                           ctx_span, tb.used, tb.fired ? " (budget)" : "");
             }
 
             size_t stop_pos = 0, stop_len = 0;
@@ -14309,6 +14340,19 @@ decode_again:
                 stop_decode = true;
                 break;
             }
+            if (think_budget_fire) {
+                /* Cut the rest of this block (the kept < ntok rewind below)
+                 * and close the reasoning on the next iterations. */
+                char *suffix = think_budget_suffix_text(s->think_budget_message);
+                ds4_tokenize_rendered_chat(s->engine, suffix, &think_forced);
+                free(suffix);
+                think_forced_next = 0;
+                server_log(DS4_LOG_GENERATION,
+                           "ds4-server: chat ctx=%s thinking budget reached %d tokens; forced close (%d tokens)",
+                           ctx_span, tb.used, think_forced.len);
+                trace_event(s, trace_id, "thinking budget reached %d tokens; forced close", tb.used);
+                break;
+            }
             const bool next_greedy = !thinking.inside &&
                 dsml_decode_state_is_tool(dsml_tracker.decode) &&
                 !dsml_decode_state_uses_payload_sampling(dsml_tracker.decode);
@@ -14337,6 +14381,7 @@ decode_again:
         if (stop_decode) break;
     }
     server_generation_leave(s);
+    ds4_tokens_free(&think_forced);
 
     if (job_cancelled(j)) {
         request_live_state_clear(s, slot);
