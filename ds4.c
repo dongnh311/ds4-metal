@@ -60523,12 +60523,32 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
      * staged (DS4_QWEN4_STREAM_STAGE_PREFILL=0 keeps the per-token stream path). */
     bool staged = false;
     if (ok && mm_shape && experts_streamed && qwen4_stream_stage_prefill_enabled()) {
+        const uint32_t seed = g->stream_seed_last ? qwen4_stream_seed_tokens() : 0u;
+#ifdef DS4_HAS_QWEN4_METAL
+        const qwen4_prefill_flags pf = qwen4_prefill_policy(qwen4_prefill_mode_env(), g->prefill_role, T, true);
+        if (qwen4_prefill_use_pipe(pf, seed)) {
+            if (!g->stream_layers_ready) {
+                g->n_stream_layers = qwen4_stream_layer_list(w, g->stream_layers, DS4_MAX_LAYER);
+                g->stream_layers_ready = true;
+            }
+            const uint32_t nx = qwen4_stream_next_staged(g->stream_layers, g->n_stream_layers, il,
+                                                         g->prefill_role);
+            const ds4_layer_weights *ln = nx != UINT32_MAX ? &w->layer[nx] : NULL;
+            staged = ds4_gpu_qwen4_stream_stage_layer_pipe(
+                m->map, m->size, il, g->selected, T, DS4_N_EXPERT_USED,
+                l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset, l->ffn_down_exps->abs_offset,
+                l->ffn_gate_exps->type, l->ffn_down_exps->type, DS4_N_EXPERT, DS4_N_EMBD, DS4_N_FF_EXP,
+                DS4_N_EMBD, nx,
+                ln ? ln->ffn_gate_exps->abs_offset : 0u, ln ? ln->ffn_up_exps->abs_offset : 0u,
+                ln ? ln->ffn_down_exps->abs_offset : 0u, ln ? ln->ffn_gate_exps->type : UINT32_MAX,
+                ln ? ln->ffn_down_exps->type : UINT32_MAX, pf.pipe_nocache ? 1 : 0) != 0;
+        } else
+#endif
         staged = ds4_gpu_qwen4_stream_stage_layer(m->map, m->size, il, g->selected, T, DS4_N_EXPERT_USED,
                                                   l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
                                                   l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type,
                                                   l->ffn_down_exps->type, DS4_N_EXPERT, DS4_N_EMBD,
-                                                  DS4_N_FF_EXP, DS4_N_EMBD,
-                                                  g->stream_seed_last ? qwen4_stream_seed_tokens() : 0u) != 0;
+                                                  DS4_N_FF_EXP, DS4_N_EMBD, seed) != 0;
     }
     const bool mm = mm_shape && (!experts_streamed || staged);
     if (mm) {
@@ -60789,6 +60809,9 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     if (!glm_graph_begin_commands_if_needed()) {
 #ifdef DS4_HAS_QWEN4_METAL
         if (pflags.residency) ds4_gpu_prefill_residency_end();
+        if (qwen4_prefill_prompt_ends(pmode, g->prefill_role, false, pstreaming)) {
+            ds4_gpu_qwen4_stream_stage_prompt_end();
+        }
 #endif
         return false;
     }
@@ -60910,6 +60933,9 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     if (!ds4_gpu_end_commands()) ok = false;
 #ifdef DS4_HAS_QWEN4_METAL
     if (pflags.residency) ds4_gpu_prefill_residency_end();
+    if (qwen4_prefill_prompt_ends(pmode, g->prefill_role, ok, pstreaming)) {
+        ds4_gpu_qwen4_stream_stage_prompt_end();
+    }
 #endif
     const double t3 = timing ? now_sec() : 0.0;
     if (T == 1u) qwen4_router_flush(pos0);
@@ -60937,6 +60963,16 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         g->snap_after_second = false;
     }
     return ok;
+}
+
+/* A prompt loop stopped between chunks (cancellation): the pipe may hold a read
+ * queued for a next chunk that will not come. */
+static void qwen4_prefill_abandon(void) {
+#ifdef DS4_HAS_QWEN4_METAL
+    if (qwen4_prefill_mode_env() != QWEN4_PREFILL_OFF && ds4_gpu_ssd_streaming_enabled()) {
+        ds4_gpu_qwen4_stream_stage_prompt_end();
+    }
+#endif
 }
 
 static bool qwen4_graph_forward_token(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
@@ -77760,6 +77796,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         int prefill_rc = 0;
         for (int i = start; i < prompt->len;) {
             if (ds4_session_cancelled(s)) {
+                qwen4_prefill_abandon();
                 snprintf(err, errlen, "interrupted");
                 s->checkpoint_valid = s->checkpoint.len > 0;
                 prefill_rc = DS4_SESSION_SYNC_INTERRUPTED;

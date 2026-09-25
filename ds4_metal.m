@@ -30,6 +30,7 @@
 #include "ds4.h"
 #include "ds4_gpu.h"
 #include "ds4_image.h"
+#include "ds4_qwen4_stage_pipe.h"
 
 /*
  * Objective-C Metal glue for the C engine.
@@ -1286,6 +1287,9 @@ static NSUInteger ds4_gpu_tensor_offset(const ds4_gpu_tensor *tensor) {
 }
 
 static id<MTLCommandBuffer> ds4_gpu_new_command_buffer(void);
+static void ds4_gpu_qpipe_note_commit(id<MTLCommandBuffer> cb);
+static void ds4_gpu_qpipe_note_all_complete(void);
+static void ds4_gpu_qpipe_shutdown(void);
 static void ds4_gpu_stream_expert_cache_note_owned_created(void);
 
 static id<MTLCommandBuffer> ds4_gpu_command_buffer(int *owned) {
@@ -9786,6 +9790,7 @@ int ds4_gpu_flush_commands(void) {
     g_batch_has_work = NO;
     [cb commit];
     [g_pending_cbs addObject:cb];
+    ds4_gpu_qpipe_note_commit(cb);
     ds4_gpu_stream_expert_cache_note_batch_committed();
 
     g_batch_cb = ds4_gpu_new_command_buffer();
@@ -11805,6 +11810,7 @@ int ds4_gpu_end_commands(void) {
     g_stream_expert_cache_owned_seq = g_stream_expert_cache_batch_seq;
     g_stream_expert_cache_batch_seq = 0;
     const int ok = ds4_gpu_finish_command_buffer(cb, 1, "command batch");
+    ds4_gpu_qpipe_note_all_complete();
     return qgate_check_after_wait() && ok;
 }
 
@@ -11982,6 +11988,7 @@ void ds4_gpu_cleanup(void) {
         g_prefill_residency_scope = 0;
         g_prefill_residency_set = nil;
         g_prefill_residency_gen = UINT64_MAX;
+        ds4_gpu_qpipe_shutdown();
         if (ds4_gpu_stream_expert_timing_summary_enabled() &&
             getenv("DS4_METAL_MEMORY_REPORT") == NULL) {
             ds4_gpu_print_memory_report("at cleanup");
@@ -13814,7 +13821,8 @@ static uint32_t ds4_gpu_stream_expert_pread_thread_count(uint32_t n_tasks) {
     return threads;
 }
 
-static int ds4_gpu_stream_expert_pread_into(
+static int ds4_gpu_stream_expert_pread_fd(
+        int       fd,
         uint64_t  offset,
         uint64_t  len,
         uint8_t  *dst,
@@ -13822,7 +13830,7 @@ static int ds4_gpu_stream_expert_pread_into(
         double   *ms_out) {
     if (read_bytes) *read_bytes = 0;
     if (ms_out) *ms_out = 0.0;
-    if (g_model_fd < 0 ||
+    if (fd < 0 ||
         !dst ||
         len == 0 ||
         offset > (uint64_t)LLONG_MAX ||
@@ -13838,7 +13846,7 @@ static int ds4_gpu_stream_expert_pread_into(
         const size_t want = rem > (uint64_t)SSIZE_MAX ? (size_t)SSIZE_MAX : (size_t)rem;
         ssize_t nread;
         do {
-            nread = pread(g_model_fd, dst + pos, want, (off_t)(offset + pos));
+            nread = pread(fd, dst + pos, want, (off_t)(offset + pos));
         } while (nread < 0 && errno == EINTR);
         if (nread <= 0) {
             ok = 0;
@@ -13858,6 +13866,15 @@ static int ds4_gpu_stream_expert_pread_into(
         return 0;
     }
     return 1;
+}
+
+static int ds4_gpu_stream_expert_pread_into(
+        uint64_t  offset,
+        uint64_t  len,
+        uint8_t  *dst,
+        uint64_t *read_bytes,
+        double   *ms_out) {
+    return ds4_gpu_stream_expert_pread_fd(g_model_fd, offset, len, dst, read_bytes, ms_out);
 }
 
 /* Expert reads sit on the decode's critical path. A reader thread inherits
@@ -49359,6 +49376,7 @@ static struct {
     uint64_t bytes[3];     /* full tensor bytes */
     NSUInteger region[3];  /* where each tensor starts inside buf */
     id<MTLBuffer> buf;
+    id<MTLBuffer> bind_buf;   /* buffer the staged tensors bind to (buf or the pipe spare) */
     uint64_t cap;
 } g_qwen4_stage;
 
@@ -49367,7 +49385,7 @@ static bool qwen4_bind_weight(qwen4_bind *b, const void *map, uint64_t size,
     if (g_qwen4_stage.active && map == g_qwen4_stage.map) {
         for (int i = 0; i < 3; i++) {
             if (offset == g_qwen4_stage.off[i] && bytes <= g_qwen4_stage.bytes[i]) {
-                b->buf = g_qwen4_stage.buf;
+                b->buf = g_qwen4_stage.bind_buf;
                 b->off = g_qwen4_stage.region[i];
                 return true;
             }
@@ -51114,7 +51132,7 @@ void ds4_gpu_qwen4_stream_stage_clear(void) {
  * streamed layer; see g_qwen4_stage. It drains pending GPU work first, both to
  * read `selected` and because the previous staged dispatch may still read the
  * buffer. Consecutive expert ids are read as one run per tensor. */
-int ds4_gpu_qwen4_stream_stage_layer(
+static int qwen4_stage_union(
         const void *model_map, uint64_t model_size, uint32_t layer,
         const ds4_gpu_tensor *selected, uint32_t n_tokens, uint32_t n_slots,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
@@ -51238,6 +51256,7 @@ int ds4_gpu_qwen4_stream_stage_layer(
         }
     }
     if (ok) {
+        g_qwen4_stage.bind_buf = g_qwen4_stage.buf;
         g_qwen4_stage.map = model_map;
         for (int t = 0; t < 3; t++) {
             g_qwen4_stage.off[t] = src[t];
@@ -51251,6 +51270,347 @@ int ds4_gpu_qwen4_stream_stage_layer(
         ok = 0;
     }
     return ok;
+}
+
+/* qwen4 prefill staging pipe (DS4_QWEN4_PREFILL_MODE). Slot 0 is the union
+ * path's buffer (g_qwen4_stage.buf); slot 1 is a spare allocated on demand and
+ * released at prompt end. One reader thread serves queued whole-layer reads in
+ * order; before reading into a slot it waits for the command buffer that last
+ * read it (per-slot last reader, recorded by the flush hook). Bookkeeping in
+ * ds4_qwen4_stage_pipe.h; every qsp_* call and slot pointer is under g_qpipe_mu. */
+#define QPIPE_READERS 8u
+#define QPIPE_PIECE (32ull << 20)
+
+static pthread_mutex_t g_qpipe_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_qpipe_cv = PTHREAD_COND_INITIALIZER;
+static qsp_state g_qpipe;
+static id<MTLBuffer> g_qpipe_spare;
+static id<MTLCommandBuffer> g_qpipe_wait_cb[2];
+static id<MTLCommandBuffer> g_qpipe_reader_cb[2];
+static uint64_t g_qpipe_bytes[3];
+static NSUInteger g_qpipe_region[3];
+static uint64_t g_qpipe_need;
+static double g_qpipe_read_ms[2], g_qpipe_cbwait_ms[2];
+static pthread_t g_qpipe_thread;
+static int g_qpipe_started;     /* the pipe has run: hooks are live */
+static int g_qpipe_stop;
+static int g_qpipe_disabled;    /* an allocation failed: union path only */
+static int g_qpipe_nocache_fd = -1;
+
+static id<MTLBuffer> qpipe_buffer(int s) {
+    return s == 0 ? g_qwen4_stage.buf : g_qpipe_spare;
+}
+
+/* Reader thread only: the model file through a second fd that bypasses the
+ * page cache, or the shared fd when that cannot be opened. */
+static int qpipe_nocache_fd(void) {
+    if (g_qpipe_nocache_fd < 0 && g_model_fd >= 0) {
+        char path[MAXPATHLEN];
+        if (fcntl(g_model_fd, F_GETPATH, path) != -1) {
+            const int fd = open(path, O_RDONLY | O_CLOEXEC);
+            if (fd >= 0 && fcntl(fd, F_NOCACHE, 1) != -1) g_qpipe_nocache_fd = fd;
+            else if (fd >= 0) close(fd);
+        }
+    }
+    return g_qpipe_nocache_fd >= 0 ? g_qpipe_nocache_fd : g_model_fd;
+}
+
+typedef struct {
+    ds4_gpu_stream_expert_pread_task *tasks;
+    uint32_t n, first, stride;
+    int fd;
+} qpipe_reader_args;
+
+static void *qpipe_reader_main(void *arg) {
+    qpipe_reader_args *a = (qpipe_reader_args *)arg;
+    ds4_gpu_stream_expert_pread_thread_qos();
+    for (uint32_t i = a->first; i < a->n; i += a->stride) {
+        ds4_gpu_stream_expert_pread_task *t = &a->tasks[i];
+        t->ok = ds4_gpu_stream_expert_pread_fd(a->fd, t->offset, t->len, t->dst, &t->read_bytes, &t->ms);
+    }
+    return NULL;
+}
+
+/* Read one streamed layer's three whole tensors into base at the union path's
+ * regions, in QPIPE_PIECE pieces over QPIPE_READERS threads of our own (the
+ * shared pread pool stays free for the main thread). */
+static int qpipe_read_layer(uint8_t *base, const uint64_t off[3], int fd) {
+    uint32_t n = 0;
+    for (int t = 0; t < 3; t++) n += (uint32_t)((g_qpipe_bytes[t] + QPIPE_PIECE - 1u) / QPIPE_PIECE);
+    ds4_gpu_stream_expert_pread_task *tasks = (ds4_gpu_stream_expert_pread_task *)calloc(n, sizeof(*tasks));
+    if (!tasks) return 0;
+    n = 0;
+    for (int t = 0; t < 3; t++) {
+        for (uint64_t p = 0; p < g_qpipe_bytes[t]; p += QPIPE_PIECE) {
+            const uint64_t len = g_qpipe_bytes[t] - p < QPIPE_PIECE ? g_qpipe_bytes[t] - p : QPIPE_PIECE;
+            tasks[n++] = (ds4_gpu_stream_expert_pread_task){
+                .offset = off[t] + p, .len = len, .dst = base + g_qpipe_region[t] + p };
+        }
+    }
+    pthread_t th[QPIPE_READERS];
+    qpipe_reader_args args[QPIPE_READERS];
+    int live[QPIPE_READERS] = {0};
+    for (uint32_t i = 0; i < QPIPE_READERS; i++) args[i] = (qpipe_reader_args){ tasks, n, i, QPIPE_READERS, fd };
+    for (uint32_t i = 1; i < QPIPE_READERS; i++) {
+        live[i] = pthread_create(&th[i], NULL, qpipe_reader_main, &args[i]) == 0;
+    }
+    qpipe_reader_main(&args[0]);
+    for (uint32_t i = 1; i < QPIPE_READERS; i++) {
+        if (live[i]) pthread_join(th[i], NULL);
+        else qpipe_reader_main(&args[i]);   /* a thread failed to start: run its share here */
+    }
+    int ok = 1;
+    for (uint32_t i = 0; i < n; i++) if (!tasks[i].ok) ok = 0;
+    free(tasks);
+    return ok;
+}
+
+static void *qpipe_thread_main(void *arg) {
+    (void)arg;
+    ds4_gpu_stream_expert_pread_thread_qos();
+    pthread_mutex_lock(&g_qpipe_mu);
+    for (;;) {
+        int s = -1;
+        while (!g_qpipe_stop && (s = qsp_next_queued(&g_qpipe)) < 0) {
+            pthread_cond_wait(&g_qpipe_cv, &g_qpipe_mu);
+        }
+        if (g_qpipe_stop) break;
+        @autoreleasepool {
+            id<MTLCommandBuffer> wait_cb = g_qpipe_wait_cb[s];
+            g_qpipe_wait_cb[s] = nil;
+            const uint64_t off[3] = { g_qpipe.slot[s].off[0], g_qpipe.slot[s].off[1], g_qpipe.slot[s].off[2] };
+            const bool nocache = g_qpipe.slot[s].nocache;
+            uint8_t *base = (uint8_t *)[qpipe_buffer(s) contents];
+            pthread_mutex_unlock(&g_qpipe_mu);
+            const double t0 = ds4_gpu_now_ms();
+            if (wait_cb) [wait_cb waitUntilCompleted];
+            wait_cb = nil;
+            const double t1 = ds4_gpu_now_ms();
+            const int ok = base && qpipe_read_layer(base, off, nocache ? qpipe_nocache_fd() : g_model_fd);
+            const double t2 = ds4_gpu_now_ms();
+            pthread_mutex_lock(&g_qpipe_mu);
+            qsp_finish(&g_qpipe, s, ok != 0);
+            g_qpipe_cbwait_ms[s] = t1 - t0;
+            g_qpipe_read_ms[s] = t2 - t1;
+            pthread_cond_broadcast(&g_qpipe_cv);
+        }
+    }
+    pthread_mutex_unlock(&g_qpipe_mu);
+    return NULL;
+}
+
+/* Main thread, lock not held. */
+static int qpipe_start(void) {
+    if (g_qpipe_started) return 1;
+    if (pthread_create(&g_qpipe_thread, NULL, qpipe_thread_main, NULL) != 0) return 0;
+    g_qpipe_started = 1;
+    return 1;
+}
+
+/* Wait until no read is queued (lock held). */
+static void qpipe_wait_idle_locked(void) {
+    while (qsp_any_queued(&g_qpipe)) pthread_cond_wait(&g_qpipe_cv, &g_qpipe_mu);
+}
+
+/* Flush hook: the committed batch becomes the last reader of every slot whose
+ * GEMMs it carries. */
+static void ds4_gpu_qpipe_note_commit(id<MTLCommandBuffer> cb) {
+    if (!g_qpipe_started) return;
+    pthread_mutex_lock(&g_qpipe_mu);
+    const unsigned mask = qsp_note_commit(&g_qpipe);
+    for (int i = 0; i < 2; i++) if (mask & (1u << i)) g_qpipe_reader_cb[i] = cb;
+    pthread_mutex_unlock(&g_qpipe_mu);
+}
+
+/* end_commands hook: the host waited for everything committed. */
+static void ds4_gpu_qpipe_note_all_complete(void) {
+    if (!g_qpipe_started) return;
+    pthread_mutex_lock(&g_qpipe_mu);
+    qsp_all_complete(&g_qpipe);
+    g_qpipe_reader_cb[0] = nil;
+    g_qpipe_reader_cb[1] = nil;
+    pthread_mutex_unlock(&g_qpipe_mu);
+}
+
+/* Queue the read of next_layer into slot s behind s's last reader. Main
+ * thread, lock not held; the spare is allocated here when s is 1. */
+static void qpipe_queue(int s, uint32_t next_layer, const uint64_t next_off[3], const void *map, int nocache) {
+    if (s == 1 && !g_qpipe_spare) {
+        id<MTLBuffer> spare = [g_device newBufferWithLength:(NSUInteger)g_qpipe_need
+                                                    options:MTLResourceStorageModeShared];
+        if (!spare) {
+            g_qpipe_disabled = 1;
+            fprintf(stderr, "ds4: qwen4 stage pipe spare buffer allocation failed (%.2f GiB); "
+                    "staging through the union path\n", ds4_gpu_gib(g_qpipe_need));
+            return;
+        }
+        pthread_mutex_lock(&g_qpipe_mu);
+        g_qpipe_spare = spare;
+        pthread_mutex_unlock(&g_qpipe_mu);
+    }
+    pthread_mutex_lock(&g_qpipe_mu);
+    if (g_qpipe.slot[s].state != QSP_QUEUED) {
+        g_qpipe_wait_cb[s] = g_qpipe.slot[s].has_reader ? g_qpipe_reader_cb[s] : nil;
+        qsp_queue(&g_qpipe, s, next_layer, next_off, map, nocache != 0);
+        pthread_cond_broadcast(&g_qpipe_cv);
+    }
+    pthread_mutex_unlock(&g_qpipe_mu);
+}
+
+/* Main thread, no command buffer in flight: stop binding the staged tensors
+ * to the spare, so releasing it frees it. */
+static void qpipe_unbind_spare(void) {
+    if (g_qpipe_spare && g_qwen4_stage.bind_buf == g_qpipe_spare) {
+        g_qwen4_stage.active = 0;
+        g_qwen4_stage.bind_buf = nil;
+    }
+}
+
+void ds4_gpu_qwen4_stream_stage_prompt_end(void) {
+    if (!g_qpipe_started) return;
+    pthread_mutex_lock(&g_qpipe_mu);
+    qpipe_wait_idle_locked();
+    qsp_prompt_end(&g_qpipe);
+    g_qpipe_wait_cb[0] = g_qpipe_wait_cb[1] = nil;
+    g_qpipe_reader_cb[0] = g_qpipe_reader_cb[1] = nil;
+    qpipe_unbind_spare();
+    g_qpipe_spare = nil;
+    pthread_mutex_unlock(&g_qpipe_mu);
+}
+
+static void ds4_gpu_qpipe_shutdown(void) {
+    if (g_qpipe_started) {
+        pthread_mutex_lock(&g_qpipe_mu);
+        g_qpipe_stop = 1;
+        pthread_cond_broadcast(&g_qpipe_cv);
+        pthread_mutex_unlock(&g_qpipe_mu);
+        pthread_join(g_qpipe_thread, NULL);
+    }
+    memset(&g_qpipe, 0, sizeof(g_qpipe));
+    qpipe_unbind_spare();
+    g_qpipe_spare = nil;
+    g_qpipe_wait_cb[0] = g_qpipe_wait_cb[1] = nil;
+    g_qpipe_reader_cb[0] = g_qpipe_reader_cb[1] = nil;
+    if (g_qpipe_nocache_fd >= 0) close(g_qpipe_nocache_fd);
+    g_qpipe_nocache_fd = -1;
+    g_qpipe_started = 0;
+    g_qpipe_stop = 0;
+    g_qpipe_disabled = 0;
+    g_qpipe_need = 0;
+}
+
+int ds4_gpu_qwen4_stream_stage_layer(
+        const void *model_map, uint64_t model_size, uint32_t layer,
+        const ds4_gpu_tensor *selected, uint32_t n_tokens, uint32_t n_slots,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t gate_type, uint32_t down_type,
+        uint32_t n_expert, uint32_t in_dim, uint32_t ff_dim, uint32_t out_dim,
+        uint32_t seed_tokens) {
+    /* The union path writes slot 0: let queued reads finish and drop slot 0's job. */
+    if (g_qpipe_started) {
+        pthread_mutex_lock(&g_qpipe_mu);
+        qpipe_wait_idle_locked();
+        qsp_invalidate(&g_qpipe, 0);
+        pthread_mutex_unlock(&g_qpipe_mu);
+    }
+    const int ok = qwen4_stage_union(model_map, model_size, layer, selected, n_tokens, n_slots,
+                                     gate_offset, up_offset, down_offset, gate_type, down_type,
+                                     n_expert, in_dim, ff_dim, out_dim, seed_tokens);
+    if (ok && g_qpipe_started) {
+        pthread_mutex_lock(&g_qpipe_mu);
+        qsp_activate(&g_qpipe, 0);   /* the batch now encoded reads slot 0 */
+        pthread_mutex_unlock(&g_qpipe_mu);
+    }
+    return ok;
+}
+
+int ds4_gpu_qwen4_stream_stage_layer_pipe(
+        const void *model_map, uint64_t model_size, uint32_t layer,
+        const ds4_gpu_tensor *selected, uint32_t n_tokens, uint32_t n_slots,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t gate_type, uint32_t down_type,
+        uint32_t n_expert, uint32_t in_dim, uint32_t ff_dim, uint32_t out_dim,
+        uint32_t next_layer, uint64_t next_gate_offset, uint64_t next_up_offset,
+        uint64_t next_down_offset, uint32_t next_gate_type, uint32_t next_down_type,
+        int nocache) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const int profile = getenv("DS4_METAL_STREAMING_EXPERT_PREAD_PROFILE") != NULL;
+    /* Same sizes as the union path. */
+    const uint32_t gate_row_bytes = qwen4_expert_row_bytes(gate_type, in_dim);
+    const uint32_t down_dim = (down_type == 10u || down_type == 12u) ? (ff_dim + 255u) / 256u * 256u : ff_dim;
+    const uint32_t down_row_bytes = qwen4_expert_row_bytes(down_type, down_dim);
+    const uint64_t gate_bytes = (uint64_t)gate_row_bytes * ff_dim * n_expert;
+    const uint64_t down_bytes = (uint64_t)down_row_bytes * out_dim * n_expert;
+    const uint64_t need = 2u * gate_bytes + down_bytes;
+    const uint64_t off[3] = { gate_offset, up_offset, down_offset };
+    const uint64_t next_off[3] = { next_gate_offset, next_up_offset, next_down_offset };
+    const bool can_queue = next_layer != UINT32_MAX && next_gate_type == gate_type && next_down_type == down_type;
+    if (g_qpipe_disabled || gate_row_bytes == 0 || down_row_bytes == 0 ||
+        (g_qpipe_need != 0 && g_qpipe_need != need) || !qpipe_start()) {
+        return ds4_gpu_qwen4_stream_stage_layer(model_map, model_size, layer, selected, n_tokens, n_slots,
+                                                gate_offset, up_offset, down_offset, gate_type, down_type,
+                                                n_expert, in_dim, ff_dim, out_dim, 0u);
+    }
+    if (g_qpipe_need != need) {
+        /* First pipe call: the layout every queued read uses from now on (the
+         * reader thread reads these without the lock). */
+        g_qpipe_need = need;
+        g_qpipe_bytes[0] = gate_bytes;
+        g_qpipe_bytes[1] = gate_bytes;
+        g_qpipe_bytes[2] = down_bytes;
+        g_qpipe_region[0] = 0;
+        g_qpipe_region[1] = (NSUInteger)gate_bytes;
+        g_qpipe_region[2] = (NSUInteger)(2u * gate_bytes);
+    }
+
+    pthread_mutex_lock(&g_qpipe_mu);
+    const int s = qsp_find(&g_qpipe, layer, off, model_map);
+    pthread_mutex_unlock(&g_qpipe_mu);
+    if (s < 0) {
+        /* Nothing read ahead (first streamed layer of a prompt, or after a
+         * failure): union path into slot 0, then read the next layer into
+         * slot 1. Everything was drained, so slot 1 has no reader. */
+        const int ok = ds4_gpu_qwen4_stream_stage_layer(model_map, model_size, layer, selected, n_tokens,
+                                                        n_slots, gate_offset, up_offset, down_offset,
+                                                        gate_type, down_type, n_expert, in_dim, ff_dim,
+                                                        out_dim, 0u);
+        if (ok && can_queue && !g_qpipe_disabled) qpipe_queue(1, next_layer, next_off, model_map, nocache);
+        return ok;
+    }
+    /* Keep the GPU busy: commit what is encoded (the flush hook records the
+     * other slot's last reader), queue the next read behind it, then wait for
+     * this layer's read, normally long done. */
+    g_qwen4_stage.active = 0;
+    if (g_batch_cb && !ds4_gpu_flush_commands()) return 0;
+    if (can_queue) qpipe_queue(1 - s, next_layer, next_off, model_map, nocache);
+    const double w0 = ds4_gpu_now_ms();
+    pthread_mutex_lock(&g_qpipe_mu);
+    while (g_qpipe.slot[s].state == QSP_QUEUED) pthread_cond_wait(&g_qpipe_cv, &g_qpipe_mu);
+    const int done = g_qpipe.slot[s].state == QSP_DONE;
+    if (done) qsp_activate(&g_qpipe, s);
+    else qsp_invalidate(&g_qpipe, s);
+    id<MTLBuffer> buf = qpipe_buffer(s);
+    const double read_ms = g_qpipe_read_ms[s], cbwait_ms = g_qpipe_cbwait_ms[s];
+    pthread_mutex_unlock(&g_qpipe_mu);
+    const double wait_ms = ds4_gpu_now_ms() - w0;
+    if (!done) {
+        return ds4_gpu_qwen4_stream_stage_layer(model_map, model_size, layer, selected, n_tokens, n_slots,
+                                                gate_offset, up_offset, down_offset, gate_type, down_type,
+                                                n_expert, in_dim, ff_dim, out_dim, 0u);
+    }
+    g_qwen4_stage.bind_buf = buf;
+    g_qwen4_stage.map = model_map;
+    for (int t = 0; t < 3; t++) {
+        g_qwen4_stage.off[t] = off[t];
+        g_qwen4_stage.bytes[t] = g_qpipe_bytes[t];
+        g_qwen4_stage.region[t] = g_qpipe_region[t];
+    }
+    g_qwen4_stage.active = 1;
+    if (profile) {
+        fprintf(stderr, "ds4: qwen4 pipe layer=%u tokens=%u slot=%d wait=%.3f ms read=%.3f ms cbwait=%.3f ms\n",
+                layer, n_tokens, s, wait_ms, read_ms, cbwait_ms);
+    }
+    return 1;
 }
 
 /*

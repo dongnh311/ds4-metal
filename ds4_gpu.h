@@ -3615,6 +3615,23 @@ void ds4_gpu_qwen4_stream_stage_clear(void);
  * before macOS 15 or when the set cannot be built. */
 void ds4_gpu_prefill_residency_begin(void);
 void ds4_gpu_prefill_residency_end(void);
+/* qwen4 prefill staging pipe (DS4_QWEN4_PREFILL_MODE): stage `layer` from a
+ * whole-layer read queued by the previous call, without draining the GPU, and
+ * queue the read of next_layer (UINT32_MAX: none) into the other buffer. Falls
+ * back to ds4_gpu_qwen4_stream_stage_layer when nothing was queued for `layer`
+ * or the read failed. The kernels see the same bytes at the same offsets. */
+int ds4_gpu_qwen4_stream_stage_layer_pipe(
+        const void *model_map, uint64_t model_size, uint32_t layer,
+        const ds4_gpu_tensor *selected, uint32_t n_tokens, uint32_t n_slots,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t gate_type, uint32_t down_type,
+        uint32_t n_expert, uint32_t in_dim, uint32_t ff_dim, uint32_t out_dim,
+        uint32_t next_layer, uint64_t next_gate_offset, uint64_t next_up_offset,
+        uint64_t next_down_offset, uint32_t next_gate_type, uint32_t next_down_type,
+        int nocache);
+/* The prompt ended or was abandoned: wait for queued reads, forget them, and
+ * release the spare staging buffer. No-op until the pipe has run. */
+void ds4_gpu_qwen4_stream_stage_prompt_end(void);
 int ds4_gpu_qwen4_moe_mid_grouped_tensor(
         ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts, uint32_t list_cap,
