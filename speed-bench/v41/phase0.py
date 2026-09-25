@@ -46,7 +46,7 @@ SWAP_LIMIT_MIB = 256.0
 DECODE_MARGIN_S = 1.0
 FIELDS = ["workload", "ctx", "cache_gb", "gen", "prefill_tps", "gen_tps", "gen_steady_tps",
           "gen_first_ms", "step_ms", "gpu_busy_ms", "pread_ms", "engram_ms", "host_gap_ms",
-          "readahead_ms", "host_ms",
+          "readahead_ms", "host_ms", "la_issued_per_tok", "la_used_per_tok", "la_dropped",
           "pread_mib", "hits", "misses", "decode_hit_rate", "cache_experts", "cache_hit_rate",
           "wired_steady_gib", "wired_peak_gib", "wired_window", "wired_idle_gib",
           "swap_delta_mib", "contaminated", "router_log"]
@@ -98,6 +98,17 @@ TIMING_RE = re.compile(r"streaming expert timing total .*?readahead_total=([\d.]
 def parse_readahead(text):
     rows = TIMING_RE.findall(text)
     return float(rows[-1]) if rows else None
+
+
+LOOKAHEAD_RE = re.compile(r"ds4: V4\.1 lookahead: posted (\d+) dropped (\d+) predicted (\d+) "
+                          r"issued (\d+) used (\d+)")
+
+
+def parse_lookahead(text):
+    rows = LOOKAHEAD_RE.findall(text)
+    if not rows:
+        return None
+    return dict(zip(("posted", "dropped", "predicted", "issued", "used"), (int(x) for x in rows[-1])))
 
 
 def parse_profile(text):
@@ -235,6 +246,12 @@ def run_one(bin_dir, model, prompts_dir, out_dir, spec, dry_run=False,
     if ra is not None and row.get("host_gap_ms") is not None and gen > 0:
         row["readahead_ms"] = ra / gen
         row["host_ms"] = row["host_gap_ms"] - row["readahead_ms"]
+    la = parse_lookahead(stderr)
+    tokens = (parse_profile(stderr) or {}).get("tokens")
+    if la and tokens:
+        row["la_issued_per_tok"] = la["issued"] / tokens
+        row["la_used_per_tok"] = la["used"] / tokens
+        row["la_dropped"] = la["dropped"]
     tmp_path = result_path + ".tmp"
     with open(tmp_path, "w") as fp:
         json.dump(row, fp, indent=1)

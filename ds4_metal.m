@@ -13334,6 +13334,18 @@ uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
     return budget;
 }
 
+/* V4.1 lookahead prefetch asks whether an expert is cached before warming
+ * its pages. A relaxed read from another thread: a stale answer costs one
+ * redundant or one missing advisory read, never correctness. */
+int ds4_gpu_stream_expert_cache_resident_hint(uint32_t layer, uint32_t expert) {
+    if (!g_ssd_streaming_mode ||
+        layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        expert >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
+        return 0;
+    }
+    return __atomic_load_n(&g_stream_expert_cache[layer][expert].valid, __ATOMIC_RELAXED) != 0;
+}
+
 uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
     return g_stream_expert_cache_entry_count;
 }

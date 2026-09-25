@@ -1,0 +1,49 @@
+{
+ "label": "la-k2",
+ "a_tps": 12.17,
+ "b_tps": 11.495000000000001,
+ "ratio": 0.9445357436318818,
+ "runs": {
+  "a": [
+   12.29,
+   12.05
+  ],
+  "b": [
+   11.57,
+   11.42
+  ]
+ },
+ "terms": {
+  "a": {
+   "step_ms": 82.49350000000001,
+   "gpu_busy_ms": 56.918000000000006,
+   "pread_ms": 13.2895,
+   "readahead_ms": 8.7384853515625,
+   "host_ms": 2.995514648437501,
+   "decode_hit_rate": 0.8711249999999999,
+   "wired_steady_gib": 41.08048629760742,
+   "la_issued_per_tok": 38.9384765625,
+   "la_used_per_tok": 11.8505859375
+  },
+  "b": {
+   "step_ms": 87.3895,
+   "gpu_busy_ms": 63.161,
+   "pread_ms": 13.983,
+   "readahead_ms": 7.2447880859375005,
+   "host_ms": 2.4562119140625005,
+   "decode_hit_rate": 0.8711249999999999,
+   "wired_steady_gib": 41.07322311401367,
+   "la_issued_per_tok": 77.45703125,
+   "la_used_per_tok": 16.0615234375
+  }
+ },
+ "contaminated": false,
+ "a_env": {},
+ "b_env": {
+  "DS4_METAL_V41_LOOKAHEAD_K": "2"
+ },
+ "a_cache": null,
+ "b_cache": null,
+ "ctx": 8192,
+ "workload": "switch"
+}

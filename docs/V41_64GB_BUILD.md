@@ -73,6 +73,12 @@ Non-goals: big-machine / TP (Ivan's lane); rebuilding the Q2 GGUF ourselves
   threshold stays at 3, and the auto cache is unchanged. The >= 12 t/s
   sub-project target was not met.
   Results: `speed-bench/v41/pipeline-20260924/RESULTS.md`.
+- **Lookahead prefetch into the page cache, 2026-09-25:**
+  - Layer L+1's router runs on layer L's FFN input.
+  - The first uncached guess per layer gets `F_RDADVISE`.
+  - Gain: ×1.08-1.09 at ctx 8K, bit-exact.
+  - Shipped defaults: 12.00 t/s mean over 6 runs (11.48-12.29), against 8.89 for the Phase-0 configuration.
+  - Results: `speed-bench/v41/lookahead-20260925/RESULTS.md`.
 - **Branches:** work on `feature/ds4.1-flash` (off `develop`), merge to
   `develop`, deploy only via `prod/<feature>-YYYYMMDD` cut from `develop`
   (`deploy-ai-gateway.sh`). v1's `main` / `scallop` wording is retired:

@@ -378,6 +378,8 @@ int ds4_gpu_qwen4_batch_mm_q8_tensor(
         uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows);
 uint64_t ds4_gpu_recommended_working_set_size(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
+/* Relaxed "is this expert cached" query for prefetch hints (0 outside SSD streaming). */
+int ds4_gpu_stream_expert_cache_resident_hint(uint32_t layer, uint32_t expert);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
 typedef struct ds4_gpu_stream_expert_table {
     const void *model_map;
