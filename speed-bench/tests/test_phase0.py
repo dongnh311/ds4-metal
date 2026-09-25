@@ -334,6 +334,13 @@ class ReportTest(unittest.TestCase):
 
 
 class AbHelpersTest(unittest.TestCase):
+    def test_parse_lookahead_takes_last_line(self):
+        text = ("ds4: V4.1 lookahead: posted 10 dropped 0 predicted 10 issued 3 used 1\n"
+                "ds4: V4.1 lookahead: posted 4992 dropped 12 predicted 4980 issued 1500 used 480\n")
+        self.assertEqual(phase0.parse_lookahead(text),
+                         {"posted": 4992, "dropped": 12, "predicted": 4980, "issued": 1500, "used": 480})
+        self.assertIsNone(phase0.parse_lookahead("nothing"))
+
     def test_report_orders_auto_cache_rows(self):
         base = {"workload": "switch", "ctx": 8192, "gen": 512, "gen_steady_tps": 9.0,
                 "contaminated": False, "swap_delta_mib": 0.0}

@@ -20,7 +20,7 @@ import phase0  # noqa: E402
 
 ORDER = ("a", "b", "b", "a")
 TERMS = ("step_ms", "gpu_busy_ms", "pread_ms", "readahead_ms", "host_ms",
-         "decode_hit_rate", "wired_steady_gib")
+         "decode_hit_rate", "wired_steady_gib", "la_issued_per_tok", "la_used_per_tok")
 
 
 def parse_env(items):

@@ -15,6 +15,10 @@ def row(tps, **kw):
 
 
 class AbTest(unittest.TestCase):
+    def test_terms_include_lookahead(self):
+        self.assertIn("la_issued_per_tok", ab.TERMS)
+        self.assertIn("la_used_per_tok", ab.TERMS)
+
     def test_order_suffixes_and_ratio(self):
         calls = []
 
