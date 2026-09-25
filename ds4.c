@@ -58277,6 +58277,9 @@ typedef struct ds4_qwen4_gpu_graph {
     /* Set by the prefill loops for the prompt's last chunk: staged streamed
      * layers then seed the decode expert cache from its final tokens. */
     bool stream_seed_last;
+    /* Ornith (qwen35moe) gates the GDN output with silu(z); Qwen3.8 with
+     * sigmoid(z).  qwen4_graph_alloc's memset leaves it false. */
+    bool gdn_silu;
 } ds4_qwen4_gpu_graph;
 
 static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
@@ -59266,6 +59269,12 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
     }
     sub_seal(SUB_GDN_SCAN);
     if (ok) {
+#ifdef DS4_HAS_QWEN4_METAL
+        if (g->gdn_silu)
+            ok = ds4_gpu_qwen35_gdn_out_tensor(g->lin_o, g->z, m->map, m->size, l->lin_norm->abs_offset, T,
+                                               DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS) != 0;
+        else
+#endif
         ok = ds4_gpu_qwen4_gdn_out_tensor(g->lin_o, g->z, m->map, m->size, l->lin_norm->abs_offset, T,
                                           DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS) != 0;
     }
@@ -60565,6 +60574,10 @@ static int generate_qwen4_metal_argmax(
     return 0;
 }
 
+#ifdef DS4_HAS_QWEN4_METAL
+#include "ds4_qwen35moe.inc"
+#endif
+
 #endif
 
 #ifndef DS4_NO_GPU
@@ -60608,6 +60621,13 @@ static int generate_metal_graph_raw_swa(
                                            emit, done, emit_ud, progress, progress_ud);
     }
 #endif
+#ifdef DS4_HAS_QWEN4_METAL
+    if (ds4_model_is_qwen35moe()) {
+        return generate_qwen35_metal_argmax(model, vocab, weights, prompt, n_predict, ctx_size, prefill_chunk,
+                                            emit, done, emit_ud, progress, progress_ud);
+    }
+#endif
+    ds4_qwen35_not_reached("one-shot generation");
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (power_percent > 0 && power_percent < 100) {
             fprintf(stderr, "ds4: --power is not supported by the GLM Metal path yet\n");
