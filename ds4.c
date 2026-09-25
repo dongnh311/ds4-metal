@@ -8517,6 +8517,109 @@ static DS4_MAYBE_UNUSED bool qwen4_stream_expert_cache_addr_layout_supported(
     return weights_streaming_layer_experts_uniform(w, il);
 }
 
+/* Prefill residency and staging pipe (DS4_QWEN4_PREFILL_MODE=off|safe|max),
+ * docs/superpowers/specs/2026-09-25-qwen4-prefill-residency-pipe-design.md.
+ * off: as before. max: residency set on prefill command buffers and the
+ * double-buffered staging pipe on every chunk of a prompt. safe: both on all
+ * but the prompt's last chunk (pipe reads bypass the page cache), so decode
+ * starts with the page cache the union path leaves behind. */
+typedef enum {
+    QWEN4_PREFILL_OFF = 0,
+    QWEN4_PREFILL_SAFE,
+    QWEN4_PREFILL_MAX,
+} qwen4_prefill_mode;
+
+/* Set only by the CLI and server prompt loops; every other forward is NONE. */
+typedef enum {
+    QWEN4_PREFILL_ROLE_NONE = 0,
+    QWEN4_PREFILL_ROLE_MIDDLE,
+    QWEN4_PREFILL_ROLE_LAST,
+} qwen4_prefill_role;
+
+typedef struct {
+    bool residency;
+    bool pipe;
+    bool pipe_nocache;
+} qwen4_prefill_flags;
+
+/* Rows above which prefill MoE takes the tiled GEMMs (and a streamed layer is
+ * staged); below it the per-token expert path wins. */
+static uint32_t qwen4_moe_mm_min(void) {
+#ifdef DS4_HAS_QWEN4_METAL
+    return 64u;
+#else
+    return 8u;
+#endif
+}
+
+static qwen4_prefill_mode qwen4_prefill_mode_parse(const char *s) {
+    if (s && !strcmp(s, "safe")) return QWEN4_PREFILL_SAFE;
+    if (s && !strcmp(s, "max")) return QWEN4_PREFILL_MAX;
+    return QWEN4_PREFILL_OFF;
+}
+
+/* Read once per process, like the other qwen4 streaming knobs. The helpers
+ * below are unused on builds without the Metal qwen4 graph. */
+static DS4_MAYBE_UNUSED qwen4_prefill_mode qwen4_prefill_mode_env(void) {
+    static int mode = -1;
+    if (mode < 0) mode = (int)qwen4_prefill_mode_parse(getenv("DS4_QWEN4_PREFILL_MODE"));
+    return (qwen4_prefill_mode)mode;
+}
+
+static DS4_MAYBE_UNUSED qwen4_prefill_flags qwen4_prefill_policy(qwen4_prefill_mode mode, qwen4_prefill_role role,
+                                                                 uint32_t T, bool streaming) {
+    qwen4_prefill_flags f = {false, false, false};
+    if (mode == QWEN4_PREFILL_OFF || role == QWEN4_PREFILL_ROLE_NONE ||
+        T <= qwen4_moe_mm_min() || !streaming) {
+        return f;
+    }
+    if (mode == QWEN4_PREFILL_MAX) {
+        f.residency = true;
+        f.pipe = true;
+    } else if (role == QWEN4_PREFILL_ROLE_MIDDLE) {
+        f.residency = true;
+        f.pipe = true;
+        f.pipe_nocache = true;
+    }
+    return f;
+}
+
+/* True when this chunk ends the prompt for the pipe: the last chunk (staged
+ * or not) or a failed one. The pipe then drops queued reads and its spare. */
+static DS4_MAYBE_UNUSED bool qwen4_prefill_prompt_ends(qwen4_prefill_mode mode, qwen4_prefill_role role,
+                                                       bool ok, bool streaming) {
+    if (mode == QWEN4_PREFILL_OFF || role == QWEN4_PREFILL_ROLE_NONE || !streaming) return false;
+    return role == QWEN4_PREFILL_ROLE_LAST || !ok;
+}
+
+/* Seeding the decode cache reads `selected` on the host, which only the
+ * union path does. */
+static DS4_MAYBE_UNUSED bool qwen4_prefill_use_pipe(qwen4_prefill_flags flags, uint32_t seed_tokens) {
+    return flags.pipe && seed_tokens == 0;
+}
+
+/* The streamed layer staged after `layer` (UINT32_MAX: none): the next one in
+ * `list`; after the last one, the first one again for the next chunk, unless
+ * this chunk ends the prompt. */
+static DS4_MAYBE_UNUSED uint32_t qwen4_stream_next_staged(const uint32_t *list, uint32_t n, uint32_t layer,
+                                                          qwen4_prefill_role role) {
+    for (uint32_t i = 0; i < n; i++) {
+        if (list[i] != layer) continue;
+        if (i + 1u < n) return list[i + 1u];
+        return role == QWEN4_PREFILL_ROLE_LAST ? UINT32_MAX : list[0];
+    }
+    return UINT32_MAX;
+}
+
+/* Streamed layers in ascending order; returns how many (at most cap). */
+static DS4_MAYBE_UNUSED uint32_t qwen4_stream_layer_list(const ds4_weights *w, uint32_t *out, uint32_t cap) {
+    uint32_t n = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER && n < cap; il++) {
+        if (qwen4_stream_expert_cache_addr_layout_supported(w, &w->layer[il], il)) out[n++] = il;
+    }
+    return n;
+}
+
 static void model_map_span_vec_include_layer_decode(
         ds4_model_map_span_vec *spans,
         const ds4_weights      *w,
@@ -60395,11 +60498,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
      * choices each over 512 experts, so an expert averages a third of a token
      * and the tiles run nearly empty.  Above this row count the GEMM wins;
      * below it the per-token expert path does, by 4% at sixteen rows. */
-#ifdef DS4_HAS_QWEN4_METAL
-    const uint32_t mm_min = 64u;
-#else
-    const uint32_t mm_min = 8u;
-#endif
+    const uint32_t mm_min = qwen4_moe_mm_min();
     /* Under --ssd-streaming only the layers whose experts the cache serves lack
      * mapped model views, and the span planner decides that with the same
      * predicate. Pinned and off-class layers keep their views, so they take the
