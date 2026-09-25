@@ -1,0 +1,49 @@
+{
+ "label": "la-k1-auto-rep",
+ "a_tps": 11.335,
+ "b_tps": 12.204999999999998,
+ "ratio": 1.0767534186149093,
+ "runs": {
+  "a": [
+   11.31,
+   11.36
+  ],
+  "b": [
+   12.29,
+   12.12
+  ]
+ },
+ "terms": {
+  "a": {
+   "step_ms": 88.5695,
+   "gpu_busy_ms": 55.495000000000005,
+   "pread_ms": 13.36,
+   "readahead_ms": 15.198541015625,
+   "host_ms": 3.9529589843749964,
+   "decode_hit_rate": 0.8711249999999999,
+   "wired_steady_gib": 41.09767150878906,
+   "la_issued_per_tok": 0.0,
+   "la_used_per_tok": 0.0
+  },
+  "b": {
+   "step_ms": 82.309,
+   "gpu_busy_ms": 56.3965,
+   "pread_ms": 13.2405,
+   "readahead_ms": 9.0269814453125,
+   "host_ms": 3.0880185546875047,
+   "decode_hit_rate": 0.8711249999999999,
+   "wired_steady_gib": 41.085227966308594,
+   "la_issued_per_tok": 38.9375,
+   "la_used_per_tok": 11.8486328125
+  }
+ },
+ "contaminated": false,
+ "a_env": {
+  "DS4_METAL_DISABLE_V41_LOOKAHEAD": "1"
+ },
+ "b_env": {},
+ "a_cache": null,
+ "b_cache": null,
+ "ctx": 8192,
+ "workload": "switch"
+}
