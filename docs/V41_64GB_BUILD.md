@@ -1,5 +1,9 @@
 # DeepSeek-V4.1-Flash on M5 Pro 64 GB — Performance Build Spec (v2)
 
+> **FROZEN 2026-09-25.** V4.1 is kept as a research and benchmark reference,
+> not a production target. See §0 for the final state, the two closing spikes
+> and the criteria for re-opening.
+
 Build a **fast SSD-streamed, router-first** DeepSeek-V4.1-Flash Q2 runtime
 profile for a single **M5 Pro / 64 GB / 1 TB SSD** box (single-stream agent
 workload: Claude Code / Codex), **while treating the existing Qwen3.8
@@ -44,6 +48,55 @@ Non-goals: big-machine / TP (Ivan's lane); rebuilding the Q2 GGUF ourselves
 
 ## 0. Status
 
+- **FROZEN 2026-09-25 (user decision).** Effort moves back to Qwen3.8-Flash-Next
+  (PROD: 51.6 GiB, about 35-44 t/s, 256K context, zero swap).
+  - **Final state:** `develop` `2a910dc`. Shipped defaults decode at 12.1 t/s
+    (ctx 8K; auto cache, queued layers, async load, #1042 fusions, lookahead
+    k = 1), bit-exact against the Phase-0 path.
+  - **Why:**
+    - 20 t/s needs the miss path hidden, about 10 ms less GPU time, and
+      MTP/DSpark.
+    - No measured quality edge over Qwen on the agent workload.
+    - The GGUF takes 341 GiB of the 1 TB disk.
+  - **Spike 1, smaller routed experts** (CPU cache simulator on 1100-token
+    router logs, byte budget of today's 28.5 GiB decode cache):
+    - The artifact is 188.8 GiB Engram (SSD-only, about 0.6 ms/token), 142.4
+      GiB routed experts and 9.4 GiB resident.
+    - All-IQ1_M experts are still about 111 GiB, all-IQ1_S about 99 GiB, so
+      decode keeps streaming.
+    - Predicted decode: IQ1_M or ternary 13.2-14.1 t/s; IQ1_S 13.6-15.0; hot
+      experts IQ2 and the rest ternary 12.7-13.8.
+    - Hotness ranked on one workload covers another's selections almost at
+      random.
+    - Oracles from the measured terms:
+      - no miss on the critical path: 16.6 t/s;
+      - every miss already in the page cache: 13.6;
+      - GPU at the 38.4 ms byte floor: 15.6;
+      - no miss and the GPU at the byte floor: 23.9.
+  - **Spike 2, approach-2 staging by top-k:**
+    - A layer with at least one miss costs about 1.055 ms whatever its miss
+      count, because the pread pool reads in parallel.
+    - Top-1 to top-6 staging covers every miss of 31-66 % of those layers.
+      That gives 13.2-14.8 t/s if every staged read lands in time. With the
+      measured 10 GB/s random SSD reads and a ~1.27 ms window per layer, it
+      gives 12.5 t/s at top-1, falling to 4.6 at top-6 (wasted reads).
+    - A perfect one-layer predictor reaches 16.4 t/s ideal, 13.8 when bound by
+      the SSD. Layer 0 is never predictable.
+    - An infinite cache removes 76 % of the layers with a miss, so misses are
+      mostly a capacity problem.
+    - Letting decode use the idle 7.12 GiB prefill reserve gives 12.7-12.8
+      t/s; a 40 GiB cache gives 13.0-13.1.
+  - The spike simulators were throwaway and are not in the repo.
+  - **GGUF deleted from disk 2026-09-25.** Re-download it with
+    `./download_model.sh ds41f-q2`; its SHA-256 is pinned in
+    `speed-bench/v41/phase0-20260924/RESULTS.md`.
+  - **Re-open only if:**
+    - V4.1 gets MTP/DSpark with measured acceptance and a real speedup;
+    - upstream hides most of the streaming miss path;
+    - DS4.1 measurably beats Qwen on the agent tasks.
+  - **Levers in order, if re-opened:** decode use of the prefill reserve or a
+    40 GiB cache, top-1 staging into cache slots, GPU MoE and attention
+    kernels, then MTP/DSpark.
 - **Upstream sync done 2026-09-23** on `feature/ds4.1-flash`: `ec56a05` merges
   `antirez/main` 0aaea5a (25 commits), `d3bf293` merges Ivan's
   `ds41f-nondspark-optimizations` 4f9a2e0. Ivan's `main` had nothing newer
@@ -57,8 +110,8 @@ Non-goals: big-machine / TP (Ivan's lane); rebuilding the Q2 GGUF ourselves
   parameters that default to the old behavior; the new softplus series only
   reaches the DS4/V4.1/GLM router). Qwen-visible change: `d31089d` fixes Qwen
   tool-content streaming in `ds4_server.c`.
-- **Disk:** the Q2 GGUF (341 GiB) is downloaded to
-  `~/orca/workspaces/ds4-metal-data/gguf/`. About 65 GiB stays free (the unc31
+- **Disk:** the Q2 GGUF (341 GiB) was downloaded to
+  `~/orca/workspaces/ds4-metal-data/gguf/` (deleted at the freeze, 2026-09-25). About 65 GiB stays free (the unc31
   Qwen GGUF was removed; it is on HF). Keep ≥ 40 GiB free: macOS swap files
   live on the same disk.
 - **Phase 0(b) DONE 2026-09-24:** Qwen baseline and full tier green; Q2
