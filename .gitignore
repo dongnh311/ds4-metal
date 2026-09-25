@@ -47,3 +47,8 @@ __pycache__/
 /speed-bench/kv-gate/*.stderr
 /speed-bench/kv-gate/*/frontier_*.json
 speed-bench/fp8-flat-gate/
+
+# Ornith (qwen35moe) run artefacts: keep RESULTS.md and compare output only
+speed-bench/ornith/*/ds4/
+speed-bench/ornith/*/logs/
+speed-bench/ornith/oracle/ref-cpu/
