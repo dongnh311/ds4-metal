@@ -143,7 +143,7 @@ def main():
                         {"role": "user", "content": "Now list the next five primes."}]
         chat(srv.base, turn2)
         log = srv.new_log()
-        starts = re.findall(r"chat ctx=(\d+)\.\.\d+:\d+ prompt start", log)
+        starts = re.findall(r"chat ctx=(\d+)\.\.\d+:\d+(?: [A-Z_]+)* prompt start", log)
         check(bool(starts) and int(starts[0]) > 0 and "live kv cache miss" not in log,
               "3 next turn reuses the live prefix")
         # 4. request budget lower than the server cap (Anthropic)

@@ -34,8 +34,11 @@ VI_PROMPTS = [
 
 def prod_command(port, kv_dir, budget):
     reg = json.loads(REGISTRY.read_text())
-    rt = next(m["runtimes"]["ds4"] for m in reg["models"].values()
-              if m.get("runtimes", {}).get("ds4", {}).get("enabled"))
+    enabled = [m["runtimes"]["ds4"] for m in reg["models"].values()
+               if m.get("runtimes", {}).get("ds4", {}).get("enabled")]
+    if len(enabled) != 1:
+        raise SystemExit(f"expected exactly one enabled ds4 runtime in {REGISTRY}, found {len(enabled)}")
+    rt = enabled[0]
     cmd = list(rt["process_command"])
     for i, a in enumerate(cmd):
         if a == "--port":
