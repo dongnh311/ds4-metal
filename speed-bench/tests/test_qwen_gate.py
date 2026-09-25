@@ -243,5 +243,97 @@ class SpeedAbTest(unittest.TestCase):
         self.assertIn("paired A/B", failures[0])
 
 
+class LongPromptsTest(unittest.TestCase):
+    def test_distinct_slices_per_server_and_request(self):
+        filler = "".join(str(i) for i in range(200_000))   # ~1.09M chars, no repeating slice
+        seen = []
+        for index in range(len(qwen_gate.AB_ORDER)):
+            prompts = qwen_gate.long_prompts(filler, index)
+            self.assertEqual(set(prompts), {"long", "medium"})
+            for name, chars in qwen_gate.LONG_REQUESTS:
+                self.assertTrue(prompts[name].endswith(qwen_gate.LONG_QUESTION))
+                self.assertEqual(len(prompts[name]), chars + len(qwen_gate.LONG_QUESTION))
+                seen.append(prompts[name])
+        self.assertEqual(len(seen), len(set(seen)))
+
+    def test_short_filler_rejected(self):
+        with self.assertRaises(ValueError):
+            qwen_gate.long_prompts("x" * 1000, 0)
+
+
+class SseTimingsTest(unittest.TestCase):
+    def test_first_and_last_delta_and_usage(self):
+        events = [
+            (0.5, {"choices": [{"delta": {"role": "assistant"}}]}),
+            (2.0, {"choices": [{"delta": {"reasoning_content": "hm"}}]}),
+            (3.0, {"choices": [{"delta": {"content": "ok"}}]}),
+            (3.1, {"choices": [], "usage": {"prompt_tokens": 1000, "completion_tokens": 11}}),
+        ]
+        t = qwen_gate.sse_timings(events)
+        self.assertEqual((t["prompt_tokens"], t["completion_tokens"]), (1000, 11))
+        self.assertAlmostEqual(t["ttft_s"], 2.0)
+        self.assertAlmostEqual(t["decode_s"], 1.0)
+        r = qwen_gate.request_rates(t)
+        self.assertAlmostEqual(r["prefill_tps"], 500.0)
+        self.assertAlmostEqual(r["decode_tps"], 10.0)
+
+    def test_no_delta_is_an_error(self):
+        with self.assertRaises(ValueError):
+            qwen_gate.sse_timings([(1.0, {"choices": [], "usage": {}})])
+
+
+def _rates(prefill, decode):
+    return {name: {"prefill_tps": prefill, "decode_tps": decode} for name, _ in qwen_gate.LONG_REQUESTS}
+
+
+class LongAbTest(unittest.TestCase):
+    def test_interleaved_order_and_index(self):
+        calls = []
+        ab = qwen_gate.long_ab(lambda which, index: calls.append((which, index)) or _rates(1, 1))
+        self.assertEqual(calls, [(w, i) for i, w in enumerate(qwen_gate.AB_ORDER)])
+        self.assertEqual(len(ab["prod"]), 2)
+        self.assertEqual(len(ab["branch"]), 2)
+
+    def test_pass_when_decode_holds_and_prefill_gains(self):
+        ab = {"prod": [_rates(400, 36), _rates(420, 37)], "branch": [_rates(560, 36), _rates(580, 36.5)]}
+        summary = qwen_gate.long_ab_summary(ab)
+        self.assertAlmostEqual(summary["long"]["prefill_ratio"], 1140 / 820)
+        self.assertEqual(qwen_gate.long_ab_failures(summary), [])
+
+    def test_decode_below_floor_fails_per_request(self):
+        ab = {"prod": [_rates(400, 36)] * 2, "branch": [_rates(560, 34)] * 2}
+        failures = qwen_gate.long_ab_failures(qwen_gate.long_ab_summary(ab))
+        self.assertEqual(len(failures), len(qwen_gate.LONG_REQUESTS))
+        self.assertIn("decode", failures[0])
+
+    def test_small_prefill_gain_fails(self):
+        ab = {"prod": [_rates(400, 36)] * 2, "branch": [_rates(420, 36)] * 2}
+        failures = qwen_gate.long_ab_failures(qwen_gate.long_ab_summary(ab))
+        self.assertEqual(len(failures), 1)
+        self.assertIn("prefill", failures[0])
+
+
+class LongRunTest(unittest.TestCase):
+    def test_mode_env_only_on_the_branch(self):
+        seen = []
+
+        def fake_measure(bin_dir, out, tag, port, index, env=None):
+            seen.append((bin_dir, env))
+            return _rates(1, 1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            orig = qwen_gate.measure_long_server
+            qwen_gate.measure_long_server = fake_measure
+            try:
+                qwen_gate.run_long("/work", tmp, "max", ds4_running=lambda: "", idle_read=lambda: FREE_VM_STAT)
+            finally:
+                qwen_gate.measure_long_server = orig
+            with open(os.path.join(tmp, "longab.json")) as fp:
+                saved = json.load(fp)
+        self.assertEqual(seen[0], (None, None))
+        self.assertEqual(seen[1], ("/work", {"DS4_QWEN4_PREFILL_MODE": "max"}))
+        self.assertEqual(saved["prefill_mode"], "max")
+
+
 if __name__ == "__main__":
     unittest.main()
