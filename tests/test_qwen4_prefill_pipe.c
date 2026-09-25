@@ -78,7 +78,7 @@ static void check_next_staged(void) {
 static void check_pipe_order(void) {
     qsp_state p = {0};
     const uint64_t a[3] = {1, 2, 3}, b[3] = {4, 5, 6};
-    int map;
+    int map = 0;
     CHECK(qsp_next_queued(&p) == -1);
     qsp_queue(&p, 1, 33, a, &map, false);
     qsp_queue(&p, 0, 34, b, &map, true);
@@ -95,7 +95,7 @@ static void check_pipe_match(void) {
     qsp_state p = {0};
     const uint64_t a[3] = {1, 2, 3};
     uint64_t other[3] = {1, 2, 3};
-    int map1, map2;
+    int map1 = 0, map2 = 0;
     CHECK(qsp_find(&p, 33, a, &map1) == -1);   /* idle slots never match */
     qsp_queue(&p, 0, 33, a, &map1, false);
     CHECK(qsp_find(&p, 33, a, &map1) == 0);    /* queued matches: the caller waits */
@@ -115,7 +115,7 @@ static void check_pipe_match(void) {
 static void check_pipe_readers(void) {
     qsp_state p = {0};
     const uint64_t a[3] = {1, 2, 3};
-    int map;
+    int map = 0;
     qsp_queue(&p, 0, 33, a, &map, false);
     qsp_finish(&p, 0, true);
     qsp_activate(&p, 0);
@@ -135,7 +135,7 @@ static void check_pipe_readers(void) {
 static void check_pipe_prompt_end(void) {
     qsp_state p = {0};
     const uint64_t a[3] = {1, 2, 3}, b[3] = {4, 5, 6};
-    int map;
+    int map = 0;
     /* an abandoned prompt: a finished wrap read and a consumed slot with a reader */
     qsp_queue(&p, 0, 32, a, &map, false);
     qsp_queue(&p, 1, 47, b, &map, false);
