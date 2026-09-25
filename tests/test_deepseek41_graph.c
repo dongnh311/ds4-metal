@@ -2340,6 +2340,73 @@ done:
 }
 #endif
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* Lookahead prefetch core: K parsing, the scorer's top-k, the byte ranges
+ * (same as graph_stream_expert_table_make), the one-slot mailbox, and the
+ * residency hint outside streaming. Model-free. */
+static int check_v41_lookahead_units(void) {
+    int rc = 1;
+    static ds41_la_job a, b, got;
+    ds41_la_mailbox mb;
+    /* K: default 1, 0..6, garbage -> 1. */
+    unsetenv("DS4_METAL_V41_LOOKAHEAD_K");
+    REQUIRE(ds41_la_k() == 1);
+    setenv("DS4_METAL_V41_LOOKAHEAD_K", "0", 1); REQUIRE(ds41_la_k() == 0);
+    setenv("DS4_METAL_V41_LOOKAHEAD_K", "4", 1); REQUIRE(ds41_la_k() == 4);
+    setenv("DS4_METAL_V41_LOOKAHEAD_K", "9", 1); REQUIRE(ds41_la_k() == 6);
+    setenv("DS4_METAL_V41_LOOKAHEAD_K", "x", 1); REQUIRE(ds41_la_k() == 1);
+    unsetenv("DS4_METAL_V41_LOOKAHEAD_K");
+    /* Scorer: 5 experts, 2-wide rows. logits = w . x with x = (1, 1). */
+    {
+        const float w[10] = { 1, 0,   3, 0,   -30, 0,   3, 0,   2, 0 };
+        const float bias[5] = { 0, 0, 0, 0, 0.5f };
+        const float x[2] = { 1, 1 };
+        int32_t out[6];
+        /* logits 1, 3, -30, 3, 2; scores sqrt(softplus(l)) + bias:
+         * e0 1.146, e1 1.746, e2 ~0, e3 1.746 (tie with e1 -> e1 first),
+         * e4 1.458 + 0.5 = 1.958. Order: 4, 1, 3, 0, 2. */
+        REQUIRE(ds41_la_topk(w, bias, x, 5, 2, 3, out) == 3);
+        REQUIRE(out[0] == 4 && out[1] == 1 && out[2] == 3);
+        REQUIRE(ds41_la_topk(w, bias, x, 5, 2, 0, out) == 0);
+        REQUIRE(ds41_la_topk(w, bias, x, 5, 2, 6, out) == 5);
+        REQUIRE(out[3] == 0 && out[4] == 2);
+    }
+    /* Ranges: the same offsets graph_stream_expert_table_make produces. */
+    {
+        ds4_tensor gate = {.abs_offset = 1000}, up = {.abs_offset = 50000}, down = {.abs_offset = 90000};
+        ds4_layer_weights l = {0};
+        ds4_model m = {.fd = -1};
+        l.ffn_gate_exps = &gate; l.ffn_up_exps = &up; l.ffn_down_exps = &down;
+        const ds4_gpu_stream_expert_table t = graph_stream_expert_table_make(&m, &l, 3, 120, 70);
+        ds41_la_job j = {.gate_offset = t.gate_offset, .up_offset = t.up_offset,
+                         .down_offset = t.down_offset, .gate_bytes = t.gate_expert_bytes,
+                         .down_bytes = t.down_expert_bytes};
+        uint64_t off[3], len[3];
+        ds41_la_ranges(&j, 5, off, len);
+        REQUIRE(off[0] == 1000 + 5 * 120 && len[0] == 120);
+        REQUIRE(off[1] == 50000 + 5 * 120 && len[1] == 120);
+        REQUIRE(off[2] == 90000 + 5 * 70 && len[2] == 70);
+    }
+    /* Mailbox: a second post replaces the first and counts a drop. */
+    ds41_la_mailbox_init(&mb);
+    a.layer = 7; a.pos = 100; b.layer = 8; b.pos = 100;
+    REQUIRE(!ds41_la_take(&mb, &got, false, NULL));
+    ds41_la_post(&mb, &a);
+    ds41_la_post(&mb, &b);
+    REQUIRE(mb.posted == 2 && mb.dropped == 1);
+    REQUIRE(ds41_la_take(&mb, &got, false, NULL) && got.layer == 8);
+    REQUIRE(!ds41_la_take(&mb, &got, false, NULL));
+    /* Residency hint: nothing is resident outside SSD streaming. */
+    REQUIRE(ds4_gpu_stream_expert_cache_resident_hint(0, 0) == 0);
+    REQUIRE(ds4_gpu_stream_expert_cache_resident_hint(100000, 0) == 0);
+    fprintf(stderr, "V4.1 lookahead units PASS\n");
+    rc = 0;
+done:
+    unsetenv("DS4_METAL_V41_LOOKAHEAD_K");
+    return rc;
+}
+#endif
+
 static int check_decode_profile_format(void) {
     int rc = 1;
     char line[256];
@@ -2374,6 +2441,8 @@ int main(int argc, char **argv) {
         return check_v41_fuse_switches();
     if (argc == 2 && !strcmp(argv[1], "--v41-moe-fuse-predicates"))
         return check_v41_moe_fuse_predicates();
+    if (argc == 2 && !strcmp(argv[1], "--v41-lookahead-units"))
+        return check_v41_lookahead_units();
 #endif
 #ifdef __APPLE__
     if (argc == 2 && !strcmp(argv[1], "--stream-control-env"))

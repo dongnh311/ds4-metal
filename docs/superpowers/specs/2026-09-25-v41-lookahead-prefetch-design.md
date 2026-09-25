@@ -85,7 +85,7 @@ Estimate:
 3. **Prediction thread** (V4.1, started lazily):
    - take the slot, with target layer T = L + 1;
    - skip if T = 40, or if the position is an image position (that one uses a different bias);
-   - scores = `cblas_sgemv` of layer T's `ffn_gate_inp` (F32, 384 × 5120, resident in the mapped model) with the copy;
+   - scores = a dot-product loop over layer T's `ffn_gate_inp` (F32, 384 × 5120, resident in the mapped model) with the copy;
    - s = sqrt(softplus(score)) + `ffn_exp_probs_b[T]`;
    - take the top k (default 1).
 4. **Prefetch.** For each predicted expert e that `ds4_gpu_stream_expert_cache_resident_hint(T, e)` reports as not cached, issue `F_RDADVISE` on the thread's own read-only fd for three ranges:

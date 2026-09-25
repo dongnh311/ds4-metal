@@ -41078,6 +41078,106 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* Lookahead expert prefetch (docs/superpowers/specs/2026-09-25-v41-lookahead-
+ * prefetch-design.md): layer L+1's router on layer L's FFN input predicts
+ * L+1's experts; a thread warms their pages in the OS page cache so the demand
+ * read finds them resident. Selection and the expert cache are unchanged. */
+#define DS41_LA_MAX_EMBD 8192u
+#define DS41_LA_MAX_K 6u
+#define DS41_LA_MAX_LAYER 64u
+
+typedef struct {
+    uint32_t layer, pos, k, n_embd, n_expert;
+    const float *w, *bias;
+    uint64_t gate_offset, up_offset, down_offset, gate_bytes, down_bytes;
+    float x[DS41_LA_MAX_EMBD];
+} ds41_la_job;
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool full;
+    ds41_la_job job;
+    uint64_t posted, dropped;
+} ds41_la_mailbox;
+
+static DS4_MAYBE_UNUSED uint32_t ds41_la_k(void) {
+    const char *v = getenv("DS4_METAL_V41_LOOKAHEAD_K");
+    if (!v || !*v) return 1u;
+    char *end = NULL;
+    const long k = strtol(v, &end, 10);
+    if (!end || *end) return 1u;
+    return k < 0 ? 0u : k > (long)DS41_LA_MAX_K ? DS41_LA_MAX_K : (uint32_t)k;
+}
+
+/* kernel_dsv4_softplus_sqrt_f32_4's expression; ranking only, never output. */
+static DS4_MAYBE_UNUSED float ds41_la_score(float v, float bias) {
+    const float ex = expf(v);
+    const float em = ex < 0.03125f ? ex : 0.03125f;
+    const float poly = em * (1.0f - em * (0.5f - em * (1.0f / 3.0f - 0.25f * em)));
+    const float sp = v > 20.0f ? v : ex < 0.03125f ? poly : logf(1.0f + ex);
+    return sqrtf(sp) + bias;
+}
+
+static DS4_MAYBE_UNUSED uint32_t ds41_la_topk(const float *w, const float *bias, const float *x,
+                             uint32_t n_expert, uint32_t n_embd, uint32_t k, int32_t *out) {
+    float best_s[DS41_LA_MAX_K];
+    uint32_t n = 0;
+    if (k > DS41_LA_MAX_K) k = DS41_LA_MAX_K;
+    if (k > n_expert) k = n_expert;
+    for (uint32_t e = 0; e < n_expert && k; e++) {
+        const float *row = w + (uint64_t)e * n_embd;
+        float dot = 0.0f;
+        for (uint32_t i = 0; i < n_embd; i++) dot += row[i] * x[i];
+        const float s = ds41_la_score(dot, bias ? bias[e] : 0.0f);
+        /* insertion into a sorted top-k: score desc, index asc on ties */
+        uint32_t at = n;
+        while (at > 0 && s > best_s[at - 1]) at--;
+        if (at >= k) continue;
+        const uint32_t last = n < k ? n : k - 1;
+        for (uint32_t j = last; j > at; j--) { best_s[j] = best_s[j - 1]; out[j] = out[j - 1]; }
+        best_s[at] = s; out[at] = (int32_t)e;
+        if (n < k) n++;
+    }
+    return n;
+}
+
+static DS4_MAYBE_UNUSED void ds41_la_ranges(const ds41_la_job *job, int32_t expert, uint64_t off[3], uint64_t len[3]) {
+    const uint64_t e = (uint64_t)(uint32_t)expert;
+    off[0] = job->gate_offset + e * job->gate_bytes; len[0] = job->gate_bytes;
+    off[1] = job->up_offset + e * job->gate_bytes;   len[1] = job->gate_bytes;
+    off[2] = job->down_offset + e * job->down_bytes; len[2] = job->down_bytes;
+}
+
+static DS4_MAYBE_UNUSED void ds41_la_mailbox_init(ds41_la_mailbox *mb) {
+    memset(mb, 0, sizeof(*mb));
+    pthread_mutex_init(&mb->mu, NULL);
+    pthread_cond_init(&mb->cv, NULL);
+}
+
+/* Never blocks the poster: a post replaces an unconsumed one. */
+static DS4_MAYBE_UNUSED void ds41_la_post(ds41_la_mailbox *mb, const ds41_la_job *job) {
+    pthread_mutex_lock(&mb->mu);
+    if (mb->full) mb->dropped++;
+    mb->job = *job;
+    mb->full = true;
+    mb->posted++;
+    pthread_cond_signal(&mb->cv);
+    pthread_mutex_unlock(&mb->mu);
+}
+
+static DS4_MAYBE_UNUSED bool ds41_la_take(ds41_la_mailbox *mb, ds41_la_job *out, bool wait, const volatile bool *stop) {
+    pthread_mutex_lock(&mb->mu);
+    while (wait && !mb->full && !(stop && *stop)) pthread_cond_wait(&mb->cv, &mb->mu);
+    const bool got = mb->full;
+    if (got) { *out = mb->job; mb->full = false; }
+    pthread_mutex_unlock(&mb->mu);
+    return got;
+}
+#endif
+
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
 /* Solo streaming decode: hand the selected ids to the async-load worker as
  * soon as the router is on the GPU, so misses are read while the shared
  * expert runs (the V4-Flash metal_graph_selected_async_load_* path). */
