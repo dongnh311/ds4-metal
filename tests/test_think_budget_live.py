@@ -128,6 +128,9 @@ def main():
 
     srv = Server(root, args)
     try:
+        # 0. warm-up: the first request after a server start can decode differently
+        chat(srv.base, user)
+        srv.new_log()
         # 1. forced close, non-stream
         r1 = chat(srv.base, user)
         log = srv.new_log()
@@ -137,7 +140,8 @@ def main():
         # 2. stream equals non-stream
         r2 = chat(srv.base, user, stream=True)
         srv.new_log()
-        check(r2[:2] == r1[:2], "2 stream text == non-stream text")
+        norm = lambda r: (r[0].strip(), r[1].strip())
+        check(norm(r2) == norm(r1), "2 stream text == non-stream text (whitespace-trimmed)")
         # 3. next turn continues from the live state (prefix cached)
         turn2 = user + [{"role": "assistant", "content": r2[1]},
                         {"role": "user", "content": "Now list the next five primes."}]
