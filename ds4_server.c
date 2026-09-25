@@ -827,6 +827,7 @@ typedef struct {
     int cache_read_tokens;
     int cache_write_tokens;
     ds4_think_mode think_mode;
+    int think_budget;       /* request thinking cap in tokens; 0 = none */
     bool has_tools;
     bool prompt_preserves_reasoning;
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the
@@ -1072,7 +1073,8 @@ static bool parse_reasoning_effort_value(const char **p, ds4_think_mode *out) {
     return ok;
 }
 
-static bool parse_thinking_control_value(const char **p, bool *thinking_enabled) {
+static bool parse_thinking_control_value(const char **p, bool *thinking_enabled,
+                                         int *budget_tokens) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
     if (**p == 't' || **p == 'f') return json_bool(p, thinking_enabled);
@@ -1097,6 +1099,11 @@ static bool parse_thinking_control_value(const char **p, bool *thinking_enabled)
             if (!strcmp(type, "enabled")) *thinking_enabled = true;
             else if (!strcmp(type, "disabled")) *thinking_enabled = false;
             free(type);
+        } else if (!strcmp(key, "budget_tokens") && budget_tokens) {
+            if (!json_int(p, budget_tokens)) {
+                free(key);
+                return false;
+            }
         } else if (!json_skip_value(p)) {
             free(key);
             return false;
@@ -1112,9 +1119,10 @@ static bool parse_thinking_control_value(const char **p, bool *thinking_enabled)
 }
 
 /* chat_template_kwargs as the Qwen3.8 model card documents them: enable_thinking
- * and reasoning_effort are applied, other keys are ignored */
+ * and reasoning_effort are applied, thinking_budget sets the request's thinking
+ * cap, other keys are ignored */
 static bool parse_chat_template_kwargs(const char **p, bool *thinking_enabled, bool *got_thinking,
-                                       ds4_think_mode *effort) {
+                                       ds4_think_mode *effort, int *think_budget) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
     if (**p != '{') return json_skip_value(p);
@@ -1136,6 +1144,8 @@ static bool parse_chat_template_kwargs(const char **p, bool *thinking_enabled, b
             if (ok) *got_thinking = true;
         } else if (!strcmp(key, "reasoning_effort")) {
             ok = parse_reasoning_effort_value(p, effort);
+        } else if (!strcmp(key, "thinking_budget") && think_budget) {
+            ok = json_int(p, think_budget);
         } else {
             ok = json_skip_value(p);
         }
@@ -4214,7 +4224,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled, &r->think_budget)) {
                 free(key);
                 goto bad;
             }
@@ -4225,7 +4235,8 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 goto bad;
             }
         } else if (!strcmp(key, "chat_template_kwargs")) {
-            if (!parse_chat_template_kwargs(&p, &thinking_enabled, &got_thinking, &reasoning_effort)) {
+            if (!parse_chat_template_kwargs(&p, &thinking_enabled, &got_thinking, &reasoning_effort,
+                                            &r->think_budget)) {
                 free(key);
                 goto bad;
             }
@@ -4235,6 +4246,11 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 goto bad;
             }
             got_thinking = true;
+        } else if (!strcmp(key, "thinking_budget")) {
+            if (!json_int(&p, &r->think_budget)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "stop")) {
             if (!parse_stop(&p, &r->stops)) {
                 free(key);
@@ -4433,7 +4449,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled, &r->think_budget)) {
                 free(key);
                 goto bad;
             }
@@ -5420,6 +5436,11 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "thinking_budget")) {
+            if (!json_int(&p, &r->think_budget)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "reasoning")) {
             bool effort_seen = false;
             if (!parse_responses_reasoning(&p, &reasoning_effort,
@@ -5679,7 +5700,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled, NULL)) {
                 free(key);
                 goto bad;
             }
@@ -10153,6 +10174,8 @@ struct server {
     server_image_cache image_cache; /* Protected by inference_mu. */
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
+    int think_budget;                   /* --think-budget; 0 = off */
+    const char *think_budget_message;   /* NULL = DS4_THINK_BUDGET_DEFAULT_MESSAGE */
     pthread_mutex_t tool_mu;
     pthread_mutex_t kv_mu;
     pthread_mutex_t inference_mu;
@@ -15484,6 +15507,8 @@ typedef struct {
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
+    int think_budget;
+    const char *think_budget_message;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -15730,6 +15755,10 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
             c.mixed_prefill_quantum =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--think-budget")) {
+            c.think_budget = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--think-budget-message")) {
+            c.think_budget_message = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-dir")) {
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
@@ -16002,6 +16031,12 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.think_budget = cfg.think_budget;
+    s.think_budget_message = cfg.think_budget_message;
+    if (s.batched_mode && s.think_budget > 0) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: --think-budget is ignored with --batched-session");
+    }
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {
@@ -18281,10 +18316,10 @@ static void test_model_alias_thinking_controls(void) {
 static void test_api_thinking_controls_parse(void) {
     bool enabled = true;
     const char *thinking = "{\"type\":\"disabled\",\"budget_tokens\":1024}";
-    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled, NULL));
     TEST_ASSERT(!enabled);
     thinking = "true";
-    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled, NULL));
     TEST_ASSERT(enabled);
 
     ds4_think_mode mode = DS4_THINK_HIGH;
@@ -18360,6 +18395,39 @@ static void test_think_budget_suffix_text(void) {
     s = think_budget_suffix_text("Wrap up now.");
     TEST_ASSERT(!strcmp(s, "\n\nWrap up now.\n</think>\n\n"));
     free(s);
+}
+
+static void test_think_budget_request_fields(void) {
+    bool enabled = false;
+    int budget = 0;
+    const char *p = "{\"type\":\"enabled\",\"budget_tokens\":2048}";
+    TEST_ASSERT(parse_thinking_control_value(&p, &enabled, &budget));
+    TEST_ASSERT(enabled && budget == 2048);
+
+    p = "{\"type\":\"enabled\",\"budget_tokens\":\"many\"}";
+    TEST_ASSERT(!parse_thinking_control_value(&p, &enabled, &budget));
+
+    budget = 7;
+    p = "{\"type\":\"enabled\",\"budget_tokens\":-5}";
+    TEST_ASSERT(parse_thinking_control_value(&p, &enabled, &budget));
+    TEST_ASSERT(budget == 0);                    /* json_int folds negatives to 0 = none */
+
+    p = "{\"type\":\"enabled\",\"budget_tokens\":64}";
+    TEST_ASSERT(parse_thinking_control_value(&p, &enabled, NULL));  /* completions ignore it */
+
+    bool got = false;
+    ds4_think_mode mode = DS4_THINK_HIGH;
+    budget = 0;
+    const char *kw = "{\"enable_thinking\":true,\"thinking_budget\":1024}";
+    TEST_ASSERT(parse_chat_template_kwargs(&kw, &enabled, &got, &mode, &budget));
+    TEST_ASSERT(got && enabled && budget == 1024);
+    kw = "{\"thinking_budget\":1024}";
+    TEST_ASSERT(parse_chat_template_kwargs(&kw, &enabled, &got, &mode, NULL));
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    TEST_ASSERT(r.think_budget == 0);
+    request_free(&r);
 }
 
 static void test_render_think_max_prompt_prefix(void) {
@@ -18534,10 +18602,10 @@ static void test_qwen_reasoning_effort_levels(void) {
     bool enabled = true, got = false;
     ds4_think_mode mode = DS4_THINK_HIGH;
     const char *kwargs = "{\"enable_thinking\": false, \"reasoning_effort\": \"low\", \"preserve_thinking\": true}";
-    TEST_ASSERT(parse_chat_template_kwargs(&kwargs, &enabled, &got, &mode));
+    TEST_ASSERT(parse_chat_template_kwargs(&kwargs, &enabled, &got, &mode, NULL));
     TEST_ASSERT(!enabled && got && mode == DS4_THINK_LOW);
     kwargs = "null";
-    TEST_ASSERT(parse_chat_template_kwargs(&kwargs, &enabled, &got, &mode));
+    TEST_ASSERT(parse_chat_template_kwargs(&kwargs, &enabled, &got, &mode, NULL));
     TEST_ASSERT(!enabled && mode == DS4_THINK_LOW);
 
     chat_msgs msgs = {0};
@@ -23050,6 +23118,7 @@ static void ds4_server_unit_tests_run(void) {
     test_think_budget_rules();
     test_think_budget_tool_open();
     test_think_budget_suffix_text();
+    test_think_budget_request_fields();
     test_render_think_max_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();
