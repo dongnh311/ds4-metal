@@ -1,0 +1,306 @@
+[
+ {
+  "kind": "gsm8k",
+  "passed": true,
+  "think_tokens": 59,
+  "forced": false,
+  "seconds": 4.5,
+  "answer": null
+ },
+ {
+  "kind": "gsm8k",
+  "passed": true,
+  "think_tokens": 103,
+  "forced": false,
+  "seconds": 5.4,
+  "answer": null
+ },
+ {
+  "kind": "gsm8k",
+  "passed": true,
+  "think_tokens": 102,
+  "forced": false,
+  "seconds": 6.2,
+  "answer": null
+ },
+ {
+  "kind": "gsm8k",
+  "passed": true,
+  "think_tokens": 76,
+  "forced": false,
+  "seconds": 4.1,
+  "answer": null
+ },
+ {
+  "kind": "gsm8k",
+  "passed": true,
+  "think_tokens": 217,
+  "forced": false,
+  "seconds": 8.0,
+  "answer": null
+ },
+ {
+  "kind": "gsm8k",
+  "passed": true,
+  "think_tokens": 121,
+  "forced": false,
+  "seconds": 5.5,
+  "answer": null
+ },
+ {
+  "kind": "gsm8k",
+  "passed": true,
+  "think_tokens": 75,
+  "forced": false,
+  "seconds": 3.9,
+  "answer": null
+ },
+ {
+  "kind": "gsm8k",
+  "passed": true,
+  "think_tokens": 57,
+  "forced": false,
+  "seconds": 4.0,
+  "answer": null
+ },
+ {
+  "kind": "gsm8k",
+  "passed": true,
+  "think_tokens": 85,
+  "forced": false,
+  "seconds": 4.6,
+  "answer": null
+ },
+ {
+  "kind": "gsm8k",
+  "passed": true,
+  "think_tokens": 56,
+  "forced": false,
+  "seconds": 3.7,
+  "answer": null
+ },
+ {
+  "kind": "gsm8k",
+  "passed": true,
+  "think_tokens": 72,
+  "forced": false,
+  "seconds": 4.1,
+  "answer": null
+ },
+ {
+  "kind": "gsm8k",
+  "passed": true,
+  "think_tokens": 61,
+  "forced": false,
+  "seconds": 4.1,
+  "answer": null
+ },
+ {
+  "kind": "gsm8k",
+  "passed": true,
+  "think_tokens": 67,
+  "forced": false,
+  "seconds": 3.8,
+  "answer": null
+ },
+ {
+  "kind": "gsm8k",
+  "passed": true,
+  "think_tokens": 102,
+  "forced": false,
+  "seconds": 5.7,
+  "answer": null
+ },
+ {
+  "kind": "gsm8k",
+  "passed": true,
+  "think_tokens": 94,
+  "forced": false,
+  "seconds": 5.0,
+  "answer": null
+ },
+ {
+  "kind": "gsm8k",
+  "passed": true,
+  "think_tokens": 88,
+  "forced": false,
+  "seconds": 5.0,
+  "answer": null
+ },
+ {
+  "kind": "humaneval",
+  "passed": true,
+  "think_tokens": 114,
+  "forced": false,
+  "seconds": 5.0,
+  "answer": null
+ },
+ {
+  "kind": "humaneval",
+  "passed": true,
+  "think_tokens": 209,
+  "forced": false,
+  "seconds": 7.3,
+  "answer": null
+ },
+ {
+  "kind": "humaneval",
+  "passed": true,
+  "think_tokens": 262,
+  "forced": false,
+  "seconds": 10.3,
+  "answer": null
+ },
+ {
+  "kind": "humaneval",
+  "passed": true,
+  "think_tokens": 317,
+  "forced": false,
+  "seconds": 11.9,
+  "answer": null
+ },
+ {
+  "kind": "humaneval",
+  "passed": true,
+  "think_tokens": 710,
+  "forced": false,
+  "seconds": 20.6,
+  "answer": null
+ },
+ {
+  "kind": "humaneval",
+  "passed": true,
+  "think_tokens": 326,
+  "forced": false,
+  "seconds": 12.4,
+  "answer": null
+ },
+ {
+  "kind": "humaneval",
+  "passed": true,
+  "think_tokens": 309,
+  "forced": false,
+  "seconds": 9.6,
+  "answer": null
+ },
+ {
+  "kind": "humaneval",
+  "passed": true,
+  "think_tokens": 71,
+  "forced": false,
+  "seconds": 3.8,
+  "answer": null
+ },
+ {
+  "kind": "humaneval",
+  "passed": true,
+  "think_tokens": 317,
+  "forced": false,
+  "seconds": 11.6,
+  "answer": null
+ },
+ {
+  "kind": "humaneval",
+  "passed": true,
+  "think_tokens": 63,
+  "forced": false,
+  "seconds": 4.6,
+  "answer": null
+ },
+ {
+  "kind": "humaneval",
+  "passed": true,
+  "think_tokens": 160,
+  "forced": false,
+  "seconds": 7.1,
+  "answer": null
+ },
+ {
+  "kind": "humaneval",
+  "passed": true,
+  "think_tokens": 264,
+  "forced": false,
+  "seconds": 9.8,
+  "answer": null
+ },
+ {
+  "kind": "humaneval",
+  "passed": true,
+  "think_tokens": 93,
+  "forced": false,
+  "seconds": 4.2,
+  "answer": null
+ },
+ {
+  "kind": "humaneval",
+  "passed": true,
+  "think_tokens": 1361,
+  "forced": false,
+  "seconds": 37.9,
+  "answer": null
+ },
+ {
+  "kind": "humaneval",
+  "passed": true,
+  "think_tokens": 445,
+  "forced": false,
+  "seconds": 14.1,
+  "answer": null
+ },
+ {
+  "kind": "humaneval",
+  "passed": true,
+  "think_tokens": 805,
+  "forced": false,
+  "seconds": 24.3,
+  "answer": null
+ },
+ {
+  "kind": "humaneval",
+  "passed": true,
+  "think_tokens": 644,
+  "forced": false,
+  "seconds": 18.2,
+  "answer": null
+ },
+ {
+  "kind": "vi",
+  "passed": null,
+  "think_tokens": 145,
+  "forced": false,
+  "seconds": 8.1,
+  "answer": "Bộ nhớ đệm KV (Key–Value cache) giúp mô hình ngôn ngữ sinh văn bản nhanh hơn bằng cách **lưu lại các vector Key và Value của các token đã xử lý trước đó** trong các lớp attention.\n\nKhi sinh token mới:\n- Mô hình chỉ cần tính **Query, Key, Value cho token hiện tại**.\n- Thay vì tính lại Key/Value cho toàn bộ đoạn văn bản đã có, nó dùng **KV cache** để truy cập ngay các giá trị cũ.\n- Nhờ đó giảm đáng kể phép tính attention ở mỗi bước sinh.\n\nNói ngắn gọn: **KV cache đổi bộ nhớ lấy tốc độ**, giúp sinh token nhanh hơn nhiều, đặc biệt khi ngữ cảnh dài."
+ },
+ {
+  "kind": "vi",
+  "passed": null,
+  "think_tokens": 2048,
+  "forced": true,
+  "seconds": 53.9,
+  "answer": "Vịnh Hạ Long là điểm đến kỳ quan thiên nhiên thế giới, nơi hàng nghìn đảo đá vôi vươn lên giữa làn nước ngọc bích. Đến đây, du khách được ngắm bình minh rực rỡ, khám phá hang động huyền ảo, chèo kayak len lỏi qua các khe đá và dừng chân trên bãi biển hoang sơ. Không gian yên bình, gió biển mát lành cùng cảnh sắc hùng vĩ sẽ để lại cảm giác choáng ngợp. Hạ Long còn hấp dẫn bởi hải sản tươi ngon, làng chài truyền thống và những tour thuyền đêm lãng mạn. Hãy một lần đến để tận mắt chiêm ngưỡng vẻ đẹp kỳ diệu của di sản Việt Nam và lưu giữ kỷ niệm."
+ },
+ {
+  "kind": "vi",
+  "passed": null,
+  "think_tokens": 282,
+  "forced": false,
+  "seconds": 58.0,
+  "answer": "Dưới đây là so sánh ưu/nhược điểm của **Python** và **Go** khi dùng để viết **dịch vụ web** (web service/API/microservice).\n\n## Bảng so sánh nhanh\n\n| Tiêu chí | Python | Go |\n|---|---|---|\n| Tốc độ phát triển | Rất nhanh, cú pháp đơn giản | Nhanh, nhưng có phần dài dòng hơn |\n| Hiệu năng runtime | Thường chậm hơn Go | Nhanh hơn, phù hợp tải cao |\n| Concurrency | Có asyncio, threading, multiprocessing; bị ảnh hưởng bởi GIL | Rất mạnh nhờ goroutine, channel |\n| Hệ sinh thái web | Rất phong phú: FastAPI, Flask, Django | Tốt, gọn nhẹ: Gin, Echo, Chi, net/http |\n| Triển khai | Phức tạp hơn: venv, Poetry, Docker, wheel | Rất đơn giản: binary tĩnh, image nhỏ |\n| Kiểu dữ liệu | Dynamic typing, linh hoạt | Static typing, an toàn hơn khi refactor |\n| Phù hợp AI/data | Rất mạnh | Không phải thế mạnh chính |\n| Phù hợp microservice hiệu năng cao | Được, nhưng cần cân nhắc | Rất phù hợp |\n\n---\n\n## Ưu điểm của Python khi viết dịch vụ web\n\n### 1. Phát triển nhanh, dễ học\nPython có cú pháp rõ ràng, dễ đọc, dễ viết. Với các framework như **FastAPI**, **Flask**, **Django**, bạn có thể dựng API rất nhanh.\n\nVí dụ: FastAPI cho phép tạo API REST, validation bằng Pydantic, sinh OpenAPI/Swagger tự động.\n\n### 2. Hệ sinh thái web rất mạnh\nPython có nhiều thư viện cho:\n- Web framework: FastAPI, Flask, Django\n- ORM: SQLAlchemy, Django ORM\n- Validation: Pydantic\n- Auth: OAuth2, JWT\n- Async: aiohttp, httpx\n- Testing: pytest\n- Docs: OpenAPI/Swagger\n\nNếu bạn làm sản phẩm cần nhiều tính năng nhanh, Python rất tiện.\n\n### 3. Rất tốt cho AI, data, ML\nNếu dịch vụ web của bạn liên quan đến:\n- Machine learning\n- Data pipeline\n- LLM\n- Phân tích dữ liệu\n- Xử lý văn bản, ảnh, audio\n\nPython gần như là lựa chọn mặc định vì có NumPy, Pandas, Scikit-learn, PyTorch, TensorFlow, Hugging Face, v.v.\n\n### 4. Linh hoạt cho prototype và MVP\nPython phù hợp khi bạn cần:\n- Dựng MVP nhanh\n- Thử nghiệm ý tưởng\n- Tích hợp nhiều thư viện bên ngoài\n- Thay đổi yêu cầu thường xuyên\n\n### 5. Cộng đồng lớn\nPython có cộng đồng rất lớn, tài liệu phong phú, nhiều ví dụ, dễ tìm câu trả lời.\n\n---\n\n## Nhược điểm của Python khi viết dịch vụ web\n\n### 1. Hiệu năng thường thấp hơn Go\nPython thường chậm hơn Go trong các tác vụ CPU-bound hoặc xử lý lượng request lớn.\n\nPython có thể đủ tốt cho nhiều API thông thường, nhưng nếu bạn cần:\n- Hàng chục nghìn request/giây\n- Xử lý nặng\n- Độ trễ rất thấp\n- Tiết kiệm CPU/memory\n\nGo thường có lợi thế hơn.\n\n### 2. GIL hạn chế concurrency CPU-bound\nPython có **GIL** (Global Interpreter Lock), khiến nhiều thread không tận dụng tốt nhiều CPU core cho tác vụ CPU-bound.\n\nPython vẫn có thể dùng:\n- `asyncio` cho I/O-bound\n- `multiprocessing` cho CPU-bound\n- Worker process như Gunicorn/Uvicorn\n\nNhưng nhìn chung mô hình concurrency của Python không mượt bằng Go.\n\n### 3. Triển khai phức tạp hơn\nPython thường cần quản lý:\n- Python version\n- Virtual environment\n- Dependency\n- Build wheel\n- Docker image\n- C extension\n- Binary dependency\n\nDocker image Python thường lớn hơn Go nếu không tối ưu.\n\n### 4. Dynamic typing có thể gây lỗi runtime\nPython linh hoạt, nhưng thiếu kiểm tra kiểu lúc compile. Với codebase lớn, nếu không dùng type hints, mypy, test tốt, dễ phát sinh lỗi runtime.\n\n### 5. Hiệu năng async tốt nhưng không phải “miễn phí”\n`asyncio` giúp Python xử lý I/O tốt, nhưng:\n- Code async phải nhất quán\n- Gọi hàm blocking trong async sẽ làm nghẽn event loop\n- Debug async đôi khi khó hơn\n- Một số thư viện chưa hỗ trợ async tốt\n\n---\n\n## Ưu điểm của Go khi viết dịch vụ web\n\n### 1. Hiệu năng cao\nGo được biên dịch thành binary native, thường nhanh hơn Python về:\n- CPU\n- Memory\n- Startup time\n- Throughput\n\nGo rất phù hợp cho API gateway, microservice, backend hiệu năng cao.\n\n### 2. Concurrency rất mạnh\nGo có:\n- `goroutine`\n- `channel`\n- `context`\n- `select`\n\nMô hình concurrency của Go được thiết kế sẵn cho hệ thống đồng thời lớn. Bạn có thể xử lý hàng nghìn, hàng chục nghìn goroutine một cách tương đối dễ dàng.\n\n### 3. Triển khai đơn giản\nGo biên dịch ra một binary duy nhất, có thể chạy trong container rất nhỏ, ví dụ `scratch` hoặc `distroless`.\n\nƯu điểm:\n- Không cần cài runtime phức tạp\n- Image nhỏ\n- Startup nhanh\n- Ít phụ thuộc môi trường\n\n### 4. Static typing giúp codebase lớn an toàn hơn\nGo có static typing, giúp phát hiện nhiều lỗi sớm hơn, refactor an toàn hơn, đặc biệt trong dự án lớn hoặc microservice.\n\n### 5. Tooling tốt\nGo có sẵn:\n- `go test`\n- `go fmt`\n- `go vet`\n- `go build`\n- `go mod`\n- Profiling\n- Benchmark\n\nQuản lý dependency bằng Go modules khá đơn giản.\n\n### 6. Phù hợp microservice và hạ tầng\nGo rất phổ biến trong:\n- API gateway\n- Proxy\n- Service mesh\n- Cloud-native tooling\n- Kubernetes ecosystem\n- Backend cần độ trễ thấp\n\nNhiều công cụ hạ tầng nổi tiếng được viết bằng Go: Docker, Kubernetes, Terraform, Prometheus, etcd, CockroachDB, v.v.\n\n---\n\n## Nhược điểm của Go khi viết dịch vụ web\n\n### 1. Cú pháp có phần dài dòng\nGo đơn giản nhưng đôi khi verbose, đặc biệt với:\n- Xử lý lỗi\n- Struct\n- Interface\n- Generic\n- CRUD API\n\nVí dụ, xử lý lỗi kiểu `if err != nil` lặp lại nhiều lần.\n\n### 2. Hệ sinh thái web không “đầy đủ” như Python\nGo có web framework tốt, nhưng không phong phú bằng Python về:\n- ORM\n- Admin panel\n- Auth\n- CMS\n- Data science\n- ML\n- Scripting nhanh\n\nPython có Django “batteries included”, còn Go thường cần tự ghép nhiều thư viện hơn.\n\n### 3. Ít phù hợp cho AI/data\nGo không phải lựa chọn hàng đầu cho:\n- Machine learning\n- Data analysis\n- NLP\n- LLM pipeline\n- Scientific computing\n\nNếu dịch vụ web của bạn là API cho mô hình ML, Python thường tiện hơn.\n\n### 4. Generic còn hạn chế so với một số ngôn ngữ khác\nGo đã có generics, nhưng vẫn chưa linh hoạt như TypeScript, Rust hay Python typing trong một số trường hợp.\n\n### 5. Xử lý lỗi thủ công\nGo không có exception như Python. Bạn phải xử lý lỗi tường minh, điều này an toàn nhưng có thể gây lặp code.\n\n### 6. Ít “magic” hơn\nPython có nhiều decorator, metaclass, dynamic behavior giúp code ngắn gọn. Go cố ý đơn giản, ít magic, điều này tốt cho maintainability nhưng đôi khi kém linh hoạt.\n\n---\n\n## Khi nào nên chọn Python?\n\nNên chọn Python nếu bạn cần:\n\n- Phát triển nhanh MVP\n- API tích hợp AI/ML/data\n- Dùng Django/FastAPI để dựng sản phẩm nhanh\n- Đội dev quen Python\n- Cần nhiều thư viện sẵn có\n- Tải không quá khắt khe về hiệu năng\n- Ưu tiên tốc độ phát triển hơn tối ưu CPU\n\nVí dụ phù hợp:\n- REST API cho web/mobile\n- Backend cho sản phẩm AI\n- Data pipeline service\n- Internal tool\n- BFF (Backend for Frontend)\n- API cho LLM, chatbot, recommendation\n\n---\n\n## Khi nào nên chọn Go?\n\nNên chọn Go nếu bạn cần:\n\n- Hiệu năng cao\n- Độ trễ thấp\n- Throughput lớn\n- Microservice chạy trong container\n- Concurrency cao\n- Triển khai đơn giản\n- Codebase lớn, cần static typing\n- Hệ thống hạ tầng, gateway, proxy, scheduler\n\nVí dụ phù hợp:\n- API gateway\n- Microservice backend\n- Real-time service\n- WebSocket server\n- Service xử lý lượng request lớn\n- Cloud-native backend\n- Service cần image nhỏ, startup nhanh\n\n---\n\n## Kết luận ngắn gọn\n\n- **Chọn Python** nếu bạn ưu tiên **tốc độ phát triển**, hệ sinh thái phong phú, đặc biệt cho **AI/data/web nhanh**.\n- **Chọn Go** nếu bạn ưu tiên **hiệu năng**, **concurrency**, **triển khai đơn giản**, và phù hợp cho **microservice/hệ thống tải cao**.\n\nNếu dự án của bạn là **API thông thường**, Python thường đủ tốt.  \nNếu dự án là **microservice hiệu năng cao, cloud-native, nhiều request, cần deploy gọn**, Go thường là lựa chọn tốt hơn."
+ },
+ {
+  "kind": "vi",
+  "passed": null,
+  "think_tokens": 104,
+  "forced": false,
+  "seconds": 10.4,
+  "answer": "**Ý chính của định luật Ohm:**\n\nĐịnh luật Ohm phát biểu rằng: **Cường độ dòng điện chạy qua một vật dẫn tỉ lệ thuận với hiệu điện thế đặt vào hai đầu vật dẫn và tỉ lệ nghịch với điện trở của vật dẫn**, với điều kiện nhiệt độ và các yếu tố khác không đổi.\n\nCông thức:\n\n\\[\nI = \\frac{U}{R}\n\\]\n\nTrong đó:\n\n- \\(I\\): cường độ dòng điện, đơn vị Ampe (A)  \n- \\(U\\): hiệu điện thế, đơn vị Vôn (V)  \n- \\(R\\): điện trở, đơn vị Ôm (\\(\\Omega\\))\n\nCó thể viết lại:\n\n\\[\nU = I \\cdot R\n\\]\n\nhoặc\n\n\\[\nR = \\frac{U}{I}\n\\]\n\n---\n\n**Ví dụ tính toán:**\n\nMột điện trở có giá trị \\(R = 10\\,\\Omega\\) được nối vào nguồn điện có hiệu điện thế \\(U = 20\\,V\\). Tính cường độ dòng điện chạy qua điện trở.\n\nÁp dụng công thức:\n\n\\[\nI = \\frac{U}{R} = \\frac{20}{10} = 2\\,A\n\\]\n\n**Kết quả:** Cường độ dòng điện chạy qua điện trở là **2 A**."
+ },
+ {
+  "kind": "vi",
+  "passed": null,
+  "think_tokens": 172,
+  "forced": false,
+  "seconds": 7.8,
+  "answer": "Tổng cộng giảm **28%**.\n\nGiải thích:\n\n- Giá ban đầu coi là 100%.\n- Giảm 20% thì còn lại: 80%.\n- Giảm thêm 10% trên giá đã giảm:  \n  \\(10\\% \\times 80\\% = 8\\%\\)\n- Tổng cộng giảm:  \n  \\(20\\% + 8\\% = 28\\%\\)\n\nVậy cửa hàng đã giảm tổng cộng **28%** so với giá ban đầu."
+ }
+]
