@@ -142,8 +142,12 @@ def main():
         srv.new_log()
         norm = lambda r: (r[0].strip(), r[1].strip())
         check(norm(r2) == norm(r1), "2 stream text == non-stream text (whitespace-trimmed)")
-        # 3. next turn continues from the live state (prefix cached)
-        turn2 = user + [{"role": "assistant", "content": r2[1]},
+        # 3. next turn continues from the live state (prefix cached). A length-truncated
+        #    turn is never remembered for continuation, so the first turn must end on "stop".
+        t1 = chat(srv.base, user, max_tokens=2048)
+        srv.new_log()
+        check(t1[2] == "stop", "3 first turn finished with stop")
+        turn2 = user + [{"role": "assistant", "content": t1[1]},
                         {"role": "user", "content": "Now list the next five primes."}]
         chat(srv.base, turn2)
         log = srv.new_log()
