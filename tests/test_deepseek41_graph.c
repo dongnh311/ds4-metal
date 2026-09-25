@@ -2447,6 +2447,25 @@ static int check_v41_lookahead_units(void) {
         ds41_la_note_selected(3, 10, sel_hit, 6);
         REQUIRE(g_ds41_la.used == used0 + 1);
     }
+    /* The mailbox lock works before the thread ever started (profile runs
+     * with lookahead off print the counters). */
+    REQUIRE(pthread_mutex_lock(&g_ds41_la.mb.mu) == 0);
+    pthread_mutex_unlock(&g_ds41_la.mb.mu);
+    /* A failed start is retried after a stop (engine close), and a start
+     * zeroes every counter together. */
+    {
+        const int fd = open("/dev/null", O_RDONLY);
+        REQUIRE(fd >= 0);
+        REQUIRE(!ds41_la_start(-1));               /* no fd: fails, latched */
+        REQUIRE(!ds41_la_start(fd));
+        ds41_la_stop();                            /* engine close clears the latch */
+        g_ds41_la.predicted = 5; g_ds41_la.issued = 4; g_ds41_la.used = 3;
+        REQUIRE(ds41_la_start(fd));
+        REQUIRE(g_ds41_la.predicted == 0 && g_ds41_la.issued == 0 && g_ds41_la.used == 0 &&
+                g_ds41_la.mb.posted == 0 && g_ds41_la.mb.dropped == 0);
+        ds41_la_stop();
+        close(fd);
+    }
     /* Counter line format. */
     {
         char line[256] = "";

@@ -41197,7 +41197,8 @@ static struct {
     int32_t pred[DS41_LA_MAX_LAYER][DS41_LA_MAX_K];
     uint32_t pred_n[DS41_LA_MAX_LAYER], pred_pos[DS41_LA_MAX_LAYER];
     uint64_t predicted, issued, used;
-} g_ds41_la = {.mu = PTHREAD_MUTEX_INITIALIZER, .fd = -1};
+} g_ds41_la = {.mu = PTHREAD_MUTEX_INITIALIZER, .fd = -1,
+               .mb = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER}};
 
 static void ds41_la_record(uint32_t layer, uint32_t pos, const int32_t *ids, uint32_t n) {
     if (layer >= DS41_LA_MAX_LAYER) return;
@@ -41264,7 +41265,14 @@ static bool ds41_la_start(int model_fd) {
         pthread_mutex_unlock(&g_ds41_la.mu);
         return ok;
     }
-    ds41_la_mailbox_init(&g_ds41_la.mb);
+    /* The mailbox lock is statically initialised (the counter print may run
+     * before any start); a start resets the state and every counter. */
+    pthread_mutex_lock(&g_ds41_la.mb.mu);
+    g_ds41_la.mb.full = false;
+    g_ds41_la.mb.posted = g_ds41_la.mb.dropped = 0;
+    pthread_mutex_unlock(&g_ds41_la.mb.mu);
+    g_ds41_la.predicted = g_ds41_la.issued = g_ds41_la.used = 0;
+    for (uint32_t l = 0; l < DS41_LA_MAX_LAYER; l++) g_ds41_la.pred_n[l] = 0;
     g_ds41_la.stop = false;
     g_ds41_la.fd = model_fd >= 0 ? dup(model_fd) : -1;
     if (g_ds41_la.fd < 0 || pthread_create(&g_ds41_la.th, NULL, ds41_la_main, NULL) != 0) {
@@ -41284,6 +41292,7 @@ static bool ds41_la_start(int model_fd) {
 static void ds41_la_stop(void) {
     pthread_mutex_lock(&g_ds41_la.mu);
     const bool started = g_ds41_la.started;
+    g_ds41_la.failed = false;   /* the next engine retries a failed start */
     pthread_mutex_unlock(&g_ds41_la.mu);
     if (!started) return;
     pthread_mutex_lock(&g_ds41_la.mb.mu);
