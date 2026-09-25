@@ -3601,7 +3601,11 @@ int ds4_gpu_qwen4_moe_stream_layer(
 /* Stage one streamed layer's selected experts so the resident MoE kernels can
  * read them; binds of its gate/up/down tensors use the staging buffer until
  * ds4_gpu_qwen4_stream_stage_clear(). A nonzero seed_tokens also copies the
- * experts of the last seed_tokens rows into the decode expert cache. */
+ * experts of the last seed_tokens rows into the decode expert cache. This is
+ * the union path's writer of slot 0: once the pipe has run, it first waits
+ * for any queued pipe reads and invalidates slot 0's job before its own
+ * synchronous read, so the pipe's bookkeeping never overlaps a union write
+ * to the same buffer. */
 int ds4_gpu_qwen4_stream_stage_layer(
         const void *model_map, uint64_t model_size, uint32_t layer,
         const ds4_gpu_tensor *selected, uint32_t n_tokens, uint32_t n_slots,
@@ -3630,7 +3634,10 @@ int ds4_gpu_qwen4_stream_stage_layer_pipe(
         uint64_t next_down_offset, uint32_t next_gate_type, uint32_t next_down_type,
         int nocache);
 /* The prompt ended or was abandoned: wait for queued reads, forget them, and
- * release the spare staging buffer. No-op until the pipe has run. */
+ * release the spare staging buffer. No-op until the pipe has run. Requires
+ * that no command buffer still reading the spare is in flight when called —
+ * callers call it after end_commands, once the GPU has drained the batches
+ * that read it. */
 void ds4_gpu_qwen4_stream_stage_prompt_end(void);
 int ds4_gpu_qwen4_moe_mid_grouped_tensor(
         ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,

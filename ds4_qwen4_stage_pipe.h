@@ -78,14 +78,24 @@ static inline void qsp_finish(qsp_state *p, int i, bool ok) {
 }
 
 /* Slot i is staged for the batch being encoded: its job is consumed and the
- * batch's next commit becomes its last reader. */
+ * batch's next commit becomes its last reader.
+ *
+ * Hazard invariant: the first commit after this call is taken as the slot's
+ * last reader (qsp_note_commit below). Nothing may commit between this call
+ * and the last GEMM that reads the slot, unless that commit is followed by a
+ * full wait for the GPU (which is what makes an earlier, in-between commit
+ * safe to treat as the last reader too). A commit that races ahead of the
+ * slot's real last-reading GEMM would let a later read into the slot start
+ * before that GEMM has actually finished reading it. */
 static inline void qsp_activate(qsp_state *p, int i) {
     p->slot[i].state = QSP_IDLE;
     p->slot[i].reader_pending = true;
 }
 
 /* A batch was committed. Returns the slots (bit i) that took it as their last
- * reader; a slot keeps the first commit after its activation. */
+ * reader; a slot keeps the first commit after its activation (see the
+ * hazard invariant documented on qsp_activate above: the caller must ensure
+ * that first commit really does follow the slot's last reading GEMM). */
 static inline unsigned qsp_note_commit(qsp_state *p) {
     unsigned mask = 0;
     for (int i = 0; i < 2; i++) {

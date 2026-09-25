@@ -6,8 +6,11 @@ Date: 2026-09-25. Branch `feature/qwen4-prefill-pipe` at `90a5c80`. Model unc48L
 
 ## Knob
 
-`DS4_QWEN4_PREFILL_MODE=off|safe|max` (engine default `off`); see the spec (residency scope in `safe`, plus the
-double-buffered streaming-expert staging pipe in `max`).
+`DS4_QWEN4_PREFILL_MODE=off|safe|max` (engine default `off`). `safe` applies the residency scope plus the
+double-buffered streaming-expert staging pipe (F_NOCACHE reads) to every prefill chunk except the prompt's
+last chunk, which still runs the pre-existing union path with no residency. `max` applies residency + pipe
+to every chunk, including the last. See `qwen4_prefill_policy()` in `ds4.c` and the spec's policy table for
+the source of truth.
 
 Chosen for PROD: **`off`** (rule: `max` if decode >= 97% of PROD on both long-prompt requests AND prefill >=
 +10% on the long request; else `safe` under the same rule; else `off`). Neither `max` nor `safe` passed the
@@ -50,7 +53,7 @@ long-prompt paired A/B gate (`qwen_gate.py longab`) run in this task — see bel
 
 ## Long-prompt paired A/B (qwen_gate longab)
 
-Commit `90a5c80`, `--out /tmp/claude-501/qpp-longab-{max,safe}`, interleaved PROD/branch/branch/PROD servers,
+Measured at commit `90a5c80` (this file committed later, at `1e49903`), `--out /tmp/claude-501/qpp-longab-{max,safe}`, interleaved PROD/branch/branch/PROD servers,
 long request = ~110K filler chars, medium = ~17K, 300 max tokens each.
 
 | mode | request | PROD prefill (t/s) | branch prefill (t/s) | x | PROD decode (t/s) | branch decode (t/s) | x | verdict |
@@ -58,7 +61,7 @@ long request = ~110K filler chars, medium = ~17K, 300 max tokens each.
 | max | long | 498.9 | 539.4 | 1.081 | 38.25 | 35.88 | 0.938 | FAIL (decode < 0.97; prefill < 1.10) |
 | max | medium | 338.2 | 450.3 | 1.331 | 38.57 | 35.73 | 0.927 | FAIL (decode < 0.97) |
 | safe | long | 501.3 | 526.2 | 1.050 | 37.18 | 36.64 | 0.986 | FAIL (prefill < 1.10; decode OK) |
-| safe | medium | 327.3 | 353.5 | 1.080 | 38.31 | 37.22 | 0.971 | decode OK (medium has no prefill-gain requirement) |
+| safe | medium | 327.3 | 353.5 | 1.080 | 38.31 | 37.22 | 0.971 | PASS (decode OK; medium has no prefill-gain requirement) |
 
 `qwen_gate.py longab --prefill-mode max`: `qwen_gate: FAIL` (long decode 0.938, medium decode 0.927, long
 prefill 1.081 < 1.10).
@@ -83,11 +86,14 @@ Commit `90a5c80`, `speed-bench/qwen-prefill-pipe/cli_run.sh $O idle-$m $O/prompt
 | safe | 542.44 | 20.28 | 67844.3 | 51205.2 | 24.5% | 572.7 (27) |
 | max | 530.61 | 18.54 | 69413.2 | 55904.6 | 19.5% | 6.3 (11) |
 
-Launch latency: `off` ~8.9 s, `safe` ~0.57 s, `max` ~0.006 s, matching the brief's expected band (safe/max
-under 1 s; off in the 10-20 s band, measured slightly under 10 s here as in Task 3's run — consistent with
-Task 3's `idle-off` at 8914.9 ms). The residency scope (`safe`) and the staging pipe (`max`) both remove
-launch latency essentially completely; this does not translate into the required +10%/97% server-side A/B
-result once decode-side page-cache/read contention (see Task 4's report) is accounted for.
+The launch-latency totals are summed over different wait counts per mode (off 299, safe 27, max 11) and are
+not directly comparable; compare mean latency per wait instead: off 8946.5/299 ≈ 29.9 ms/wait, safe
+572.7/27 ≈ 21.2 ms/wait, max 6.3/11 ≈ 0.57 ms/wait. `safe`'s much smaller total mostly reflects that it
+waits far less often (the residency scope removes the wait on every chunk but the last, per the Knob
+section above), not a large per-wait improvement over `off`. `max` removes launch latency essentially
+completely, both in total and per wait, matching the brief's expected under-1-s band; this does not
+translate into the required +10%/97% server-side A/B result once decode-side page-cache/read contention
+(see Task 4's report) is accounted for.
 
 ## Full tier
 
@@ -98,9 +104,18 @@ behavior: decode 42.80 t/s median, steady wired 45.80 GiB, needle hit at 214,672
 
 ## Why `off`: background from Tasks 3-4 (GPU sections, not re-run here)
 
-- Task 3 (commit `c7d1c1b`): residency alone (`safe`) gave a dramatic launch-latency win on tiny prefills
-  (`chat`: 15.08 -> ~86 t/s CLI prefill) but only +3.3% (cli_exact) to +7.0% (GPU-idle run) on the 36K prompt —
-  both below the spec's informal +10% expectation, flagged as a concern at the time.
+- Task 3 (commit `c7d1c1b`) originally read `chat-off 15.08 -> chat-safe ~86 t/s` (cli_exact) as a dramatic
+  residency win. That reading is wrong: `chat` is a single prompt chunk, which is always the prompt's LAST
+  chunk, and `safe` explicitly excludes the last chunk (see the Knob section) — `safe` does no residency or
+  pipe work on `chat` at all. The jump is a run-order effect: `cli_exact.sh` always runs `off` first against
+  a cold page cache, then `safe` and `max` against a warm one, so `off`'s chat number is depressed and
+  `safe`/`max`'s are inflated by the warm cache alone. Task 3's own numbers confirm it: `chat-safe 86.10`
+  and `chat-max 85.97` are within noise of each other even though `max` (unlike `safe`) does apply residency
+  and the pipe to `chat`'s one chunk — if residency explained the win, `safe` and `max` would not land on
+  the same number. `cli_exact.sh`'s speed columns are therefore only an informal sanity signal, biased by
+  this fixed run order; the actual pass/fail check there is md5 equality, not the t/s numbers. On the 36K
+  prompt (where `safe` does have non-last chunks to act on), residency gave only +3.3% (cli_exact) to +7.0%
+  (GPU-idle run) — both below the spec's informal +10% expectation, flagged as a concern at the time.
 - Task 4 (commit `7f4ed87`): the staging pipe (`max`) reached 280+ pipe-served layers per run (287/288) and
   cut GPU idle from 28.5% (off) to 14.4% (max) in a profiled run, but prefill gain was only +1% (cli_exact,
   553.5 vs 548.2 t/s) to +11% (profiled pair, 528.7 vs 476.5 t/s) — the whole-layer pipe reads are SSD-bound

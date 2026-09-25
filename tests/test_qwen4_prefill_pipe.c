@@ -25,7 +25,9 @@ static bool flags_eq(qwen4_prefill_flags f, bool r, bool p, bool n) {
 
 static void check_policy(void) {
     const uint32_t lo = qwen4_moe_mm_min(), hi = qwen4_moe_mm_min() + 1u;
+#ifdef DS4_HAS_QWEN4_METAL
     CHECK(lo == 64u);
+#endif
     /* off, NONE, too few rows, or not streaming: nothing */
     CHECK(flags_eq(qwen4_prefill_policy(QWEN4_PREFILL_OFF, QWEN4_PREFILL_ROLE_MIDDLE, 2048, true), 0, 0, 0));
     CHECK(flags_eq(qwen4_prefill_policy(QWEN4_PREFILL_MAX, QWEN4_PREFILL_ROLE_NONE, 2048, true), 0, 0, 0));

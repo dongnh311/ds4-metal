@@ -60551,6 +60551,13 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                   DS4_N_FF_EXP, DS4_N_EMBD, seed) != 0;
     }
     const bool mm = mm_shape && (!experts_streamed || staged);
+    /* Hazard invariant (ds4_qwen4_stage_pipe.h, qsp_activate/qsp_note_commit):
+     * when `staged` came from the pipe (ds4_gpu_qwen4_stream_stage_layer_pipe
+     * above), the pipe's stage call already activated the slot the GEMMs
+     * below read, and it takes the batch's first commit after that as the
+     * slot's last reader. Nothing may commit between the stage call above
+     * and the last GEMM here reading the staged slot (mid/down below),
+     * unless that intervening commit is followed by a full GPU wait. */
     if (mm) {
         if (ok) {
             ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, DS4_N_EXPERT_USED,

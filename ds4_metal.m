@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #define ACCELERATE_NEW_LAPACK 1
 #include <Accelerate/Accelerate.h>
@@ -1769,8 +1770,11 @@ static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, con
     if (!owned) return 1;
 
     const double t_commit = ds4_gpu_now_ms();
-    const double h_commit = ds4_gpu_host_seconds();
-    const BOOL had_pending = [g_pending_cbs count] != 0;
+    /* h_commit/had_pending feed only the g_gpu_idle_prof accounting below
+     * (DS4_METAL_GPU_IDLE); compute them there so the default path pays no
+     * extra work for diagnostics it does not use. */
+    const double h_commit = g_gpu_idle_prof > 0 ? ds4_gpu_host_seconds() : 0.0;
+    const BOOL had_pending = g_gpu_idle_prof > 0 ? [g_pending_cbs count] != 0 : NO;
     [cb commit];
     int ok = ds4_gpu_wait_pending_command_buffers(label);
     if (!ds4_gpu_wait_command_buffer(cb, label)) {
@@ -51302,14 +51306,27 @@ static id<MTLBuffer> qpipe_buffer(int s) {
 }
 
 /* Reader thread only: the model file through a second fd that bypasses the
- * page cache, or the shared fd when that cannot be opened. */
+ * page cache, or the shared fd when that cannot be opened. Reopens by path
+ * (F_GETPATH), so it also verifies the reopened fd still names the same
+ * file (st_dev/st_ino match g_model_fd) before using it: if the GGUF was
+ * replaced by rename after load, a bare path reopen would silently read
+ * the new file. On a mismatch (or any other failure), fall back to the
+ * shared fd with no F_NOCACHE, same as the existing fallback path. */
 static int qpipe_nocache_fd(void) {
     if (g_qpipe_nocache_fd < 0 && g_model_fd >= 0) {
         char path[MAXPATHLEN];
         if (fcntl(g_model_fd, F_GETPATH, path) != -1) {
             const int fd = open(path, O_RDONLY | O_CLOEXEC);
-            if (fd >= 0 && fcntl(fd, F_NOCACHE, 1) != -1) g_qpipe_nocache_fd = fd;
-            else if (fd >= 0) close(fd);
+            if (fd >= 0) {
+                struct stat st_new, st_model;
+                if (fstat(fd, &st_new) == 0 && fstat(g_model_fd, &st_model) == 0 &&
+                    st_new.st_dev == st_model.st_dev && st_new.st_ino == st_model.st_ino &&
+                    fcntl(fd, F_NOCACHE, 1) != -1) {
+                    g_qpipe_nocache_fd = fd;
+                } else {
+                    close(fd);
+                }
+            }
         }
     }
     return g_qpipe_nocache_fd >= 0 ? g_qpipe_nocache_fd : g_model_fd;
