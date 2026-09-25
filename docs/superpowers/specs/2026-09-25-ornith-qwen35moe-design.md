@@ -300,9 +300,14 @@ A/B shows a gain.
    pipelines Qwen3.8 runs compile to the same code as today.
 2. **Predicate split.** Every site is classified in Appendix B. QWEN4_ONLY
    sites are left alone.
-3. **Separate knobs.** `DS4_QWEN4_*` environment variables are read only on
-   the qwen4exp path; the new family uses a `DS4_QWEN35_*` prefix. Tuning keyed
-   on `n_embd == 2560`, `n_rank == 320` or `n_hc == 4` stays as is.
+3. **Separate knobs.** Family-level `DS4_QWEN4_*` knobs (KV modes, prefill
+   chunk, PLE, MTP depth, SSD streaming, YaRN, kv-grow) are read only on the
+   qwen4exp path; Ornith reads none of them, and its own knobs use a
+   `DS4_QWEN35_*` prefix. The `DS4_QWEN4_*` switches inside the shared qwen4
+   kernels and helpers (dense GEMV, fused GDN front and decode fusions,
+   attention split, tiled and merge) choose between arithmetic-equivalent
+   kernel paths and apply to both families by design. Tuning keyed on
+   `n_embd == 2560`, `n_rank == 320` or `n_hc == 4` stays as is.
 4. **Qwen gate.** Every commit that touches a shared file (`ds4.c` outside the
    `.inc`, `ds4_metal.m`, `ds4_gpu.h`, `metal/*.metal`, `ds4_server.c`) passes
    before merge:

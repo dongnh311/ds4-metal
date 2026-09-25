@@ -10,7 +10,10 @@
  * llama.cpp converter already folded +1 into the norm weights, stores
  * ssm_a = -exp(A_log) and tiles the GDN value heads, which is what the qwen4
  * kernels expect.  The prefill chunk rule (qwen35_prefill_chunk_tokens)
- * lives in ds4.c next to the memory estimate that shares it. */
+ * lives in ds4.c next to the memory estimate that shares it.  The reused
+ * qwen4 helpers keep their DS4_QWEN4_* kernel A/B switches (dense GEMV,
+ * decode fusions, attention split/tiled/merge), which pick between
+ * arithmetic-equivalent paths; Ornith's own knobs use DS4_QWEN35_*. */
 
 static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_t cap_tokens) {
     memset(g, 0, sizeof(*g));
