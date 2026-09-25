@@ -150,8 +150,11 @@ A stage call accepts a done job only if the layer, all three offsets and the mod
 
 **Per-buffer last reader.** Each buffer remembers the command buffer that last carried GEMMs reading it:
 - When a stage call activates buffer `s` for layer `L`, `L`'s GEMMs are encoded into the open batch.
-- The next pipe commit records that command buffer as buffer `s`'s last reader.
-- `ds4_gpu_qwen4_stream_stage_chunk_end(last)`, called by `ds4.c` after the chunk's `ds4_gpu_end_commands`, clears every last reader (everything has completed).
+- The next commit of that batch records the committed command buffer as buffer `s`'s last reader. A hook in
+  `ds4_gpu_flush_commands` does this, so every commit counts: the pipe's own, the early flush at
+  layer 2, and the profiler seals.
+- A hook in `ds4_gpu_end_commands` clears every last reader, since everything has completed at that point.
+- Both hooks return at once until the pipe has run.
 
 **Stage call with a matching job for `L` in buffer `s`:**
 1. Commit the open batch without waiting (flush) and keep the committed command buffer.
@@ -166,10 +169,15 @@ A stage call accepts a done job only if the layer, all three offsets and the mod
 3. Run the existing union path (drain, read `selected`, union read) into buffer 0.
 4. Queue the next streamed layer into buffer 1 with no wait command buffer, since everything is drained.
 
-**Chunk end.** `ds4.c` calls `ds4_gpu_qwen4_stream_stage_chunk_end(last)` after every prefill chunk whose
-role is not `NONE`, whether or not that chunk used the pipe (a `safe` `LAST` chunk does not, but still ends
-the prompt). It clears the last readers. With `last`, it also waits for any queued job, marks both
-buffers idle and releases buffer 1.
+**Prompt end.** `ds4.c` calls `ds4_gpu_qwen4_stream_stage_prompt_end()` after the `ds4_gpu_end_commands`
+of every chunk that ends a prompt. It also calls it after a failed chunk, and when the server abandons a prompt
+between chunks (cancellation). The call happens whether or not that chunk used the pipe: a `safe` `LAST`
+chunk does not, but it still ends the prompt. `prompt_end` does three things:
+- waits for any queued job;
+- marks both buffers idle and clears the last readers;
+- releases buffer 1.
+
+The mode must not be `off`, and the run must be streaming.
 
 **Failures and cleanup.**
 - A read failure sends that layer to the union path.
@@ -199,12 +207,14 @@ wait, the read time and the wait on the command buffer.
 | ds4.c | graph struct next to `stream_seed_last` (58949) | `prefill_role` |
 | ds4.c | new, near `qwen4_stream_seed_tokens` (8474) | mode parser, `qwen4_prefill_policy`, next-streamed-layer function |
 | ds4.c | `qwen4_graph_moe` staging call (60420) | pipe entry when `policy.pipe` |
-| ds4.c | `qwen4_graph_forward_tokens` (60645, 60793) | residency scope, `chunk_end` |
+| ds4.c | `qwen4_graph_forward_tokens` (60645, 60793) | residency scope, `prompt_end` |
+| ds4.c | server loop cancellation branch (77640) | `prompt_end` for an abandoned prompt |
 | ds4.c | CLI loop (61194), server loop (77652) | set and reset `prefill_role` |
-| ds4_gpu.h | next to the stage API | residency scope, pipe entry, `chunk_end` |
+| ds4_gpu.h | next to the stage API | residency scope, pipe entry, `prompt_end` |
 | ds4_metal.m | `ds4_gpu_new_command_buffer` (1389) | attach the set inside the scope |
 | ds4_metal.m | `ds4_gpu_idle_note_cb` / `ds4_gpu_finish_command_buffer` (1595, 1675) | launch-latency diagnostic |
 | ds4_metal.m | next to `ds4_gpu_qwen4_stream_stage_layer` (51016) | pipe module |
+| ds4_metal.m | `ds4_gpu_flush_commands` (9680), `ds4_gpu_end_commands` (11697) | last-reader hooks |
 | ds4_metal.m | `ds4_gpu_cleanup` (11866) | stop the pipe, release the set, buffers and fd |
 | new C header | `ds4_qwen4_stage_pipe.h` | pure bookkeeping |
 | tests/ | new model-free test + Makefile target | policy, next layer, bookkeeping |
@@ -219,9 +229,9 @@ wait, the read time and the wait on the command buffer.
 - Pipe bookkeeping:
   - queue and serve in sequence order;
   - match and mismatch (layer, offsets, map);
-  - last-reader recorded on commit and cleared on chunk end;
+  - last-reader recorded on the first commit after activation and cleared when everything completed;
   - failed job goes to the union path;
-  - chunk end with `last` releases the spare and leaves no queued job.
+  - prompt end (including an abandoned prompt with a queued wrap read) leaves no queued job and no match.
 
 **With the model** (GPU; only when the user allows and the machine is free, oMLX and watchdogs down and restored after):
 - **Exactness:** CLI output byte-identical across `off`, `safe` and `max` on a ~50-token chat, 5K, 36K and 134K
