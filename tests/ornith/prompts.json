@@ -1,0 +1,14 @@
+[
+  {"name": "en_capital", "text": "The capital of France is", "n_predict": 64},
+  {"name": "en_story", "text": "Once upon a time, in a small village by the sea, there lived", "n_predict": 64},
+  {"name": "en_explain", "text": "Explain in two sentences why the sky is blue:", "n_predict": 64},
+  {"name": "vi_greeting", "text": "Xin chào! Hôm nay tôi muốn kể cho bạn nghe về", "n_predict": 64},
+  {"name": "vi_hanoi", "text": "Hà Nội là thủ đô của Việt Nam. Thành phố này", "n_predict": 64},
+  {"name": "code_py", "text": "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n", "n_predict": 64},
+  {"name": "code_c", "text": "#include <stdio.h>\n\nint main(void) {\n", "n_predict": 64},
+  {"name": "code_rust", "text": "fn main() {\n    let v: Vec<i32> = (1..=10).collect();\n", "n_predict": 64},
+  {"name": "json_obj", "text": "{\"name\": \"Alice\", \"age\": 30, \"city\":", "n_predict": 32},
+  {"name": "math_mul", "text": "Q: What is 17 * 23?\nA:", "n_predict": 32},
+  {"name": "list_tips", "text": "Three tips for writing clean code:\n1.", "n_predict": 64},
+  {"name": "long_it", "file": "speed-bench/promessi_sposi.txt", "chars": 32000, "n_predict": 16}
+]
