@@ -32,6 +32,8 @@ answers recorded). 38 prompts x 5 budgets = 190 requests.
 
 Every N keeps every N=0 pass (gsm8k 16/16, humaneval 17/17 throughout). `forced` = number of
 prompts (out of 38) whose thinking was cut by the budget (0/0/0/1/2 for N = 0/8192/4096/2048/1024).
+The `total seconds` column is single-sample noise, not a speed result: the 36 prompts no budget
+touched took 368.2 s in the N=1024 run vs ~337-339 s in the others.
 
 ## Unlimited-run (N=0) thinking distribution, by kind
 
@@ -64,17 +66,24 @@ Across all 38 prompts, only 2 ever reach 1024 thinking tokens unforced (p90 = 64
 
 ## Chosen N
 
-**N = 1024** — the lowest budget whose graded pass set (gsm8k 16/16, humaneval 17/17) keeps
-every case that passed at N=0.
+**Chosen N = 1024 (plan rule)** — the lowest budget whose graded pass set (gsm8k 16/16,
+humaneval 17/17) keeps every case that passed at N=0.
+
+**Recommended PROD start: 4096.** 4096 and 8192 never fired on this set, so they act as pure
+runaway guards. Start PROD at 4096, collect the `thinking closed after K tokens` distribution
+from real agent traffic, then lower N from that evidence.
 
 Caveat, stated plainly: the benchmark set is small and easy (thinking p90 is only 644 tokens;
 only 2 of 38 prompts ever reach 1024 unforced) and has no long agentic/tool turns, so the
 evidence here for a low cap on real agent traffic is thin. The PROD value should be confirmed
 with the user at deploy time; raising N later is a one-line registry change.
 
-Known measurement caveat (from review): a "thinking closed after N tokens (budget)" log line
-can also fire when `max_tokens` ends on the fire token, not just on the budget cutting thinking
-short. Not reachable in this run (`max_tokens 16384` is far above every budget tested).
+Known measurement caveat (from review): in the build measured here, the "thinking budget
+reached N tokens; forced close" log line could print when `max_tokens` ended generation on the
+token that spent the budget, even though no forced close followed. Not reachable in this run
+(`max_tokens 16384` is far above every budget tested). The final-review fix wave removes it: the
+line now prints only when the forced suffix is actually queued (still inside `<think>`, not
+stopping, `completion < max_tokens`).
 
 ## Data
 
