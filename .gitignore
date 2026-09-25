@@ -49,3 +49,4 @@ __pycache__/
 speed-bench/fp8-flat-gate/
 /speed-bench/qwen-regression/last-*/
 /speed-bench/qwen-regression/baseline/server.log
+/speed-bench/think-budget/runs/*.log

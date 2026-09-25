@@ -364,6 +364,9 @@ static void print_server_thinking(FILE *fp, const help_colors *c) {
     para(fp, c, "Think Max requires --ctx >= 393216; smaller contexts use high.");
     para(fp, c, "thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.");
     para(fp, c, "In thinking mode, client sampling knobs are ignored like the official API.");
+    opt(fp, c, "--think-budget N", "Close reasoning after N generated tokens, then answer. 0 = no server cap. Default: 0");
+    opt(fp, c, "--think-budget-message TEXT", "Text inserted before the forced </think>. Default: Qwen's fallback sentence.");
+    para(fp, c, "Chat, Responses and Anthropic requests may set or lower the cap: thinking.budget_tokens, thinking_budget, chat_template_kwargs.thinking_budget.");
     fputc('\n', fp);
 }
 

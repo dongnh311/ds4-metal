@@ -49,6 +49,20 @@ Max only with sufficient context; otherwise it falls back to normal thinking.
 `xhigh` maps to normal thinking, not Think Max. Use `think:false`, a disabled
 thinking object, or a non-thinking model alias for direct answers.
 
+A hard reasoning cap is off unless the server flag or the request sets one.
+`--think-budget N` caps every thinking request at N generated reasoning tokens:
+the server inserts the `--think-budget-message` text (default: Qwen's
+"Considering the limited time by the user, I have to give the solution based
+on the thinking directly now."), then `</think>`, and the model answers in the
+same generation. Chat, Responses, and Anthropic requests can also set or lower
+the cap with `thinking.budget_tokens`, `thinking_budget`, or
+`chat_template_kwargs.thinking_budget`; when both the flag and a request value
+are set, the smaller one wins. `/v1/completions` uses only the server flag.
+The close happens at the end of the decode block in which the budget runs out,
+so reasoning can exceed N by a few tokens; while a tool call is open inside
+the reasoning the close waits, up to 2N tokens. Forced tokens count toward
+`max_tokens`. The cap is ignored with `--batched-session`.
+
 ## Multiple sessions
 
 ```sh
