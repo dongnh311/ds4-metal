@@ -750,7 +750,7 @@ else
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 endif
 
-tests/test_qwen4_prefill_pipe.o: tests/test_qwen4_prefill_pipe.c ds4.c ds4.h ds4_gpu.h
+tests/test_qwen4_prefill_pipe.o: tests/test_qwen4_prefill_pipe.c ds4.c ds4.h ds4_gpu.h ds4_qwen4_stage_pipe.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
 tests/test_qwen4_prefill_pipe: tests/test_qwen4_prefill_pipe.o $(filter-out ds4.o,$(CORE_OBJS))
