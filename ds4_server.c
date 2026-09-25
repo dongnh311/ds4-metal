@@ -12205,6 +12205,55 @@ static thinking_state thinking_state_from_prompt(const request *r) {
     return st;
 }
 
+/* Hard thinking budget (--think-budget, thinking.budget_tokens, thinking_budget).
+ * Qwen's documented fallback: when reasoning reaches the budget, append this
+ * sentence, close </think>, and let the model answer. */
+#define DS4_THINK_BUDGET_DEFAULT_MESSAGE \
+    "Considering the limited time by the user, I have to give the solution based on the thinking directly now."
+
+typedef struct {
+    int limit;   /* effective budget in generated tokens; 0 = unlimited */
+    int used;    /* generated tokens counted inside <think> */
+    bool fired;  /* the forced close has been queued */
+} think_budget_state;
+
+/* The smaller positive value wins; 0 means no budget on that side. */
+static int think_budget_effective(int server_limit, int request_limit) {
+    if (server_limit > 0 && request_limit > 0)
+        return server_limit < request_limit ? server_limit : request_limit;
+    if (server_limit > 0) return server_limit;
+    return request_limit > 0 ? request_limit : 0;
+}
+
+/* Count one kept token; true while the budget is spent and the close is due.
+ * Counting stops once the close fired, so forced tokens never count. */
+static bool think_budget_due(think_budget_state *b, bool inside_after) {
+    if (!b || b->fired || !inside_after) return false;
+    b->used++;
+    return b->limit > 0 && b->used >= b->limit;
+}
+
+/* True when the reasoning so far opened a tool-call block that has not closed:
+ * a forced </think> there would cut tool syntax, so the close waits. */
+static bool think_budget_tool_open(const char *text) {
+    if (!text) return false;
+    const char *start = find_last_substr(text, "<think>");
+    if (!start) start = text;
+    const char *open = NULL;
+    for (const char *p = find_any_tool_start(start); p; p = find_any_tool_start(p + 1))
+        open = p;
+    return open && !find_any_tool_end(open);
+}
+
+/* "\n\n<message>\n</think>\n\n"; the caller frees the result. */
+static char *think_budget_suffix_text(const char *message) {
+    buf b = {0};
+    buf_puts(&b, "\n\n");
+    buf_puts(&b, message && message[0] ? message : DS4_THINK_BUDGET_DEFAULT_MESSAGE);
+    buf_puts(&b, "\n</think>\n\n");
+    return buf_take(&b);
+}
+
 /* A completed tool block inside unclosed reasoning can be recovered without
  * predicting what the model will emit after an injected close marker. Keep a
  * short overlap until the opening appears, then wait for its matching end. */
@@ -18267,6 +18316,52 @@ static void test_api_thinking_controls_parse(void) {
     }
 }
 
+static void test_think_budget_rules(void) {
+    TEST_ASSERT(think_budget_effective(0, 0) == 0);
+    TEST_ASSERT(think_budget_effective(4096, 0) == 4096);
+    TEST_ASSERT(think_budget_effective(0, 512) == 512);
+    TEST_ASSERT(think_budget_effective(4096, 512) == 512);
+    TEST_ASSERT(think_budget_effective(512, 4096) == 512);
+
+    think_budget_state b = {.limit = 3};
+    TEST_ASSERT(!think_budget_due(&b, false));   /* outside <think>: not counted */
+    TEST_ASSERT(b.used == 0);
+    TEST_ASSERT(!think_budget_due(&b, true));
+    TEST_ASSERT(!think_budget_due(&b, true));
+    TEST_ASSERT(think_budget_due(&b, true));     /* the third token inside spends it */
+    TEST_ASSERT(b.used == 3);
+    TEST_ASSERT(think_budget_due(&b, true));     /* still due while the close waits */
+    b.fired = true;
+    const int used = b.used;
+    TEST_ASSERT(!think_budget_due(&b, true));    /* forced tokens never count */
+    TEST_ASSERT(b.used == used);
+
+    think_budget_state off = {0};
+    for (int i = 0; i < 10; i++) TEST_ASSERT(!think_budget_due(&off, true));
+    TEST_ASSERT(off.used == 10);                 /* counted for the log even when off */
+}
+
+static void test_think_budget_tool_open(void) {
+    TEST_ASSERT(!think_budget_tool_open(NULL));
+    TEST_ASSERT(!think_budget_tool_open("Let me think about primes."));
+    TEST_ASSERT(think_budget_tool_open("I will call it: <tool_call>{\"name\":\"ls\""));
+    TEST_ASSERT(!think_budget_tool_open("<tool_call>{\"name\":\"ls\"}</tool_call> then more"));
+    TEST_ASSERT(think_budget_tool_open("<tool_call>a</tool_call> and <tool_call>b"));
+    TEST_ASSERT(!think_budget_tool_open("old <tool_call> before <think> new reasoning"));
+}
+
+static void test_think_budget_suffix_text(void) {
+    char *s = think_budget_suffix_text(NULL);
+    TEST_ASSERT(!strcmp(s, "\n\n" DS4_THINK_BUDGET_DEFAULT_MESSAGE "\n</think>\n\n"));
+    free(s);
+    s = think_budget_suffix_text("");
+    TEST_ASSERT(!strcmp(s, "\n\n" DS4_THINK_BUDGET_DEFAULT_MESSAGE "\n</think>\n\n"));
+    free(s);
+    s = think_budget_suffix_text("Wrap up now.");
+    TEST_ASSERT(!strcmp(s, "\n\nWrap up now.\n</think>\n\n"));
+    free(s);
+}
+
 static void test_render_think_max_prompt_prefix(void) {
     chat_msgs msgs = {0};
     chat_msg sys = {0};
@@ -22952,6 +23047,9 @@ static void ds4_server_unit_tests_run(void) {
     test_reasoning_effort_mapping();
     test_model_alias_thinking_controls();
     test_api_thinking_controls_parse();
+    test_think_budget_rules();
+    test_think_budget_tool_open();
+    test_think_budget_suffix_text();
     test_render_think_max_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();
