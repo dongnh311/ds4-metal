@@ -102,12 +102,11 @@ Existing work, checked and not reused as a base:
 
 ### Where the code lives
 
-- The graph, weight binding, session state and payload code for the family go
-  in a new `ds4_qwen35moe.inc`, included by `ds4.c` right after the qwen4 Metal
-  graph block. This keeps the family readable as one unit and lets it call the
-  `static` qwen4 helpers (`qwen4_gemv`, `qwen4_graph_linear`, the router and
-  MoE kernels) without exporting them. The repo already includes `.inc`
-  files this way (`ds4_streaming_hotlist.inc`, `ds4_qwen4_unicode.inc`).
+- The graph, one-shot generation and session helpers for the family go in a
+  new `ds4_qwen35moe.inc`; the validator, weight binding and layout
+  validation stay beside their qwen4 counterparts in `ds4.c` because
+  `weights_bind()` runs before the graph block. The repo already includes
+  `.inc` files this way (`ds4_streaming_hotlist.inc`, `ds4_qwen4_unicode.inc`).
 - `ds4.c` gets one branch per dispatch point (engine open, session
   create/free, forward, speculative cycle, payload save/load, context cap),
   each calling into the `.inc`.
