@@ -61532,6 +61532,9 @@ struct ds4_session {
     ds4_qwen4_gpu_graph qwen4_graph;
     bool qwen4_graph_ready;
     int qwen4_slot;   /* -1 when the session holds private recurrent state */
+    /* Ornith (qwen35moe) sessions reuse qwen4_graph for their graph but never
+     * set qwen4_graph_ready, so qwen4-only paths that test it stay off. */
+    bool qwen35_graph_ready;
     bool qwen4_rewound;
     float *qwen4_verify_logits;
     uint64_t qwen4_spec_cycles;
@@ -62556,6 +62559,10 @@ static bool ds4_session_is_glm(const ds4_session *s) {
 
 static bool ds4_session_is_qwen4(const ds4_session *s) {
     return s && s->engine && ds4_model_is_qwen4();
+}
+
+static DS4_MAYBE_UNUSED bool ds4_session_is_qwen35(const ds4_session *s) {
+    return s && s->engine && ds4_model_is_qwen35moe();
 }
 
 #ifndef DS4_NO_GPU
@@ -74305,6 +74312,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             fprintf(stderr, "ds4: Qwen3.8 sessions require Metal or CUDA\n");
             return 1;
         }
+        if (ds4_model_is_qwen35moe()) {
+            fprintf(stderr, "ds4: Ornith sessions require Metal\n");
+            return 1;
+        }
         if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
             fprintf(stderr, "ds4: distributed coordinator sessions require the graph backend\n");
             return 1;
@@ -74374,6 +74385,30 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         return 0;
     }
 #endif
+#ifdef DS4_HAS_QWEN4_METAL
+    if (ds4_model_is_qwen35moe()) {
+        if (e->backend != DS4_BACKEND_METAL || e->distributed.role != DS4_DISTRIBUTED_NONE) {
+            fprintf(stderr, "ds4: Ornith sessions require single-host Metal\n");
+            free(s);
+            return 1;
+        }
+        const uint32_t cap_tokens = e->prefill_chunk && e->prefill_chunk < (uint32_t)ctx_size ?
+            e->prefill_chunk : qwen35_prefill_chunk_tokens((uint32_t)ctx_size);
+        s->qwen4_slot = -1;
+        if (!qwen35_graph_alloc(&s->qwen4_graph, (uint32_t)ctx_size, cap_tokens)) {
+            free(s);
+            return 1;
+        }
+        qwen35_graph_reset(&s->qwen4_graph);
+        s->qwen35_graph_ready = true;
+        s->prefill_cap = (uint32_t)ctx_size;
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
+        *out = s;
+        return 0;
+    }
+#endif
+    ds4_qwen35_not_reached("session create");
 #ifdef DS4_HAS_QWEN4_GPU
     if (ds4_model_is_qwen4()) {
         if ((e->backend != DS4_BACKEND_METAL && e->backend != DS4_BACKEND_CUDA) ||
@@ -74813,6 +74848,11 @@ void ds4_session_free(ds4_session *s) {
         if (s->ds41_graph_ready) {
             s->engine->ds41_session_bytes -= s->ds41_graph.allocation_bytes;
             ds41_graph_free(&s->ds41_graph);
+        } else
+#endif
+#ifdef DS4_HAS_QWEN4_METAL
+        if (s->qwen35_graph_ready) {
+            qwen4_graph_free(&s->qwen4_graph);
         } else
 #endif
 #ifdef DS4_HAS_QWEN4_GPU
@@ -76963,6 +77003,54 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                      err,
                                      errlen);
     }
+#ifdef DS4_HAS_QWEN4_METAL
+    if (ds4_session_is_qwen35(s)) {
+        ds4_engine *e = s->engine;
+        ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+        int start = 0;
+        if (s->checkpoint_valid && g->pos == (uint32_t)s->checkpoint.len &&
+            prompt->len >= s->checkpoint.len && ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+            start = s->checkpoint.len;
+        } else {
+            /* A different prompt, a rewind or a failed forward: the recurrent
+             * state cannot be trimmed, so replay from the start. */
+            qwen35_graph_reset(g);
+            s->checkpoint.len = 0;
+            s->checkpoint_valid = false;
+        }
+        if ((uint32_t)prompt->len > g->ctx_cap) {
+            snprintf(err, errlen, "prompt of %d tokens exceeds the %u-token context", prompt->len, g->ctx_cap);
+            return 1;
+        }
+        for (int i = start; i < prompt->len; i++) {
+            if (prompt->v[i] < 0 || prompt->v[i] >= (int)DS4_N_VOCAB) {
+                snprintf(err, errlen, "token id %d at position %d is outside the vocabulary", prompt->v[i], i);
+                return 1;
+            }
+        }
+        for (int i = start; i < prompt->len;) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                s->checkpoint_valid = s->checkpoint.len > 0;
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            uint32_t chunk = (uint32_t)(prompt->len - i);
+            if (chunk > g->cap_tokens) chunk = g->cap_tokens;
+            s->checkpoint_valid = false;
+            if (!qwen35_graph_forward_tokens(g, &e->model, &e->weights, prompt->v + i, chunk, s->logits)) {
+                snprintf(err, errlen, "Ornith prefill failed at token %d", i);
+                return 1;
+            }
+            for (uint32_t j = 0; j < chunk; j++) token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
+            i += (int)chunk;
+            s->checkpoint_valid = true;
+            s->mtp_draft_valid = false;
+            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
+        }
+        s->checkpoint_valid = true;
+        return 0;
+    }
+#endif
 #ifdef DS4_HAS_QWEN4_GPU
     if (ds4_session_is_qwen4(s)) {
         ds4_engine *e = s->engine;
@@ -77039,6 +77127,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         return 0;
     }
 #endif
+    ds4_qwen35_not_reached("session sync");
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
         if (s->checkpoint_valid &&
@@ -79037,6 +79126,28 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         return 0;
     }
 #endif
+#ifdef DS4_HAS_QWEN4_METAL
+    if (ds4_session_is_qwen35(s)) {
+        ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+        if (!s->qwen35_graph_ready || !s->checkpoint_valid || g->pos != (uint32_t)s->checkpoint.len) {
+            if (errlen) snprintf(err, errlen, "Ornith session is not synchronized");
+            return 1;
+        }
+        if (g->pos >= g->ctx_cap) {
+            if (errlen) snprintf(err, errlen, "context is full");
+            return 1;
+        }
+        if (!qwen35_graph_forward_tokens(g, &e->model, &e->weights, &token, 1, s->logits)) {
+            if (errlen) snprintf(err, errlen, "Ornith decode failed at position %u", g->pos);
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        return 0;
+    }
+#endif
 #ifdef DS4_HAS_QWEN4_GPU
     if (ds4_session_is_qwen4(s)) {
         if (!s->qwen4_graph_ready) {
@@ -79063,6 +79174,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         return 0;
     }
 #endif
+    ds4_qwen35_not_reached("session eval");
     if (ds4_session_is_glm(s)) {
         if (!s->glm_graph_ready) {
             if (errlen) snprintf(err, errlen, "%s GLM graph is not initialized",
