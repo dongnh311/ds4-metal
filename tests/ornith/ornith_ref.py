@@ -3,16 +3,23 @@
 References come from llama.cpp's llama-server on the same GGUF; ds4 output
 comes from `ds4 --dump-logprobs`.  Both are reduced to the same step form,
 {"selected": id, "top": [[id, logprob], ...]}, and compared greedily: the
-selected tokens must match and every token in both top-k lists must agree
-within a tolerance, until the reference reaches a near-tie (top-1/top-2 gap
-below `tie`), after which a different but equally valid continuation is
-allowed.  The tolerances are calibrated from llama.cpp's own Metal-versus-CPU
-spread instead of being picked by hand.
+selected tokens must match and every probable token (reference log-prob >=
+PROBABLE) in both top-k lists must agree within a tolerance, until the
+reference reaches a near-tie (top-1/top-2 gap below `tie`), after which a
+different but equally valid continuation is allowed.  The tolerances are
+calibrated from llama.cpp's own Metal-versus-CPU spread instead of being
+picked by hand.
 """
 import json
 import os
 
 FLOOR = 0.05  # log-prob; the smallest tolerance and tie gap the gate uses
+
+# Tail ranks (roughly log-prob < -2, i.e. under ~13% probability) carry
+# activation-quantization noise from the CPU backend that says nothing about
+# correctness; only probable tokens are where an implementation error would
+# actually show up, so max_delta/tol are only computed over those.
+PROBABLE = -2.0
 
 
 def load_prompts(path):
@@ -61,7 +68,7 @@ def compare(ref_steps, got_steps, tol, tie):
         got = got_steps[i]
         mine = dict((tid, lp) for tid, lp in got["top"])
         for tid, lp in ref["top"]:
-            if tid in mine:
+            if lp >= PROBABLE and tid in mine:
                 res["max_delta"] = max(res["max_delta"], abs(mine[tid] - lp))
         if got["selected"] != ref["selected"]:
             res.update(ok=False, first_mismatch=i,

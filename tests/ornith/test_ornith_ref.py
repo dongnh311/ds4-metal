@@ -36,10 +36,16 @@ class CompareTest(unittest.TestCase):
 
     def test_logprob_delta_above_tolerance_fails(self):
         ref = [step(5, (5, -0.1), (7, -3.0))]
-        got = [step(5, (5, -0.1), (7, -2.5))]
+        got = [step(5, (5, -0.6), (7, -3.0))]
         res = r.compare(ref, got, tol=0.05, tie=0.05)
         self.assertFalse(res["ok"])
         self.assertAlmostEqual(res["max_delta"], 0.5)
+
+    def test_tail_delta_is_ignored(self):
+        ref = [step(5, (5, -0.1), (7, -3.0))]
+        got = [step(5, (5, -0.1), (7, -6.0))]
+        res = r.compare(ref, got, tol=0.05, tie=0.05)
+        self.assertTrue(res["ok"])
 
     def test_shorter_output_fails_unless_stopped(self):
         ref = [step(5, (5, -0.1), (7, -3.0)), step(9, (9, -0.2), (2, -2.5))]
@@ -53,7 +59,7 @@ class CompareTest(unittest.TestCase):
         cal = r.calibrate(metal, cpu)
         self.assertAlmostEqual(cal["tol"], 0.05)
         self.assertAlmostEqual(cal["tie"], 0.05)
-        self.assertAlmostEqual(cal["observed_max_delta"], 0.002, places=6)
+        self.assertAlmostEqual(cal["observed_max_delta"], 0.001, places=6)
 
 
 class NormaliseTest(unittest.TestCase):
