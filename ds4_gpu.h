@@ -3601,7 +3601,11 @@ int ds4_gpu_qwen4_moe_stream_layer(
 /* Stage one streamed layer's selected experts so the resident MoE kernels can
  * read them; binds of its gate/up/down tensors use the staging buffer until
  * ds4_gpu_qwen4_stream_stage_clear(). A nonzero seed_tokens also copies the
- * experts of the last seed_tokens rows into the decode expert cache. */
+ * experts of the last seed_tokens rows into the decode expert cache. This is
+ * the union path's writer of slot 0: once the pipe has run, it first waits
+ * for any queued pipe reads and invalidates slot 0's job before its own
+ * synchronous read, so the pipe's bookkeeping never overlaps a union write
+ * to the same buffer. */
 int ds4_gpu_qwen4_stream_stage_layer(
         const void *model_map, uint64_t model_size, uint32_t layer,
         const ds4_gpu_tensor *selected, uint32_t n_tokens, uint32_t n_slots,
@@ -3610,6 +3614,31 @@ int ds4_gpu_qwen4_stream_stage_layer(
         uint32_t n_expert, uint32_t in_dim, uint32_t ff_dim, uint32_t out_dim,
         uint32_t seed_tokens);
 void ds4_gpu_qwen4_stream_stage_clear(void);
+/* qwen4 prefill residency (DS4_QWEN4_PREFILL_MODE): while the scope is open,
+ * new command buffers use a residency set of the mapped model views. A no-op
+ * before macOS 15 or when the set cannot be built. */
+void ds4_gpu_prefill_residency_begin(void);
+void ds4_gpu_prefill_residency_end(void);
+/* qwen4 prefill staging pipe (DS4_QWEN4_PREFILL_MODE): stage `layer` from a
+ * whole-layer read queued by the previous call, without draining the GPU, and
+ * queue the read of next_layer (UINT32_MAX: none) into the other buffer. Falls
+ * back to ds4_gpu_qwen4_stream_stage_layer when nothing was queued for `layer`
+ * or the read failed. The kernels see the same bytes at the same offsets. */
+int ds4_gpu_qwen4_stream_stage_layer_pipe(
+        const void *model_map, uint64_t model_size, uint32_t layer,
+        const ds4_gpu_tensor *selected, uint32_t n_tokens, uint32_t n_slots,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t gate_type, uint32_t down_type,
+        uint32_t n_expert, uint32_t in_dim, uint32_t ff_dim, uint32_t out_dim,
+        uint32_t next_layer, uint64_t next_gate_offset, uint64_t next_up_offset,
+        uint64_t next_down_offset, uint32_t next_gate_type, uint32_t next_down_type,
+        int nocache);
+/* The prompt ended or was abandoned: wait for queued reads, forget them, and
+ * release the spare staging buffer. No-op until the pipe has run. Requires
+ * that no command buffer still reading the spare is in flight when called —
+ * callers call it after end_commands, once the GPU has drained the batches
+ * that read it. */
+void ds4_gpu_qwen4_stream_stage_prompt_end(void);
 int ds4_gpu_qwen4_moe_mid_grouped_tensor(
         ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts, uint32_t list_cap,

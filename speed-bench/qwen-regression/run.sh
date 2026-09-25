@@ -14,6 +14,6 @@ case "$tier" in
     *) echo "usage: run.sh fast|full [BASELINE_DIR]" >&2; exit 2 ;;
 esac
 cd "$root"
-make ds4-server test-qwen4-kernels test-qwen4-q2
+make ds4-server test-qwen4-kernels test-qwen4-q2 test-qwen4-prefill-pipe
 python3 "$here/qwen_gate.py" check --bin "$root" --baseline "$baseline" \
     --out "$here/last-$tier" $full_flag

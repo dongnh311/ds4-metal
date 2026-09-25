@@ -576,7 +576,7 @@ ds4_eval_cpu.o: ds4_eval.c ds4_eval_cases.h ds4.h ds4_ssd.h ds4_distributed.h ds
 ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_prompt_prefix.h ds4_kvstore.h ds4_web.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_agent.c
 
-ds4_metal.o: ds4_metal.m ds4.h ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_image.h $(METAL_SRCS)
+ds4_metal.o: ds4_metal.m ds4.h ds4_gpu.h ds4_qwen4_stage_pipe.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_image.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
 tests/test_glm53_kda.o: tests/test_glm53_kda.c ds4_gpu.h
@@ -749,6 +749,20 @@ ifeq ($(UNAME_S),Darwin)
 else
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 endif
+
+tests/test_qwen4_prefill_pipe.o: tests/test_qwen4_prefill_pipe.c ds4.c ds4.h ds4_gpu.h ds4_qwen4_stage_pipe.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_qwen4_prefill_pipe: tests/test_qwen4_prefill_pipe.o $(filter-out ds4.o,$(CORE_OBJS))
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
+else
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+endif
+
+.PHONY: test-qwen4-prefill-pipe
+test-qwen4-prefill-pipe: tests/test_qwen4_prefill_pipe
+	./tests/test_qwen4_prefill_pipe
 
 tests/test_qwen4_prefill.o: tests/test_qwen4_prefill.c ds4.h
 	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
@@ -1067,6 +1081,7 @@ tests/test_session_state_gpu.o: ds4_tool_text.h
 clean:
 	rm -f tests/test_qwen4_ngrams
 	rm -f tests/test_qwen4_ngram_state
+	rm -f tests/test_qwen4_prefill_pipe
 	rm -f tests/test_web_recovery
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_command_memory

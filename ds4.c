@@ -8517,6 +8517,109 @@ static DS4_MAYBE_UNUSED bool qwen4_stream_expert_cache_addr_layout_supported(
     return weights_streaming_layer_experts_uniform(w, il);
 }
 
+/* Prefill residency and staging pipe (DS4_QWEN4_PREFILL_MODE=off|safe|max),
+ * docs/superpowers/specs/2026-09-25-qwen4-prefill-residency-pipe-design.md.
+ * off: as before. max: residency set on prefill command buffers and the
+ * double-buffered staging pipe on every chunk of a prompt. safe: both on all
+ * but the prompt's last chunk (pipe reads bypass the page cache), so decode
+ * starts with the page cache the union path leaves behind. */
+typedef enum {
+    QWEN4_PREFILL_OFF = 0,
+    QWEN4_PREFILL_SAFE,
+    QWEN4_PREFILL_MAX,
+} qwen4_prefill_mode;
+
+/* Set only by the CLI and server prompt loops; every other forward is NONE. */
+typedef enum {
+    QWEN4_PREFILL_ROLE_NONE = 0,
+    QWEN4_PREFILL_ROLE_MIDDLE,
+    QWEN4_PREFILL_ROLE_LAST,
+} qwen4_prefill_role;
+
+typedef struct {
+    bool residency;
+    bool pipe;
+    bool pipe_nocache;
+} qwen4_prefill_flags;
+
+/* Rows above which prefill MoE takes the tiled GEMMs (and a streamed layer is
+ * staged); below it the per-token expert path wins. */
+static uint32_t qwen4_moe_mm_min(void) {
+#ifdef DS4_HAS_QWEN4_METAL
+    return 64u;
+#else
+    return 8u;
+#endif
+}
+
+static qwen4_prefill_mode qwen4_prefill_mode_parse(const char *s) {
+    if (s && !strcmp(s, "safe")) return QWEN4_PREFILL_SAFE;
+    if (s && !strcmp(s, "max")) return QWEN4_PREFILL_MAX;
+    return QWEN4_PREFILL_OFF;
+}
+
+/* Read once per process, like the other qwen4 streaming knobs. The helpers
+ * below are unused on builds without the Metal qwen4 graph. */
+static DS4_MAYBE_UNUSED qwen4_prefill_mode qwen4_prefill_mode_env(void) {
+    static int mode = -1;
+    if (mode < 0) mode = (int)qwen4_prefill_mode_parse(getenv("DS4_QWEN4_PREFILL_MODE"));
+    return (qwen4_prefill_mode)mode;
+}
+
+static DS4_MAYBE_UNUSED qwen4_prefill_flags qwen4_prefill_policy(qwen4_prefill_mode mode, qwen4_prefill_role role,
+                                                                 uint32_t T, bool streaming) {
+    qwen4_prefill_flags f = {false, false, false};
+    if (mode == QWEN4_PREFILL_OFF || role == QWEN4_PREFILL_ROLE_NONE ||
+        T <= qwen4_moe_mm_min() || !streaming) {
+        return f;
+    }
+    if (mode == QWEN4_PREFILL_MAX) {
+        f.residency = true;
+        f.pipe = true;
+    } else if (role == QWEN4_PREFILL_ROLE_MIDDLE) {
+        f.residency = true;
+        f.pipe = true;
+        f.pipe_nocache = true;
+    }
+    return f;
+}
+
+/* True when this chunk ends the prompt for the pipe: the last chunk (staged
+ * or not) or a failed one. The pipe then drops queued reads and its spare. */
+static DS4_MAYBE_UNUSED bool qwen4_prefill_prompt_ends(qwen4_prefill_mode mode, qwen4_prefill_role role,
+                                                       bool ok, bool streaming) {
+    if (mode == QWEN4_PREFILL_OFF || role == QWEN4_PREFILL_ROLE_NONE || !streaming) return false;
+    return role == QWEN4_PREFILL_ROLE_LAST || !ok;
+}
+
+/* Seeding the decode cache reads `selected` on the host, which only the
+ * union path does. */
+static DS4_MAYBE_UNUSED bool qwen4_prefill_use_pipe(qwen4_prefill_flags flags, uint32_t seed_tokens) {
+    return flags.pipe && seed_tokens == 0;
+}
+
+/* The streamed layer staged after `layer` (UINT32_MAX: none): the next one in
+ * `list`; after the last one, the first one again for the next chunk, unless
+ * this chunk ends the prompt. */
+static DS4_MAYBE_UNUSED uint32_t qwen4_stream_next_staged(const uint32_t *list, uint32_t n, uint32_t layer,
+                                                          qwen4_prefill_role role) {
+    for (uint32_t i = 0; i < n; i++) {
+        if (list[i] != layer) continue;
+        if (i + 1u < n) return list[i + 1u];
+        return role == QWEN4_PREFILL_ROLE_LAST ? UINT32_MAX : list[0];
+    }
+    return UINT32_MAX;
+}
+
+/* Streamed layers in ascending order; returns how many (at most cap). */
+static DS4_MAYBE_UNUSED uint32_t qwen4_stream_layer_list(const ds4_weights *w, uint32_t *out, uint32_t cap) {
+    uint32_t n = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER && n < cap; il++) {
+        if (qwen4_stream_expert_cache_addr_layout_supported(w, &w->layer[il], il)) out[n++] = il;
+    }
+    return n;
+}
+
 static void model_map_span_vec_include_layer_decode(
         ds4_model_map_span_vec *spans,
         const ds4_weights      *w,
@@ -58947,6 +59050,13 @@ typedef struct ds4_qwen4_gpu_graph {
     /* Set by the prefill loops for the prompt's last chunk: staged streamed
      * layers then seed the decode expert cache from its final tokens. */
     bool stream_seed_last;
+    /* DS4_QWEN4_PREFILL_MODE: role of the chunk being run, set only by the CLI
+     * and server prompt loops (NONE everywhere else), and the streamed layers
+     * in ascending order, filled on first use by the staging pipe. */
+    qwen4_prefill_role prefill_role;
+    uint32_t stream_layers[DS4_MAX_LAYER];
+    uint32_t n_stream_layers;
+    bool stream_layers_ready;
 } ds4_qwen4_gpu_graph;
 
 static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
@@ -60395,11 +60505,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
      * choices each over 512 experts, so an expert averages a third of a token
      * and the tiles run nearly empty.  Above this row count the GEMM wins;
      * below it the per-token expert path does, by 4% at sixteen rows. */
-#ifdef DS4_HAS_QWEN4_METAL
-    const uint32_t mm_min = 64u;
-#else
-    const uint32_t mm_min = 8u;
-#endif
+    const uint32_t mm_min = qwen4_moe_mm_min();
     /* Under --ssd-streaming only the layers whose experts the cache serves lack
      * mapped model views, and the span planner decides that with the same
      * predicate. Pinned and off-class layers keep their views, so they take the
@@ -60417,14 +60523,41 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
      * staged (DS4_QWEN4_STREAM_STAGE_PREFILL=0 keeps the per-token stream path). */
     bool staged = false;
     if (ok && mm_shape && experts_streamed && qwen4_stream_stage_prefill_enabled()) {
+        const uint32_t seed = g->stream_seed_last ? qwen4_stream_seed_tokens() : 0u;
+#ifdef DS4_HAS_QWEN4_METAL
+        const qwen4_prefill_flags pf = qwen4_prefill_policy(qwen4_prefill_mode_env(), g->prefill_role, T, true);
+        if (qwen4_prefill_use_pipe(pf, seed)) {
+            if (!g->stream_layers_ready) {
+                g->n_stream_layers = qwen4_stream_layer_list(w, g->stream_layers, DS4_MAX_LAYER);
+                g->stream_layers_ready = true;
+            }
+            const uint32_t nx = qwen4_stream_next_staged(g->stream_layers, g->n_stream_layers, il,
+                                                         g->prefill_role);
+            const ds4_layer_weights *ln = nx != UINT32_MAX ? &w->layer[nx] : NULL;
+            staged = ds4_gpu_qwen4_stream_stage_layer_pipe(
+                m->map, m->size, il, g->selected, T, DS4_N_EXPERT_USED,
+                l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset, l->ffn_down_exps->abs_offset,
+                l->ffn_gate_exps->type, l->ffn_down_exps->type, DS4_N_EXPERT, DS4_N_EMBD, DS4_N_FF_EXP,
+                DS4_N_EMBD, nx,
+                ln ? ln->ffn_gate_exps->abs_offset : 0u, ln ? ln->ffn_up_exps->abs_offset : 0u,
+                ln ? ln->ffn_down_exps->abs_offset : 0u, ln ? ln->ffn_gate_exps->type : UINT32_MAX,
+                ln ? ln->ffn_down_exps->type : UINT32_MAX, pf.pipe_nocache ? 1 : 0) != 0;
+        } else
+#endif
         staged = ds4_gpu_qwen4_stream_stage_layer(m->map, m->size, il, g->selected, T, DS4_N_EXPERT_USED,
                                                   l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
                                                   l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type,
                                                   l->ffn_down_exps->type, DS4_N_EXPERT, DS4_N_EMBD,
-                                                  DS4_N_FF_EXP, DS4_N_EMBD,
-                                                  g->stream_seed_last ? qwen4_stream_seed_tokens() : 0u) != 0;
+                                                  DS4_N_FF_EXP, DS4_N_EMBD, seed) != 0;
     }
     const bool mm = mm_shape && (!experts_streamed || staged);
+    /* Hazard invariant (ds4_qwen4_stage_pipe.h, qsp_activate/qsp_note_commit):
+     * when `staged` came from the pipe (ds4_gpu_qwen4_stream_stage_layer_pipe
+     * above), the pipe's stage call already activated the slot the GEMMs
+     * below read, and it takes the batch's first commit after that as the
+     * slot's last reader. Nothing may commit between the stage call above
+     * and the last GEMM here reading the staged slot (mid/down below),
+     * unless that intervening commit is followed by a full GPU wait. */
     if (mm) {
         if (ok) {
             ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, DS4_N_EXPERT_USED,
@@ -60674,7 +60807,21 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     const double t0 = timing ? now_sec() : 0.0;
     if (!qwen4_graph_stage_inputs(g, m, w, tokens, T)) return false;
     const double t1 = timing ? now_sec() : 0.0;
-    if (!glm_graph_begin_commands_if_needed()) return false;
+#ifdef DS4_HAS_QWEN4_METAL
+    const qwen4_prefill_mode pmode = qwen4_prefill_mode_env();
+    const bool pstreaming = ds4_gpu_ssd_streaming_enabled();
+    const qwen4_prefill_flags pflags = qwen4_prefill_policy(pmode, g->prefill_role, T, pstreaming);
+    if (pflags.residency) ds4_gpu_prefill_residency_begin();
+#endif
+    if (!glm_graph_begin_commands_if_needed()) {
+#ifdef DS4_HAS_QWEN4_METAL
+        if (pflags.residency) ds4_gpu_prefill_residency_end();
+        if (qwen4_prefill_prompt_ends(pmode, g->prefill_role, false, pstreaming)) {
+            ds4_gpu_qwen4_stream_stage_prompt_end();
+        }
+#endif
+        return false;
+    }
     bool ok = true;
     /* DS4_QWEN4_TIMING=2 on prefill batches: sync after each stage group and
      * report GPU ms per group (adds sync overhead; diagnostics only) */
@@ -60791,6 +60938,12 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     g_sub_armed = 0;
     const double t2 = timing ? now_sec() : 0.0;
     if (!ds4_gpu_end_commands()) ok = false;
+#ifdef DS4_HAS_QWEN4_METAL
+    if (pflags.residency) ds4_gpu_prefill_residency_end();
+    if (qwen4_prefill_prompt_ends(pmode, g->prefill_role, ok, pstreaming)) {
+        ds4_gpu_qwen4_stream_stage_prompt_end();
+    }
+#endif
     const double t3 = timing ? now_sec() : 0.0;
     if (T == 1u) qwen4_router_flush(pos0);
     if (ok && logits_out) {
@@ -60817,6 +60970,16 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         g->snap_after_second = false;
     }
     return ok;
+}
+
+/* A prompt loop stopped between chunks (cancellation): the pipe may hold a read
+ * queued for a next chunk that will not come. */
+static void qwen4_prefill_abandon(void) {
+#ifdef DS4_HAS_QWEN4_METAL
+    if (qwen4_prefill_mode_env() != QWEN4_PREFILL_OFF && ds4_gpu_ssd_streaming_enabled()) {
+        ds4_gpu_qwen4_stream_stage_prompt_end();
+    }
+#endif
 }
 
 static bool qwen4_graph_forward_token(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
@@ -61192,9 +61355,11 @@ static int generate_qwen4_metal_argmax(
         uint32_t chunk = (uint32_t)(prompt->len - i);
         if (chunk > g->cap_tokens) chunk = g->cap_tokens;
         g->stream_seed_last = i + (int)chunk == prompt->len;
+        g->prefill_role = g->stream_seed_last ? QWEN4_PREFILL_ROLE_LAST : QWEN4_PREFILL_ROLE_MIDDLE;
         ok = qwen4_graph_forward_tokens(g, model, weights, prompt->v + i, chunk,
                                         i + (int)chunk == prompt->len ? logits : NULL, false);
         g->stream_seed_last = false;
+        g->prefill_role = QWEN4_PREFILL_ROLE_NONE;
         i += (int)chunk;
         if (progress) progress(progress_ud, "prefill_chunk", i, prompt->len);
     }
@@ -77638,6 +77803,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         int prefill_rc = 0;
         for (int i = start; i < prompt->len;) {
             if (ds4_session_cancelled(s)) {
+                qwen4_prefill_abandon();
                 snprintf(err, errlen, "interrupted");
                 s->checkpoint_valid = s->checkpoint.len > 0;
                 prefill_rc = DS4_SESSION_SYNC_INTERRUPTED;
@@ -77650,9 +77816,12 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
              * its own logits as well as recurrent/KV state. */
             s->checkpoint_valid = false;
             s->qwen4_graph.stream_seed_last = i + (int)chunk == prompt->len;
+            s->qwen4_graph.prefill_role = s->qwen4_graph.stream_seed_last ? QWEN4_PREFILL_ROLE_LAST
+                                                                          : QWEN4_PREFILL_ROLE_MIDDLE;
             const bool chunk_ok = qwen4_graph_forward_tokens(&s->qwen4_graph, &e->model, &e->weights,
                                                              prompt->v + i, chunk, s->logits, false);
             s->qwen4_graph.stream_seed_last = false;
+            s->qwen4_graph.prefill_role = QWEN4_PREFILL_ROLE_NONE;
             if (!chunk_ok) {
                 snprintf(err, errlen, "Qwen3.8 prefill failed at token %d", i);
                 s->checkpoint_valid = false;

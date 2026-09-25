@@ -45,6 +45,14 @@ TPS_FLOOR = 0.97
 AB_ORDER = ("prod", "branch", "branch", "prod")
 WIRED_SLACK_GIB = 0.5
 
+# Long-prompt paired A/B (docs/superpowers/specs/2026-09-25-qwen4-prefill-residency-pipe-design.md):
+# chars of filler per request (~3.4 chars/token: ~32K and ~5K tokens), each a
+# slice no other server or request uses, so the prefix cache never skips it.
+LONG_REQUESTS = (("long", 110_000), ("medium", 17_000))
+LONG_QUESTION = "\n\nSummarize the text above in two sentences."
+LONG_MAX_TOKENS = 300
+LONG_PREFILL_GAIN = 1.10
+
 
 def registry_command(registry, bin_dir, port, kv_dir):
     """PROD ds4 command from the gateway registry, retargeted like the smoke."""
@@ -157,9 +165,10 @@ def evaluate(baseline, current):
 
 
 @contextlib.contextmanager
-def server(cmd, cwd, port, log_path):
+def server(cmd, cwd, port, log_path, env=None):
     log = open(log_path, "w")
-    proc = subprocess.Popen(cmd, cwd=cwd, stdout=log, stderr=subprocess.STDOUT)
+    proc = subprocess.Popen(cmd, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
+                            env=None if env is None else {**os.environ, **env})
     try:
         base = f"http://127.0.0.1:{port}"
         for _ in range(900):
@@ -219,6 +228,142 @@ def measure_server(bin_dir, out, tag, port):
         tps = timed_tps(base)
     shutil.rmtree(kv, ignore_errors=True)
     return tps
+
+
+def long_prompts(filler, index):
+    """The two prompts of server `index` (0-based position in AB_ORDER)."""
+    per_server = sum(chars for _, chars in LONG_REQUESTS)
+    start = index * per_server
+    if start + per_server > len(filler):
+        raise ValueError(f"filler has {len(filler)} chars, need {start + per_server}")
+    prompts = {}
+    for name, chars in LONG_REQUESTS:
+        prompts[name] = filler[start:start + chars] + LONG_QUESTION
+        start += chars
+    return prompts
+
+
+def sse_timings(events):
+    """events: (seconds since the request, parsed chunk) per SSE data line.
+    Time to the first content or reasoning delta, first-to-last delta time,
+    and the usage token counts."""
+    first = last = None
+    usage = {}
+    for t, chunk in events:
+        if chunk.get("usage"):
+            usage = chunk["usage"]
+        for choice in chunk.get("choices") or []:
+            delta = choice.get("delta") or {}
+            if delta.get("content") or delta.get("reasoning_content"):
+                first = t if first is None else first
+                last = t
+    if first is None:
+        raise ValueError("stream had no content delta")
+    return {"prompt_tokens": usage.get("prompt_tokens", 0),
+            "completion_tokens": usage.get("completion_tokens", 0),
+            "ttft_s": first, "decode_s": last - first}
+
+
+def request_rates(timing):
+    """Prefill t/s (prompt tokens over time to first token) and decode t/s."""
+    prefill = timing["prompt_tokens"] / timing["ttft_s"] if timing["ttft_s"] > 0 else 0.0
+    n = timing["completion_tokens"] - 1
+    decode = n / timing["decode_s"] if n > 0 and timing["decode_s"] > 0 else 0.0
+    return {"prefill_tps": prefill, "decode_tps": decode}
+
+
+def chat_stream(base, text, max_tokens):
+    """One streamed chat request; sse_timings of its chunks."""
+    body = json.dumps({"model": "ds4", "messages": [{"role": "user", "content": text}],
+                       "max_tokens": max_tokens, "temperature": 0, "stream": True,
+                       "stream_options": {"include_usage": True}}).encode()
+    req = urllib.request.Request(base + "/v1/chat/completions", body,
+                                 {"Content-Type": "application/json"})
+    events = []
+    t0 = time.time()
+    with urllib.request.urlopen(req, timeout=3600) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").strip()
+            if line.startswith("data: ") and line != "data: [DONE]":
+                events.append((time.time() - t0, json.loads(line[6:])))
+    return sse_timings(events)
+
+
+def measure_long_server(bin_dir, out, tag, port, index, env=None):
+    """One fresh server: the long request, then the medium one, streamed."""
+    kv = os.path.join(out, f"kv-long-{tag}")
+    shutil.rmtree(kv, ignore_errors=True)
+    os.makedirs(kv)
+    require_idle()
+    cmd, cwd = registry_command(REGISTRY, bin_dir, port, kv)
+    with open(os.path.join(ROOT, NEEDLE_SOURCE), encoding="utf-8", errors="replace") as fp:
+        prompts = long_prompts(fp.read(), index)
+    runs = {}
+    with server(cmd, cwd, port, os.path.join(out, f"server-long-{tag}.log"), env=env) as base:
+        for name, _ in LONG_REQUESTS:
+            timing = chat_stream(base, prompts[name], LONG_MAX_TOKENS)
+            runs[name] = {**timing, **request_rates(timing)}
+    shutil.rmtree(kv, ignore_errors=True)
+    return runs
+
+
+def long_ab(measure, order=AB_ORDER):
+    """measure(which, index) -> {request: rates} of one fresh server, interleaved."""
+    ab = {"prod": [], "branch": []}
+    for index, which in enumerate(order):
+        ab[which].append(measure(which, index))
+    return ab
+
+
+def long_ab_summary(ab):
+    """Per request: mean prefill and decode t/s per side, branch/PROD ratios."""
+    summary = {}
+    for name, _ in LONG_REQUESTS:
+        row = {}
+        for side in ("prod", "branch"):
+            runs = [r[name] for r in ab[side]]
+            row[side + "_prefill_tps"] = statistics.fmean(r["prefill_tps"] for r in runs)
+            row[side + "_decode_tps"] = statistics.fmean(r["decode_tps"] for r in runs)
+        row["prefill_ratio"] = row["branch_prefill_tps"] / row["prod_prefill_tps"]
+        row["decode_ratio"] = row["branch_decode_tps"] / row["prod_decode_tps"]
+        summary[name] = row
+    return summary
+
+
+def long_ab_failures(summary):
+    """The default-mode rule: decode >= TPS_FLOOR of PROD on every request,
+    and at least LONG_PREFILL_GAIN prefill on the long one."""
+    failures = []
+    for name, row in summary.items():
+        if row["decode_ratio"] < TPS_FLOOR:
+            failures.append(f"{name}: decode {row['branch_decode_tps']:.2f} t/s is "
+                            f"{row['decode_ratio']:.3f} of PROD {row['prod_decode_tps']:.2f}")
+    long_row = summary["long"]
+    if long_row["prefill_ratio"] < LONG_PREFILL_GAIN:
+        failures.append(f"long: prefill {long_row['branch_prefill_tps']:.1f} t/s is only "
+                        f"{long_row['prefill_ratio']:.3f} of PROD {long_row['prod_prefill_tps']:.1f}")
+    return failures
+
+
+def run_long(bin_dir, out, prefill_mode, ds4_running=machine.ds4_running, idle_read=None,
+             idle_timeout=wired.IDLE_SETTLE_S, idle_interval=2.0):
+    out = os.path.abspath(out)
+    busy = ds4_running()
+    if busy:
+        raise SystemExit("qwen_gate: ds4 is running; the machine must be free:\n" + busy)
+    require_idle(idle_read, idle_timeout, idle_interval)
+    os.makedirs(out, exist_ok=True)
+    port = int(os.environ.get("DS4_GATE_PORT", "18298"))
+    env = {"DS4_QWEN4_PREFILL_MODE": prefill_mode}
+    ab = long_ab(lambda which, index: measure_long_server(
+        None if which == "prod" else bin_dir, out, f"{index}-{which}", port, index,
+        None if which == "prod" else env))
+    summary = long_ab_summary(ab)
+    result = {"prefill_mode": prefill_mode, "ab": ab, "summary": summary,
+              "failures": long_ab_failures(summary)}
+    with open(os.path.join(out, "longab.json"), "w", encoding="utf-8") as fp:
+        json.dump(result, fp, indent=1)
+    return result
 
 
 def check_preflight(out, baseline):
@@ -291,7 +436,21 @@ def main():
     for p in (rec, chk):
         p.add_argument("--full", action="store_true")
         p.add_argument("--needle-chars", type=int, default=730_000)
+    lng = sub.add_parser("longab", help="paired long-prompt prefill/decode A/B against PROD")
+    lng.add_argument("--bin", required=True, help="directory holding the ds4-server to test")
+    lng.add_argument("--out", required=True)
+    lng.add_argument("--prefill-mode", required=True, choices=("safe", "max"))
     args = ap.parse_args()
+    if args.mode == "longab":
+        result = run_long(args.bin, args.out, args.prefill_mode)
+        for name, row in result["summary"].items():
+            print(f"qwen_gate: {name}: prefill {row['prod_prefill_tps']:.1f} -> {row['branch_prefill_tps']:.1f} "
+                  f"(x{row['prefill_ratio']:.3f}), decode {row['prod_decode_tps']:.2f} -> "
+                  f"{row['branch_decode_tps']:.2f} (x{row['decode_ratio']:.3f})")
+        for failure in result["failures"]:
+            print("qwen_gate: FAIL", failure)
+        print("qwen_gate:", "FAIL" if result["failures"] else "PASS")
+        return 1 if result["failures"] else 0
     if args.mode == "record":
         run(None, args.out, args.full, args.needle_chars)
         print("qwen_gate: reference recorded in", args.out)
