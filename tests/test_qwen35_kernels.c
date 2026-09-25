@@ -113,6 +113,18 @@ static uint64_t arena_alloc(arena_t *a, uint64_t bytes) {
     return off;
 }
 
+/* f32 weights with a double shadow for the reference */
+static uint64_t arena_f32(arena_t *a, uint64_t n, double **shadow, float lo, float hi) {
+    const uint64_t off = arena_alloc(a, n * sizeof(float));
+    float *w = (float *)(a->base + off);
+    *shadow = malloc(n * sizeof(double));
+    for (uint64_t i = 0; i < n; i++) {
+        w[i] = lo + (hi - lo) * (0.5f * frand() + 0.5f);
+        (*shadow)[i] = w[i];
+    }
+    return off;
+}
+
 /* q8_0 rows of `cols` elements (cols % 32 == 0), `rows` rows */
 static uint64_t arena_q8_0(arena_t *a, uint64_t rows, uint64_t cols, double **shadow, float scale) {
     const uint64_t blocks = cols / 32;
@@ -281,6 +293,145 @@ static void test_moe_q5k(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, ui
     free(gate_w); free(up_w); free(down_w); free(sg_w); free(su_w); free(sd_w);
 }
 
+/* GDN output: per-head RMSNorm of the scan output times ssm_norm, gated by
+ * silu(z) (Qwen3.5 RMSNormGated). */
+static void test_gdn_out_silu(arena_t *a, uint32_t H, uint32_t D, uint32_t T) {
+    double *w;
+    const uint64_t w_off = arena_f32(a, D, &w, 0.5f, 1.5f);
+    const uint64_t n = (uint64_t)T * H * D;
+    float *o = rand_vec(n, 1.0f), *z = rand_vec(n, 2.0f);
+    double *ref = malloc(n * sizeof(double));
+    for (uint32_t t = 0; t < T; t++) {
+        for (uint32_t h = 0; h < H; h++) {
+            const uint64_t base = ((uint64_t)t * H + h) * D;
+            double ss = 0.0;
+            for (uint32_t i = 0; i < D; i++) ss += (double)o[base + i] * o[base + i];
+            const double r = 1.0 / sqrt(ss / D + 1e-6);
+            for (uint32_t i = 0; i < D; i++) ref[base + i] = o[base + i] * r * w[i] * silu_d(z[base + i]);
+        }
+    }
+    ds4_gpu_tensor *go = upload(o, n), *gz = upload(z, n);
+    require_ok(ds4_gpu_qwen35_gdn_out_tensor(go, gz, a->base, a->size, w_off, T, H, D, 1e-6f), "qwen35 gdn out");
+    float *got = download(go, n);
+    check_close("gdn out silu", got, ref, n, 1e-5);
+    free(got); free(o); free(z); free(ref); free(w);
+    ds4_gpu_tensor_free(go); ds4_gpu_tensor_free(gz);
+}
+
+/* NEOX partial RoPE on the first n_rot dims (pairs i, i + n_rot/2). */
+static void rope_ref(double *x, uint32_t n_rot, uint32_t pos, double base) {
+    const uint32_t nh = n_rot / 2;
+    for (uint32_t i = 0; i < nh; i++) {
+        const double th = (double)pos * pow(base, -2.0 * i / n_rot);
+        const double c = cos(th), s = sin(th), x0 = x[i], x1 = x[i + nh];
+        x[i] = x0 * c - x1 * s;
+        x[i + nh] = x0 * s + x1 * c;
+    }
+}
+
+/* Attention prep without the indexer: q (from the interleaved [q | gate]
+ * rows) and k get RMSNorm, their weight and RoPE; the gate passes through; k
+ * and v are appended to the F16 caches at pos0.. . */
+static void test_attn_prep_noindexer(arena_t *a) {
+    const uint32_t T = 3, H = 16, Hkv = 2, D = 256, n_rot = 64, pos0 = 5, cap = 16;
+    const double base = 1.0e7;
+    double *gq, *gk;
+    const uint64_t gq_off = arena_f32(a, D, &gq, 0.5f, 1.5f);
+    const uint64_t gk_off = arena_f32(a, D, &gk, 0.5f, 1.5f);
+    float *qg = rand_vec((uint64_t)T * H * 2 * D, 1.0f);
+    float *kp = rand_vec((uint64_t)T * Hkv * D, 1.0f), *vp = rand_vec((uint64_t)T * Hkv * D, 1.0f);
+    uint32_t pos3[16 * 4];
+    for (uint32_t p = 0; p < cap; p++) { pos3[p * 4] = pos3[p * 4 + 1] = pos3[p * 4 + 2] = p; pos3[p * 4 + 3] = 0; }
+    double *q_ref = malloc((uint64_t)T * H * D * sizeof(double));
+    double *g_ref = malloc((uint64_t)T * H * D * sizeof(double));
+    double *k_ref = malloc((uint64_t)T * Hkv * D * sizeof(double));
+    double row[256];
+    for (uint32_t t = 0; t < T; t++) {
+        for (uint32_t h = 0; h < H; h++) {
+            const float *src = qg + ((uint64_t)t * H + h) * 2 * D;
+            double ss = 0.0;
+            for (uint32_t i = 0; i < D; i++) ss += (double)src[i] * src[i];
+            const double r = 1.0 / sqrt(ss / D + 1e-6);
+            for (uint32_t i = 0; i < D; i++) row[i] = src[i] * r * gq[i];
+            rope_ref(row, n_rot, pos0 + t, base);
+            for (uint32_t i = 0; i < D; i++) {
+                q_ref[((uint64_t)t * H + h) * D + i] = row[i];
+                g_ref[((uint64_t)t * H + h) * D + i] = src[D + i];
+            }
+        }
+        for (uint32_t h = 0; h < Hkv; h++) {
+            const float *src = kp + ((uint64_t)t * Hkv + h) * D;
+            double ss = 0.0;
+            for (uint32_t i = 0; i < D; i++) ss += (double)src[i] * src[i];
+            const double r = 1.0 / sqrt(ss / D + 1e-6);
+            for (uint32_t i = 0; i < D; i++) row[i] = src[i] * r * gk[i];
+            rope_ref(row, n_rot, pos0 + t, base);
+            for (uint32_t i = 0; i < D; i++) k_ref[((uint64_t)t * Hkv + h) * D + i] = row[i];
+        }
+    }
+    ds4_gpu_tensor *gqg = upload(qg, (uint64_t)T * H * 2 * D);
+    ds4_gpu_tensor *gkp = upload(kp, (uint64_t)T * Hkv * D), *gvp = upload(vp, (uint64_t)T * Hkv * D);
+    ds4_gpu_tensor *gq_out = upload(NULL, (uint64_t)T * H * D), *ggate = upload(NULL, (uint64_t)T * H * D);
+    ds4_gpu_tensor *kc = ds4_gpu_tensor_alloc((uint64_t)cap * Hkv * D * 2u);
+    ds4_gpu_tensor *vc = ds4_gpu_tensor_alloc((uint64_t)cap * Hkv * D * 2u);
+    ds4_gpu_tensor *gpos = ds4_gpu_tensor_alloc(sizeof(pos3));
+    require_ok(kc && vc && gpos && ds4_gpu_tensor_write(gpos, 0, pos3, sizeof(pos3)), "prep buffers");
+    require_ok(ds4_gpu_qwen35_attn_prep_tensor(gq_out, ggate, kc, vc, gqg, gkp, gvp, gpos, a->base, a->size,
+                                               gq_off, gk_off, T, H, Hkv, D, n_rot, pos0, cap,
+                                               (float)base, 1e-6f), "qwen35 attn prep");
+    float *got = download(gq_out, (uint64_t)T * H * D);
+    check_close("attn prep q", got, q_ref, (uint64_t)T * H * D, 2e-5);
+    free(got);
+    got = download(ggate, (uint64_t)T * H * D);
+    check_close("attn prep gate", got, g_ref, (uint64_t)T * H * D, 0.0);
+    free(got);
+    uint16_t *kh = malloc((uint64_t)cap * Hkv * D * 2u), *vh = malloc((uint64_t)cap * Hkv * D * 2u);
+    require_ok(ds4_gpu_tensor_read(kc, 0, kh, (uint64_t)cap * Hkv * D * 2u), "k cache read");
+    require_ok(ds4_gpu_tensor_read(vc, 0, vh, (uint64_t)cap * Hkv * D * 2u), "v cache read");
+    float *kf = malloc((uint64_t)T * Hkv * D * sizeof(float)), *vf = malloc((uint64_t)T * Hkv * D * sizeof(float));
+    double *v_ref = malloc((uint64_t)T * Hkv * D * sizeof(double));
+    for (uint64_t i = 0; i < (uint64_t)T * Hkv * D; i++) {
+        kf[i] = f16_to_f32(kh[(uint64_t)pos0 * Hkv * D + i]);
+        vf[i] = f16_to_f32(vh[(uint64_t)pos0 * Hkv * D + i]);
+        v_ref[i] = vp[i];
+    }
+    check_close("attn prep k cache (f16)", kf, k_ref, (uint64_t)T * Hkv * D, 2e-3);
+    check_close("attn prep v cache (f16)", vf, v_ref, (uint64_t)T * Hkv * D, 2e-3);
+    free(kh); free(vh); free(kf); free(vf); free(v_ref);
+    free(qg); free(kp); free(vp); free(q_ref); free(g_ref); free(k_ref); free(gq); free(gk);
+    ds4_gpu_tensor_free(gqg); ds4_gpu_tensor_free(gkp); ds4_gpu_tensor_free(gvp);
+    ds4_gpu_tensor_free(gq_out); ds4_gpu_tensor_free(ggate); ds4_gpu_tensor_free(kc);
+    ds4_gpu_tensor_free(vc); ds4_gpu_tensor_free(gpos);
+}
+
+/* MoE reduce without the residual combine (R = NULL, n_hc = 0): the shared
+ * expert comes from a part slot (single rows) or a separate buffer (batches). */
+static void test_reduce_nohc(uint32_t T, uint32_t K, uint32_t E, bool shared_slot) {
+    const uint32_t stride = K + (shared_slot ? 1u : 0u);
+    float *part = rand_vec((uint64_t)T * stride * E, 1.0f);
+    float *w = rand_vec((uint64_t)T * K, 1.0f);
+    float *sg = rand_vec(T, 2.0f);
+    float *sh = rand_vec((uint64_t)T * E, 1.0f);
+    double *ref = malloc((uint64_t)T * E * sizeof(double));
+    for (uint32_t t = 0; t < T; t++) {
+        for (uint32_t d = 0; d < E; d++) {
+            double acc = 0.0;
+            for (uint32_t s = 0; s < K; s++) acc += (double)w[t * K + s] * part[((uint64_t)t * stride + s) * E + d];
+            const double shared = shared_slot ? part[((uint64_t)t * stride + K) * E + d] : sh[(uint64_t)t * E + d];
+            ref[(uint64_t)t * E + d] = acc + sigmoid_d(sg[t]) * shared;
+        }
+    }
+    ds4_gpu_tensor *gp = upload(part, (uint64_t)T * stride * E), *gw = upload(w, (uint64_t)T * K);
+    ds4_gpu_tensor *gsg = upload(sg, T), *gsh = upload(sh, (uint64_t)T * E), *gout = upload(NULL, (uint64_t)T * E);
+    require_ok(ds4_gpu_qwen4_moe_reduce_tensor(gout, gp, gw, gsg, shared_slot ? NULL : gsh, NULL, NULL,
+                                               T, K, stride, E, 0u), "moe reduce (no hc)");
+    float *got = download(gout, (uint64_t)T * E);
+    check_close(shared_slot ? "moe reduce, shared slot" : "moe reduce, shared buffer", got, ref, (uint64_t)T * E, 1e-5);
+    free(got); free(part); free(w); free(sg); free(sh); free(ref);
+    ds4_gpu_tensor_free(gp); ds4_gpu_tensor_free(gw); ds4_gpu_tensor_free(gsg);
+    ds4_gpu_tensor_free(gsh); ds4_gpu_tensor_free(gout);
+}
+
 int main(void) {
     arena_t arena;
     arena.size = (uint64_t)512 << 20;
@@ -294,6 +445,13 @@ int main(void) {
     test_moe_q5k(&arena, 16, 8, 512, 256, 1);
     test_moe_q5k(&arena, 16, 8, 512, 256, 2);
     test_moe_q5k(&arena, 16, 8, 512, 512, 5);
+    printf("qwen35 gdn out (silu gate)\n");
+    test_gdn_out_silu(&arena, 32, 128, 3);
+    printf("qwen35 attention prep (no indexer)\n");
+    test_attn_prep_noindexer(&arena);
+    printf("qwen4 moe reduce without residual (as Ornith calls it)\n");
+    test_reduce_nohc(1, 8, 2048, true);
+    test_reduce_nohc(12, 8, 2048, false);
     printf("qwen35 kernels: ok\n");
     return 0;
 }

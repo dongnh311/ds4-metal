@@ -105,3 +105,30 @@ kernel void kernel_qwen35_moe_down(
         if (tiisg == 0) part[pair * args.out_rows + r] = v;
     }
 }
+
+/* --- Gated DeltaNet output ---------------------------------------------- */
+
+/* Qwen3.5 RMSNormGated: per-head RMSNorm of the scan output, scaled by
+ * ssm_norm and gated by silu(z).  Qwen3.8 gates with sigmoid
+ * (kernel_qwen4_gdn_out); the arithmetic is otherwise the same. */
+kernel void kernel_qwen35_gdn_out(
+        constant ds4_metal_args_qwen4_gdn_out & args,
+        device float       *o,        /* [T][H*D], in place */
+        device const float *z,        /* [T][H*D] */
+        device const float *weight,   /* [D] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint h = tgpig.x;
+    const uint tok = tgpig.y;
+    if (h >= args.n_head || tok >= args.n_tokens) return;
+    const uint D = args.head_dim;
+    const uint npt = D / 32;
+    const uint64_t base = ((uint64_t)tok * args.n_head + h) * D + tiisg * npt;
+    float ss = 0.0f;
+    for (uint i = 0; i < npt; i++) ss += o[base + i] * o[base + i];
+    ss = simd_sum(ss);
+    const float r = rsqrt(ss / (float)D + args.eps);
+    for (uint i = 0; i < npt; i++) {
+        o[base + i] = o[base + i] * r * weight[tiisg * npt + i] * qwen4_silu(z[base + i]);
+    }
+}
