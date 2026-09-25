@@ -41085,6 +41085,7 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
 #define DS41_LA_MAX_EMBD 8192u
 #define DS41_LA_MAX_K 6u
 #define DS41_LA_MAX_LAYER 64u
+#define DS41_LA_RANK 16u   /* ranking depth the first k uncached experts come from */
 
 typedef struct {
     uint32_t layer, pos, k, n_embd, n_expert;
@@ -41121,9 +41122,9 @@ static DS4_MAYBE_UNUSED float ds41_la_score(float v, float bias) {
 
 static DS4_MAYBE_UNUSED uint32_t ds41_la_topk(const float *w, const float *bias, const float *x,
                              uint32_t n_expert, uint32_t n_embd, uint32_t k, int32_t *out) {
-    float best_s[DS41_LA_MAX_K];
+    float best_s[DS41_LA_RANK];
     uint32_t n = 0;
-    if (k > DS41_LA_MAX_K) k = DS41_LA_MAX_K;
+    if (k > DS41_LA_RANK) k = DS41_LA_RANK;
     if (k > n_expert) k = n_expert;
     for (uint32_t e = 0; e < n_expert && k; e++) {
         const float *row = w + (uint64_t)e * n_embd;
@@ -41139,6 +41140,18 @@ static DS4_MAYBE_UNUSED uint32_t ds41_la_topk(const float *w, const float *bias,
         best_s[at] = s; out[at] = (int32_t)e;
         if (n < k) n++;
     }
+    return n;
+}
+
+/* The first k experts of the ranking that are not cached: the top of the
+ * ranking is usually a cached (hot) expert, so taking the top k and then
+ * dropping the cached ones would prefetch almost nothing. */
+static DS4_MAYBE_UNUSED uint32_t ds41_la_pick_uncached(uint32_t layer, const int32_t *ranked, uint32_t n_ranked,
+                                                       uint32_t k, int (*resident)(uint32_t, uint32_t),
+                                                       int32_t *out) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < n_ranked && n < k; i++)
+        if (!resident(layer, (uint32_t)ranked[i])) out[n++] = ranked[i];
     return n;
 }
 
@@ -41173,6 +41186,146 @@ static DS4_MAYBE_UNUSED bool ds41_la_take(ds41_la_mailbox *mb, ds41_la_job *out,
     if (got) { *out = mb->job; mb->full = false; }
     pthread_mutex_unlock(&mb->mu);
     return got;
+}
+static struct {
+    pthread_mutex_t mu;        /* guards started/stop/fd and pred[] */
+    pthread_t th;
+    bool started, failed;
+    volatile bool stop;
+    int fd;
+    ds41_la_mailbox mb;
+    int32_t pred[DS41_LA_MAX_LAYER][DS41_LA_MAX_K];
+    uint32_t pred_n[DS41_LA_MAX_LAYER], pred_pos[DS41_LA_MAX_LAYER];
+    uint64_t predicted, issued, used;
+} g_ds41_la = {.mu = PTHREAD_MUTEX_INITIALIZER, .fd = -1};
+
+static void ds41_la_record(uint32_t layer, uint32_t pos, const int32_t *ids, uint32_t n) {
+    if (layer >= DS41_LA_MAX_LAYER) return;
+    pthread_mutex_lock(&g_ds41_la.mu);
+    g_ds41_la.pred_n[layer] = n > DS41_LA_MAX_K ? DS41_LA_MAX_K : n;
+    g_ds41_la.pred_pos[layer] = pos;
+    for (uint32_t i = 0; i < g_ds41_la.pred_n[layer]; i++) g_ds41_la.pred[layer][i] = ids[i];
+    pthread_mutex_unlock(&g_ds41_la.mu);
+}
+
+static void ds41_la_note_selected(uint32_t layer, uint32_t pos, const int32_t *ids, uint32_t n) {
+    if (layer >= DS41_LA_MAX_LAYER) return;
+    pthread_mutex_lock(&g_ds41_la.mu);
+    if (g_ds41_la.pred_pos[layer] == pos) {
+        for (uint32_t i = 0; i < g_ds41_la.pred_n[layer]; i++)
+            for (uint32_t j = 0; j < n; j++)
+                if (ids[j] == g_ds41_la.pred[layer][i]) { g_ds41_la.used++; break; }
+        g_ds41_la.pred_n[layer] = 0;              /* count once */
+    }
+    pthread_mutex_unlock(&g_ds41_la.mu);
+}
+
+static void ds41_la_print(FILE *fp) {
+    pthread_mutex_lock(&g_ds41_la.mb.mu);
+    const unsigned long long posted = g_ds41_la.mb.posted, dropped = g_ds41_la.mb.dropped;
+    pthread_mutex_unlock(&g_ds41_la.mb.mu);
+    pthread_mutex_lock(&g_ds41_la.mu);
+    fprintf(fp, "ds4: V4.1 lookahead: posted %llu dropped %llu predicted %llu issued %llu used %llu\n",
+            posted, dropped, (unsigned long long)g_ds41_la.predicted,
+            (unsigned long long)g_ds41_la.issued, (unsigned long long)g_ds41_la.used);
+    pthread_mutex_unlock(&g_ds41_la.mu);
+}
+
+static void *ds41_la_main(void *arg) {
+    (void)arg;
+    static ds41_la_job job;   /* one thread: 32 KB off the stack */
+    while (ds41_la_take(&g_ds41_la.mb, &job, true, &g_ds41_la.stop)) {
+        int32_t ranked[DS41_LA_RANK], issued[DS41_LA_MAX_K];
+        const uint32_t n = ds41_la_topk(job.w, job.bias, job.x, job.n_expert, job.n_embd, DS41_LA_RANK, ranked);
+        const uint32_t n_issued = ds41_la_pick_uncached(job.layer, ranked, n, job.k,
+                                                        ds4_gpu_stream_expert_cache_resident_hint, issued);
+        for (uint32_t i = 0; i < n_issued; i++) {
+            uint64_t off[3], len[3];
+            ds41_la_ranges(&job, issued[i], off, len);
+            for (int r = 0; r < 3; r++) {
+                struct radvisory ra = {.ra_offset = (off_t)off[r], .ra_count = (int)len[r]};
+                (void)fcntl(g_ds41_la.fd, F_RDADVISE, &ra);
+            }
+        }
+        ds41_la_record(job.layer, job.pos, issued, n_issued);
+        pthread_mutex_lock(&g_ds41_la.mu);
+        g_ds41_la.predicted++;   /* jobs processed */
+        g_ds41_la.issued += n_issued;
+        pthread_mutex_unlock(&g_ds41_la.mu);
+        if (g_ds41_la.stop) break;
+    }
+    return NULL;
+}
+
+static bool ds41_la_start(int model_fd) {
+    pthread_mutex_lock(&g_ds41_la.mu);
+    if (g_ds41_la.started || g_ds41_la.failed) {
+        const bool ok = g_ds41_la.started;
+        pthread_mutex_unlock(&g_ds41_la.mu);
+        return ok;
+    }
+    ds41_la_mailbox_init(&g_ds41_la.mb);
+    g_ds41_la.stop = false;
+    g_ds41_la.fd = model_fd >= 0 ? dup(model_fd) : -1;
+    if (g_ds41_la.fd < 0 || pthread_create(&g_ds41_la.th, NULL, ds41_la_main, NULL) != 0) {
+        if (g_ds41_la.fd >= 0) close(g_ds41_la.fd);
+        g_ds41_la.fd = -1;
+        g_ds41_la.failed = true;
+        pthread_mutex_unlock(&g_ds41_la.mu);
+        fprintf(stderr, "ds4: V4.1 lookahead prefetch disabled (no fd or thread)\n");
+        return false;
+    }
+    g_ds41_la.started = true;
+    pthread_mutex_unlock(&g_ds41_la.mu);
+    return true;
+}
+
+/* Before the model is unmapped: the thread holds pointers into it. */
+static void ds41_la_stop(void) {
+    pthread_mutex_lock(&g_ds41_la.mu);
+    const bool started = g_ds41_la.started;
+    pthread_mutex_unlock(&g_ds41_la.mu);
+    if (!started) return;
+    pthread_mutex_lock(&g_ds41_la.mb.mu);
+    g_ds41_la.stop = true;
+    pthread_cond_broadcast(&g_ds41_la.mb.cv);
+    pthread_mutex_unlock(&g_ds41_la.mb.mu);
+    pthread_join(g_ds41_la.th, NULL);
+    pthread_mutex_lock(&g_ds41_la.mu);
+    close(g_ds41_la.fd);
+    g_ds41_la.fd = -1;
+    g_ds41_la.started = false;
+    for (uint32_t l = 0; l < DS41_LA_MAX_LAYER; l++) g_ds41_la.pred_n[l] = 0;
+    pthread_mutex_unlock(&g_ds41_la.mu);
+}
+
+static bool ds41_la_should_post(const ds41_gpu_graph *g, uint32_t il) {
+    return g->streaming && !g->quality && !g->imatrix && g->tp_world == 1 &&
+        il + 1u < DS4_N_LAYER && il + 1u < DS41_LA_MAX_LAYER &&
+        !getenv("DS4_METAL_DISABLE_V41_LOOKAHEAD") && ds41_la_k() > 0;
+}
+
+/* Main thread, layer il's ids known: hand layer il+1's router its input. */
+static void ds41_la_post_layer(ds41_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *next,
+                               uint32_t target, uint64_t gate_bytes, uint64_t down_bytes) {
+    static ds41_la_job job;   /* main thread only */
+    if (DS4_N_EMBD > DS41_LA_MAX_EMBD || !next->ffn_gate_inp ||
+        next->ffn_gate_inp->type != DS4_TENSOR_F32 || !next->ffn_exp_probs_b ||
+        !ds41_la_start(m->fd)) return;
+    job.layer = target;
+    job.pos = g->pos;
+    job.k = ds41_la_k();
+    job.n_embd = DS4_N_EMBD;
+    job.n_expert = DS4_N_EXPERT;
+    job.w = (const float *)(const void *)(m->map + next->ffn_gate_inp->abs_offset);
+    job.bias = (const float *)(const void *)(m->map + next->ffn_exp_probs_b->abs_offset);
+    job.gate_offset = next->ffn_gate_exps->abs_offset;
+    job.up_offset = next->ffn_up_exps->abs_offset;
+    job.down_offset = next->ffn_down_exps->abs_offset;
+    job.gate_bytes = gate_bytes;
+    job.down_bytes = down_bytes;
+    memcpy(job.x, ds4_gpu_tensor_contents(g->norm), (size_t)DS4_N_EMBD * sizeof(float));
+    ds41_la_post(&g_ds41_la.mb, &job);
 }
 #endif
 
@@ -41358,6 +41511,12 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             ds41_stream_async_abandon(&async_load);
             return false;
         }
+        /* Lookahead: count a used prediction for this layer, then hand the
+         * next layer's router this layer's FFN input (router done on the GPU,
+         * nothing that rewrites g->norm is encoded yet). */
+        ds41_la_note_selected(il, g->pos, async_load.selected_ids, DS4_N_EXPERT_USED);
+        if (ds41_la_should_post(g, il) && !ds41_image_at(g, g->pos))
+            ds41_la_post_layer(g, m, l + 1, il + 1u, gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD);
     }
 #endif
     routed_ok = ds4_gpu_routed_moe_one_tensor(routed, g->gate, g->up, g->mid, g->experts,
@@ -42189,7 +42348,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         p->pread_bytes += pread_bytes - pread_bytes0;
         p->hits += hits - hits0;
         p->misses += misses - misses0;
-        if (p->tokens % 64u == 0u) ds41_decode_profile_print(stderr, p);
+        if (p->tokens % 64u == 0u) {
+            ds41_decode_profile_print(stderr, p);
+            ds41_la_print(stderr);
+        }
     }
 #endif
     g->history = next_history;
@@ -74565,6 +74727,9 @@ bool ds4_engine_is_deepseek41(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && defined(__APPLE__) && !defined(DS4_NO_GPU)
+    ds41_la_stop();   /* before the model is unmapped */
+#endif
     ds4_engine_tp_unbind(e);
     ds4_expert_profile_close();
     weights_free(&e->weights);

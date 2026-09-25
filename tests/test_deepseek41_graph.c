@@ -2341,6 +2341,13 @@ done:
 #endif
 
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* Layer 3 has experts 9, 4 and 2 cached. */
+static int test_la_resident(uint32_t layer, uint32_t expert) {
+    return layer == 3 && (expert == 9 || expert == 4 || expert == 2);
+}
+#endif
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
 /* Lookahead prefetch core: K parsing, the scorer's top-k, the byte ranges
  * (same as graph_stream_expert_table_make), the one-slot mailbox, and the
  * residency hint outside streaming. Model-free. */
@@ -2399,6 +2406,71 @@ static int check_v41_lookahead_units(void) {
     /* Residency hint: nothing is resident outside SSD streaming. */
     REQUIRE(ds4_gpu_stream_expert_cache_resident_hint(0, 0) == 0);
     REQUIRE(ds4_gpu_stream_expert_cache_resident_hint(100000, 0) == 0);
+    /* Pick: walk the ranking and take the first k experts not cached (the spike's
+     * rule; the top of the ranking is usually already cached). */
+    {
+        const int32_t ranked[6] = {9, 4, 7, 2, 5, 1};
+        int32_t out[6];
+        REQUIRE(ds41_la_pick_uncached(3, ranked, 6, 1, test_la_resident, out) == 1 && out[0] == 7);
+        REQUIRE(ds41_la_pick_uncached(3, ranked, 6, 2, test_la_resident, out) == 2 &&
+                out[0] == 7 && out[1] == 5);
+        REQUIRE(ds41_la_pick_uncached(3, ranked, 6, 6, test_la_resident, out) == 3);
+        REQUIRE(ds41_la_pick_uncached(3, ranked, 6, 0, test_la_resident, out) == 0);
+    }
+    /* Post gating: never the last layer; never without the switch; tp 1 streaming only. */
+    {
+        ds41_gpu_graph g = {.tp_world = 1, .streaming = true};
+        unsetenv("DS4_METAL_DISABLE_V41_LOOKAHEAD");
+        REQUIRE(ds41_la_should_post(&g, 0));
+        REQUIRE(!ds41_la_should_post(&g, DS4_N_LAYER - 1));
+        setenv("DS4_METAL_DISABLE_V41_LOOKAHEAD", "1", 1);
+        REQUIRE(!ds41_la_should_post(&g, 0));
+        unsetenv("DS4_METAL_DISABLE_V41_LOOKAHEAD");
+        setenv("DS4_METAL_V41_LOOKAHEAD_K", "0", 1);
+        REQUIRE(!ds41_la_should_post(&g, 0));
+        unsetenv("DS4_METAL_V41_LOOKAHEAD_K");
+        g.streaming = false;
+        REQUIRE(!ds41_la_should_post(&g, 0));
+    }
+    /* "used" counts only an issued prediction for the same layer and position. */
+    {
+        const int32_t pred[1] = {7}, sel_hit[6] = {1, 2, 7, 4, 5, 6}, sel_miss[6] = {1, 2, 3, 4, 5, 6};
+        const uint64_t used0 = g_ds41_la.used;
+        ds41_la_record(3, 10, pred, 1);
+        ds41_la_note_selected(3, 11, sel_hit, 6);      /* other position: no */
+        REQUIRE(g_ds41_la.used == used0);
+        ds41_la_note_selected(3, 10, sel_miss, 6);     /* not selected: no */
+        REQUIRE(g_ds41_la.used == used0);
+        ds41_la_note_selected(3, 10, sel_hit, 6);      /* already noted once: no */
+        REQUIRE(g_ds41_la.used == used0);
+        ds41_la_record(3, 10, pred, 1);
+        ds41_la_note_selected(3, 10, sel_hit, 6);
+        REQUIRE(g_ds41_la.used == used0 + 1);
+    }
+    /* Counter line format. */
+    {
+        char line[256] = "";
+        FILE *fp = tmpfile();
+        REQUIRE(fp);
+        ds41_la_print(fp);
+        rewind(fp);
+        REQUIRE(fgets(line, sizeof(line), fp));
+        fclose(fp);
+        unsigned long long a, b, c, d, e;
+        REQUIRE(sscanf(line, "ds4: V4.1 lookahead: posted %llu dropped %llu predicted %llu issued %llu used %llu",
+                       &a, &b, &c, &d, &e) == 5);
+    }
+    /* Start, stop, restart: the thread joins and a new one starts. */
+    {
+        const int fd = open("/dev/null", O_RDONLY);
+        REQUIRE(fd >= 0);
+        REQUIRE(ds41_la_start(fd));
+        REQUIRE(ds41_la_start(fd));                /* idempotent */
+        ds41_la_stop();
+        REQUIRE(ds41_la_start(fd));
+        ds41_la_stop();
+        close(fd);
+    }
     fprintf(stderr, "V4.1 lookahead units PASS\n");
     rc = 0;
 done:

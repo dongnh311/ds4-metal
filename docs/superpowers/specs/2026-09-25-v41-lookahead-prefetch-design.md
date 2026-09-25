@@ -87,8 +87,8 @@ Estimate:
    - skip if T = 40, or if the position is an image position (that one uses a different bias);
    - scores = a dot-product loop over layer T's `ffn_gate_inp` (F32, 384 × 5120, resident in the mapped model) with the copy;
    - s = sqrt(softplus(score)) + `ffn_exp_probs_b[T]`;
-   - take the top k (default 1).
-4. **Prefetch.** For each predicted expert e that `ds4_gpu_stream_expert_cache_resident_hint(T, e)` reports as not cached, issue `F_RDADVISE` on the thread's own read-only fd for three ranges:
+   - rank the top 16 and take the first k (default 1) that are not cached. Taking the top k first and dropping the cached ones prefetched almost nothing (4.4 experts/token), because the top of the ranking is usually a hot, cached expert; the spike's numbers use the first-uncached rule.
+4. **Prefetch.** For each picked expert e (`ds4_gpu_stream_expert_cache_resident_hint(T, e)` reported it not cached), issue `F_RDADVISE` on the thread's own read-only fd for three ranges:
    - gate: `ffn_gate_exps` offset + e × gate_bytes;
    - up: `ffn_up_exps` offset + e × gate_bytes;
    - down: `ffn_down_exps` offset + e × down_bytes.
@@ -108,7 +108,8 @@ Estimate:
   - `DS4_METAL_DISABLE_V41_LOOKAHEAD`: read per call, default on if the A/B keeps it;
   - `DS4_METAL_V41_LOOKAHEAD_K`: 0..6, default 1; 0 turns prediction off.
 - **Counters,** printed as `ds4: V4.1 lookahead: posted N dropped N predicted N issued N used N` next to the V4.1 decode profile:
-  - issued = predicted and not cached;
+  - predicted = jobs processed;
+  - issued = experts advised (first k not cached);
   - used = issued and then selected by layer T. The main thread compares T's selected ids with the prediction the thread recorded for T.
 
 ### Errors and safety
