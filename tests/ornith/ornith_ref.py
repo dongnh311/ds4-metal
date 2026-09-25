@@ -5,7 +5,8 @@ comes from `ds4 --dump-logprobs`.  Both are reduced to the same step form,
 {"selected": id, "top": [[id, logprob], ...]}, and compared greedily: the
 selected tokens must match and every probable token (reference log-prob >=
 PROBABLE) in both top-k lists must agree within a tolerance, until the
-reference reaches a near-tie (top-1/top-2 gap below `tie`), after which a
+reference reaches a near-tie (top-1/top-2 gap below `tie`).  The tie step's
+probable tokens are still checked against the tolerance; from that step on a
 different but equally valid continuation is allowed.  The tolerances are
 calibrated from llama.cpp's own Metal-versus-CPU spread instead of being
 picked by hand.
@@ -59,10 +60,12 @@ def compare(ref_steps, got_steps, tol, tie):
     res = {"ok": True, "compared": 0, "stopped_at_tie": None, "max_delta": 0.0,
            "first_mismatch": None, "reason": ""}
     for i, ref in enumerate(ref_steps):
-        if _gap(ref) < tie:
+        at_tie = _gap(ref) < tie
+        if at_tie:
             res["stopped_at_tie"] = i
-            return res
         if i >= len(got_steps):
+            if at_tie:
+                return res
             res.update(ok=False, first_mismatch=i, reason=f"ds4 stopped after {len(got_steps)} steps")
             return res
         got = got_steps[i]
@@ -70,6 +73,13 @@ def compare(ref_steps, got_steps, tol, tie):
         for tid, lp in ref["top"]:
             if lp >= PROBABLE and tid in mine:
                 res["max_delta"] = max(res["max_delta"], abs(mine[tid] - lp))
+        if at_tie:
+            # The tie excuses a different selection from here on, not the
+            # probable-token log-probs of the tie step itself.
+            if res["max_delta"] > tol:
+                res.update(ok=False, first_mismatch=i,
+                           reason=f"step {i} (tie): logprob delta {res['max_delta']:.4f} > {tol:.4f}")
+            return res
         if got["selected"] != ref["selected"]:
             res.update(ok=False, first_mismatch=i,
                        reason=f"step {i}: selected {got['selected']} != {ref['selected']}")

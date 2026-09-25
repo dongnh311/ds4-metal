@@ -2,12 +2,14 @@ en_capital: ok compared=1 tie_at=1 max_delta=0.0008
 en_story: ok compared=13 tie_at=13 max_delta=0.0359 
 en_explain: ok compared=5 tie_at=5 max_delta=0.0010 
 vi_greeting: ok compared=1 tie_at=1 max_delta=0.0026 
-vi_hanoi: ok compared=0 tie_at=0 max_delta=0.0000 
-code_py: ok compared=3 tie_at=3 max_delta=0.0075 
+vi_hanoi: ok compared=0 tie_at=0 max_delta=0.0008 
+code_py: ok compared=3 tie_at=3 max_delta=0.0502 
 code_c: ok compared=3 tie_at=3 max_delta=0.0013 
-code_rust: ok compared=1 tie_at=1 max_delta=0.0001 
-json_obj: ok compared=4 tie_at=4 max_delta=0.0230 
+code_rust: ok compared=1 tie_at=1 max_delta=0.0086 
+json_obj: ok compared=4 tie_at=4 max_delta=0.0832 
 math_mul: ok compared=11 tie_at=11 max_delta=0.1795 
 list_tips: ok compared=1 tie_at=1 max_delta=0.0000 
 long_it: ok compared=0 tie_at=0 max_delta=0.0000 
+en_contributing: ok compared=14 tie_at=14 max_delta=0.0678 
+code_c_pack: ok compared=16 tie_at=16 max_delta=0.0771 
 gate1: PASS tol=1.4802 tie=0.4478

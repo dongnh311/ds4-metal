@@ -10,5 +10,7 @@
   {"name": "json_obj", "text": "{\"name\": \"Alice\", \"age\": 30, \"city\":", "n_predict": 32},
   {"name": "math_mul", "text": "Q: What is 17 * 23?\nA:", "n_predict": 32},
   {"name": "list_tips", "text": "Three tips for writing clean code:\n1.", "n_predict": 64},
-  {"name": "long_it", "file": "speed-bench/promessi_sposi.txt", "chars": 32000, "n_predict": 16}
+  {"name": "long_it", "file": "speed-bench/promessi_sposi.txt", "chars": 32000, "n_predict": 16},
+  {"name": "en_contributing", "file": "CONTRIBUTING.md", "chars": 1363, "n_predict": 32},
+  {"name": "code_c_pack", "file": "ds4_layer_pack.c", "chars": 1383, "n_predict": 32}
 ]

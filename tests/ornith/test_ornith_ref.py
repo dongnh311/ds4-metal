@@ -34,6 +34,25 @@ class CompareTest(unittest.TestCase):
         self.assertEqual(res["stopped_at_tie"], 1)
         self.assertEqual(res["compared"], 1)
 
+    def test_tie_step_swap_within_tolerance_passes(self):
+        ref = [step(5, (5, -0.10), (7, -3.0)), step(1, (1, -0.69), (2, -0.70))]
+        got = [step(5, (5, -0.10), (7, -3.0)), step(2, (2, -0.68), (1, -0.71))]
+        res = r.compare(ref, got, tol=0.05, tie=0.05)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["stopped_at_tie"], 1)
+        self.assertEqual(res["compared"], 1)
+        self.assertAlmostEqual(res["max_delta"], 0.02)
+
+    def test_tie_step_probable_delta_above_tolerance_fails(self):
+        ref = [step(5, (5, -0.10), (7, -3.0)), step(1, (1, -0.69), (2, -0.70))]
+        got = [step(5, (5, -0.10), (7, -3.0)), step(1, (1, -0.40), (2, -1.20))]
+        res = r.compare(ref, got, tol=0.05, tie=0.05)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["stopped_at_tie"], 1)
+        self.assertEqual(res["compared"], 1)
+        self.assertEqual(res["first_mismatch"], 1)
+        self.assertAlmostEqual(res["max_delta"], 0.5)
+
     def test_logprob_delta_above_tolerance_fails(self):
         ref = [step(5, (5, -0.1), (7, -3.0))]
         got = [step(5, (5, -0.6), (7, -3.0))]
