@@ -3492,6 +3492,20 @@ int ds4_gpu_qwen4_moe_down_tensor(
         uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
         uint32_t ff_dim, uint32_t out_dim,
         uint64_t shared_down_offset, uint32_t shared_type);
+/* Ornith (qwen35moe) routed experts; same semantics as the qwen4 pair above,
+ * with weight_type 13 (Q5_K) handled by qwen35_row_dot. */
+int ds4_gpu_qwen35_moe_mid_tensor(
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t in_dim, uint32_t ff_dim,
+        uint64_t shared_gate_offset, uint64_t shared_up_offset, uint32_t shared_type);
+int ds4_gpu_qwen35_moe_down_tensor(
+        ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
+        const void *model_map, uint64_t model_size, uint64_t down_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t ff_dim, uint32_t out_dim,
+        uint64_t shared_down_offset, uint32_t shared_type);
 /* Streamed decode lookahead: before a streamed layer's MoE, name the next
  * streamed layer so its gate can read the experts its router input predicts.
  * top == 0 disables it for that gate. */
