@@ -5,6 +5,7 @@
 
 bad_embd.gguf: qwen35moe.embedding_length = 64.
 bad_tier.gguf: blk.20 gate/up experts typed IQ4_XS (ggml type 23).
+bad_mtp.gguf: blk.40 (MTP) gate/up experts typed IQ4_XS (ggml type 23).
 Only the header is copied; the tensor data is a hole of the original size,
 so each file costs a few MB on disk.
 """
@@ -81,6 +82,10 @@ def main(model, out_dir):
     for name in ("blk.20.ffn_gate_exps.weight", "blk.20.ffn_up_exps.weight"):
         struct.pack_into("<I", bad, type_pos[name], 23)
     write(os.path.join(out_dir, "bad_tier.gguf"), bad, size)
+    bad = bytearray(header)
+    for name in ("blk.40.ffn_gate_exps.weight", "blk.40.ffn_up_exps.weight"):
+        struct.pack_into("<I", bad, type_pos[name], 23)
+    write(os.path.join(out_dir, "bad_mtp.gguf"), bad, size)
 
 
 if __name__ == "__main__":

@@ -6000,8 +6000,18 @@ static void weights_validate_qwen35moe_layout(const ds4_weights *w, uint32_t lay
         tensor_expect_layout(w->output_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
         tensor_expect_qwen4_dense_layout(w->output, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
+    /* When the executable trunk (0..DS4_N_LAYER-1-DS4_N_NEXTN_PREDICT) is
+     * fully loaded and the MTP block is bound, extend the check onto it too:
+     * weights_bind() binds blk.40 alongside the trunk, but only the trunk
+     * range is passed in, so blk.40 would otherwise never see a presence,
+     * shape or expert-type check. */
+    uint32_t loop_end = layer_end;
+    if (layer_end + 1u == DS4_N_LAYER - DS4_N_NEXTN_PREDICT &&
+        w->layer[DS4_N_LAYER - 1u].ffn_gate_exps) {
+        loop_end = DS4_N_LAYER - 1u;
+    }
     uint32_t n_q4k = 0, n_q5k = 0;
-    for (uint32_t il = layer_start; il <= layer_end; il++) {
+    for (uint32_t il = layer_start; il <= loop_end; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (!weights_qwen35moe_layer_has_required(l, il)) {
             fprintf(stderr, "ds4: required Ornith tensors for layer %u are missing\n", il);
@@ -71973,6 +71983,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             (opt->tp.role != DS4_TP_NONE || opt->cuda_tensor_parallel) ? "tensor parallelism" :
             (gpu_cfg && gpu_cfg->n_gpus > 1) ? "--gpu placement" :
             opt->distributed.role != DS4_DISTRIBUTED_NONE ? "distributed inference" :
+            opt->placement_session_count_hint > 1 ? "--batched-session" :
             load_slice ? "a layer slice" :
             opt->dspark ? "--dspark" :
             opt->glm_mtp ? "--mtp" :
