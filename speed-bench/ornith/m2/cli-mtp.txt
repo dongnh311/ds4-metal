@@ -1,0 +1,24 @@
+en_capital chunk 1: ok
+en_capital chunk 2: ok
+en_capital chunk 64: ok
+en_capital chunk default: ok
+code_py chunk 1: ok
+code_py chunk 2: ok
+code_py chunk 64: ok
+code_py chunk default: ok
+vi_hanoi chunk 1: ok
+vi_hanoi chunk 2: ok
+vi_hanoi chunk 64: ok
+vi_hanoi chunk default: ok
+en_contributing chunk 1: ok
+en_contributing chunk 2: ok
+en_contributing chunk 64: ok
+en_contributing chunk default: ok
+code_c_pack chunk 1: ok
+code_c_pack chunk 2: ok
+code_c_pack chunk 64: ok
+code_c_pack chunk default: ok
+long_copy chunk default: ok
+long_copy chunk 64: ok
+mtp cli: 362 accepted, 59 rejected drafts
+test_mtp_cli: PASS

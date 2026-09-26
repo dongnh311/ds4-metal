@@ -40174,20 +40174,25 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
     }
 
     if (ds4_backend_uses_graph(backend) && ds4_model_is_qwen35moe()) {
-        /* F16 K/V per full-attention trunk layer, rope positions, fixed GDN
-         * state and conv history; transients scale with the prefill chunk. */
+        /* F16 K/V per full-attention layer, the MTP block's included, rope
+         * positions, fixed GDN state and conv history with their verify
+         * snapshot, two logit rows; transients scale with the prefill chunk,
+         * MTP staging included.  The estimate cannot see --mtp, so it
+         * reserves the MTP share (2 KiB per context token plus ~66 MB),
+         * as the Qwen3.8 estimate reserves its snapshots. */
         const uint64_t T = prefill_chunk ? prefill_chunk : qwen35_prefill_chunk_tokens(ctx);
         const uint64_t E = DS4_N_EMBD, kv_row = 2ull * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
         uint32_t n_attn = 0;
-        for (uint32_t il = 0; il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER; il++) n_attn += ds4_qwen35_layer_is_attention(il);
-        const uint32_t n_lin = DS4_N_LAYER - DS4_N_NEXTN_PREDICT - n_attn;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) n_attn += ds4_qwen35_layer_is_attention(il);
+        const uint32_t n_lin = DS4_N_LAYER - n_attn;
         m.prefill_cap = (uint32_t)T;
         m.raw_cap = ctx;
         m.raw_bytes = (uint64_t)n_attn * ctx * kv_row + (uint64_t)ctx * 16u;
-        m.scratch_bytes = T * (8u * E + 4u * DS4_N_LIN_CONV_DIM + 6u * (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM +
+        m.scratch_bytes = T * (13u * E + 4u * DS4_N_LIN_CONV_DIM + 6u * (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM +
                                DS4_N_EXPERT + (uint64_t)(DS4_N_EXPERT_USED + 1u) * (E + DS4_N_FF_EXP)) * 4u +
-                          (uint64_t)n_lin * ((uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM * DS4_N_LIN_HEAD_DIM +
-                                             (uint64_t)(DS4_N_LIN_CONV - 1u) * DS4_N_LIN_CONV_DIM) * sizeof(float);
+                          2ull * DS4_N_VOCAB * sizeof(float) +
+                          2ull * n_lin * ((uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM * DS4_N_LIN_HEAD_DIM +
+                                          (uint64_t)(DS4_N_LIN_CONV - 1u) * DS4_N_LIN_CONV_DIM) * sizeof(float);
         m.total_bytes = m.raw_bytes + m.scratch_bytes;
         return m;
     }
@@ -59369,6 +59374,13 @@ typedef struct ds4_qwen4_gpu_graph {
     /* Ornith (qwen35moe) gates the GDN output with silu(z); Qwen3.8 with
      * sigmoid(z).  qwen4_graph_alloc's memset leaves it false. */
     bool gdn_silu;
+    /* Ornith MTP seed: post-output_norm trunk hidden rows.  Row k holds
+     * h_{mtp_h_pos0 - 1 + k}; row 0 is the carry from the previous forward
+     * (zeros at position 0) and rows 1..mtp_h_rows the last forward's rows.
+     * NULL on Qwen3.8 and on Ornith graphs without MTP. */
+    ds4_gpu_tensor *mtp_h;
+    uint32_t mtp_h_pos0;
+    uint32_t mtp_h_rows;
 } ds4_qwen4_gpu_graph;
 
 static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
@@ -59460,7 +59472,7 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         &g->ple_hist, &g->logits,
         &g->mtp_e, &g->mtp_cat, &g->mtp_proj, &g->mtp_R, &g->mtp_argmax, &g->mtp_argmax_tmp,
         &g->snap_ple_hist, &g->snap2_ple_hist, &g->snap0_ple_hist, &g->pos3,
-        &g->draft_head, &g->steer_dirs,
+        &g->draft_head, &g->steer_dirs, &g->mtp_h,
     };
     if (g->owns_scratch) {
         ds4_gpu_tensor **scratch[] = {
@@ -64655,6 +64667,9 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     }
     if (e && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 ? 2 : 0;
+    }
+    if (e && ds4_model_is_qwen35moe()) {
+        return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 && e->backend == DS4_BACKEND_METAL ? 2 : 0;
     }
     if (ds4_engine_has_mtp(e)) return e->mtp_draft_tokens;
 #ifndef DS4_NO_GPU
@@ -73157,7 +73172,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             opt->placement_session_count_hint > 1 ? "--batched-session" :
             load_slice ? "a layer slice" :
             opt->dspark ? "--dspark" :
-            opt->glm_mtp ? "--mtp" :
+            opt->dspark_exact_sampling ? "--mtp-exact-sampling" :
             (opt->mtp_path && opt->mtp_path[0]) ? "--mtp-model" :
             (opt->vision_path && opt->vision_path[0]) ? "--vision" :
             (opt->ple_path && opt->ple_path[0]) ? "--ple" :
@@ -73614,7 +73629,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
         e->vision_end_token = vocab_lookup(&e->vocab, "<|vision_end|>");
     }
     if (opt->glm_mtp &&
-        ((DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA && !ds4_model_is_qwen4()) ||
+        ((DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA && !ds4_model_is_qwen4() &&
+          !ds4_model_is_qwen35moe()) ||
          DS4_N_NEXTN_PREDICT == 0)) {
         fprintf(stderr,
                 "ds4: --mtp requires a model with embedded MTP weights; "
@@ -75549,7 +75565,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         const uint32_t cap_tokens = e->prefill_chunk && e->prefill_chunk < (uint32_t)ctx_size ?
             e->prefill_chunk : qwen35_prefill_chunk_tokens((uint32_t)ctx_size);
         s->qwen4_slot = -1;
-        if (!qwen35_graph_alloc(&s->qwen4_graph, (uint32_t)ctx_size, cap_tokens)) {
+        if (!qwen35_graph_alloc(&s->qwen4_graph, (uint32_t)ctx_size, cap_tokens, e->glm_mtp)) {
             free(s);
             return 1;
         }
@@ -76006,6 +76022,12 @@ void ds4_session_free(ds4_session *s) {
 #endif
 #ifdef DS4_HAS_QWEN4_METAL
         if (s->qwen35_graph_ready) {
+            if (s->engine && s->engine->glm_mtp_timing && s->qwen4_spec_cycles) {
+                fprintf(stderr, "ds4: Ornith mtp: %" PRIu64 " verify cycles, %" PRIu64 " drafts accepted (%.1f%%)\n",
+                        s->qwen4_spec_cycles, s->qwen4_spec_accepted,
+                        100.0 * (double)s->qwen4_spec_accepted / (double)s->qwen4_spec_cycles);
+            }
+            free(s->qwen4_verify_logits);
             qwen4_graph_free(&s->qwen4_graph);
         } else
 #endif
@@ -77207,6 +77229,126 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
 #endif
 #endif
 
+#ifdef DS4_HAS_QWEN4_METAL
+/* test knobs: DS4_QWEN35_SPEC_FORCE_ACCEPT commits every draft,
+ * DS4_QWEN35_SPEC_TRACE logs each cycle */
+static bool qwen35_spec_trace(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN35_SPEC_TRACE") != NULL;
+    return v != 0;
+}
+
+static bool qwen35_spec_force_accept(void) {
+    return getenv("DS4_QWEN35_SPEC_FORCE_ACCEPT") != NULL;
+}
+
+/* Run the MTP block over tokens at pos0.. and keep the draft that follows
+ * the last of them; without a draft the next cycle takes the plain path.
+ * Returns false only when the precheck passed but the GPU call itself
+ * failed (spec section 6: an MTP forward that fails midway invalidates the
+ * session), setting err/checkpoint_valid the way a failed verify does.
+ * When the draft is simply not possible (context end, residency), this
+ * returns true with no draft, unchanged from before. */
+static bool qwen35_session_draft(ds4_session *s, const int *tokens, uint32_t T, uint32_t pos0,
+                                 char *err, size_t errlen) {
+    int d = -1;
+    s->glm_mtp_have = 0;
+    ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+    if (!qwen35_mtp_precheck(g, tokens, T, pos0, true, &d)) return true;
+    if (qwen35_graph_mtp(g, &s->engine->model, &s->engine->weights, tokens, T, pos0, true, &d)) {
+        s->glm_mtp_draft = d;
+        s->glm_mtp_parent = tokens[T - 1u];
+        s->glm_mtp_have = 1;
+        return true;
+    }
+    s->checkpoint_valid = false;
+    if (errlen) snprintf(err, errlen, "Ornith mtp: draft failed");
+    return false;
+}
+
+/* One Ornith MTP cycle at depth 1, shaped like ds4_session_qwen4_spec_cycle:
+ * evaluate first_token, or verify [first_token, draft] in one 2-row pass
+ * whose attention, dense projections and GDN layers run one row per
+ * dispatch, so every row equals plain decoding bit for bit.  A draft is
+ * accepted when it is the target argmax (greedy and
+ * opportunistic sampling: the caller samples first_token and the token
+ * after the block from s->logits, so the sampling parameters are unused);
+ * a rejected one restores the GDN snapshot the verify took after its first
+ * row.  The MTP block then catches up over the committed tokens and drafts
+ * from the argmax parent the caller will most likely pass back.  Exact
+ * sampling is refused at open.  Returns the committed count (1 or 2) with
+ * s->logits at the last one, or -1. */
+static int ds4_session_qwen35_spec_cycle(ds4_session *s, int first_token, float temperature, int top_k,
+                                         float top_p, float min_p, uint64_t *rng, bool exact_sampling,
+                                         int *accepted, int accepted_cap, char *err, size_t errlen) {
+    (void)temperature; (void)top_k; (void)top_p; (void)min_p; (void)rng; (void)exact_sampling;
+    ds4_engine *e = s->engine;
+    ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+    const ds4_model *m = &e->model;
+    const ds4_weights *w = &e->weights;
+    const uint32_t pos = g->pos, V = DS4_N_VOCAB;
+    if (s->glm_mtp_have && first_token != s->glm_mtp_parent) s->glm_mtp_have = 0;
+    if (!s->glm_mtp_have || accepted_cap < 2 || pos + 2u > g->ctx_cap || g->cap_tokens < 2u ||
+        !qwen4_graph_fused(g, 2u)) {
+        s->glm_spec_inside = 1;
+        const int rc = ds4_session_eval_internal(s, first_token, false, err, errlen);
+        s->glm_spec_inside = 0;
+        if (rc != 0) return -1;
+        /* rewrite MTP row pos for first_token, then draft after the parent */
+        const int toks[2] = { first_token, sample_argmax(s->logits, V) };
+        if (!qwen35_session_draft(s, toks, 2u, pos, err, errlen)) return -1;
+        if (qwen35_spec_trace()) fprintf(stderr, "ds4: Ornith spec pos %u token %d plain\n", pos, first_token);
+        accepted[0] = first_token;
+        return 1;
+    }
+    s->glm_mtp_have = 0;
+    const int d = s->glm_mtp_draft;
+    const int toks[2] = { first_token, d };
+    /* rows 0 and 1 hold the verify rows (4 rows, as Qwen3.8 sizes it) */
+    if (!s->qwen4_verify_logits) s->qwen4_verify_logits = xmalloc(4u * (size_t)V * sizeof(float));
+    float *rows = s->qwen4_verify_logits;
+    g->snap_after_first = true;
+    g->verify_rows_exact = true;
+    const bool ok = qwen35_graph_forward_tokens(g, m, w, toks, 2u, rows, true);
+    g->verify_rows_exact = false;
+    if (!ok) {
+        if (errlen) snprintf(err, errlen, "Ornith mtp: verify failed");
+        s->checkpoint_valid = false;
+        return -1;
+    }
+    s->qwen4_spec_cycles++;
+    token_vec_push(&s->checkpoint, first_token);
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    const bool accept = sample_argmax(rows, V) == d || qwen35_spec_force_accept();
+    if (qwen35_spec_trace()) {
+        fprintf(stderr, "ds4: Ornith spec pos %u token %d draft %d %s\n", pos, first_token, d,
+                accept ? "accept" : "reject");
+    }
+    if (accept) {
+        token_vec_push(&s->checkpoint, d);
+        memcpy(s->logits, rows + V, (size_t)V * sizeof(float));
+        /* rows pos+1 (d with h_pos) and pos+2 (the parent with h_{pos+1}) */
+        const int next[2] = { d, sample_argmax(s->logits, V) };
+        if (!qwen35_session_draft(s, next, 2u, pos + 1u, err, errlen)) return -1;
+        s->qwen4_spec_accepted++;
+        accepted[0] = first_token;
+        accepted[1] = d;
+        return 2;
+    }
+    if (!qwen35_graph_state_swap(g)) {
+        if (errlen) snprintf(err, errlen, "Ornith mtp: rejection restore failed");
+        s->checkpoint_valid = false;
+        return -1;
+    }
+    memcpy(s->logits, rows, (size_t)V * sizeof(float));
+    const int parent = sample_argmax(s->logits, V);
+    if (!qwen35_session_draft(s, &parent, 1u, pos + 1u, err, errlen)) return -1;
+    accepted[0] = first_token;
+    return 1;
+}
+#endif
+
 int ds4_session_glm_tp_spec_cycle(ds4_session *s, int token, int limit,
                                  char *err, size_t errlen) {
 #ifndef DS4_NO_GPU
@@ -78179,6 +78321,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         ds4_engine *e = s->engine;
         ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
         int start = 0;
+        s->glm_mtp_have = 0;
         if (s->checkpoint_valid && g->pos == (uint32_t)s->checkpoint.len &&
             prompt->len >= s->checkpoint.len && ds4_tokens_starts_with(prompt, &s->checkpoint)) {
             start = s->checkpoint.len;
@@ -78208,8 +78351,14 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             uint32_t chunk = (uint32_t)(prompt->len - i);
             if (chunk > g->cap_tokens) chunk = g->cap_tokens;
             s->checkpoint_valid = false;
-            if (!qwen35_graph_forward_tokens(g, &e->model, &e->weights, prompt->v + i, chunk, s->logits)) {
+            if (!qwen35_graph_forward_tokens(g, &e->model, &e->weights, prompt->v + i, chunk, s->logits, false)) {
                 snprintf(err, errlen, "Ornith prefill failed at token %d", i);
+                return 1;
+            }
+            /* MTP catch-up: the block's K/V rows for this chunk's positions */
+            if (g->mtp_h && !qwen35_graph_mtp(g, &e->model, &e->weights, prompt->v + i, chunk, (uint32_t)i,
+                                              false, NULL)) {
+                snprintf(err, errlen, "Ornith MTP catch-up failed at token %d", i);
                 return 1;
             }
             for (uint32_t j = 0; j < chunk; j++) token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
@@ -80312,8 +80461,18 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             if (errlen) snprintf(err, errlen, "context is full");
             return 1;
         }
-        if (!qwen35_graph_forward_tokens(g, &e->model, &e->weights, &token, 1, s->logits)) {
+        if (!s->glm_spec_inside) s->glm_mtp_have = 0;
+        if (!qwen35_graph_forward_tokens(g, &e->model, &e->weights, &token, 1, s->logits, false)) {
             if (errlen) snprintf(err, errlen, "Ornith decode failed at position %u", g->pos);
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        /* A token that did not come through the speculative cycle (plain
+         * decode, server-forced tokens) still gets its MTP row, so later
+         * drafts attend a complete cache; the cycle writes its own rows. */
+        if (!s->glm_spec_inside && g->mtp_h &&
+            !qwen35_graph_mtp(g, &e->model, &e->weights, &token, 1u, g->pos - 1u, false, NULL)) {
+            if (errlen) snprintf(err, errlen, "Ornith MTP catch-up failed at position %u", g->pos - 1u);
             s->checkpoint_valid = false;
             return 1;
         }
@@ -87209,6 +87368,19 @@ static int ds4_session_eval_speculative_argmax_impl(
         accepted[0] = first_token;
         return 1;
     }
+#ifdef DS4_HAS_QWEN4_METAL
+    if (ds4_session_is_qwen35(s)) {
+        if (!accepted || accepted_cap <= 0) return 0;
+        if (s->engine->glm_mtp && s->qwen35_graph_ready && s->qwen4_graph.mtp_h) {
+            return ds4_session_qwen35_spec_cycle(s, first_token, 0.0f, 0, 0.0f, 0.0f, NULL, false,
+                                                 accepted, accepted_cap, err, errlen);
+        }
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
+#endif
+    ds4_qwen35_not_reached("speculative decode");
     if (ds4_session_is_glm(s)) {
         (void)max_tokens;
         (void)eos_token;
@@ -88077,6 +88249,18 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
             s, first_token, max_tokens, eos_token,
             accepted, accepted_cap, err, errlen);
     }
+#ifdef DS4_HAS_QWEN4_METAL
+    if (ds4_session_is_qwen35(s)) {
+        if (s->engine->glm_mtp && s->qwen35_graph_ready && s->qwen4_graph.mtp_h) {
+            return ds4_session_qwen35_spec_cycle(s, first_token, temperature, top_k, top_p, min_p, rng, false,
+                                                 accepted, accepted_cap, err, errlen);
+        }
+        return ds4_session_eval_speculative_argmax(
+            s, first_token, max_tokens, eos_token,
+            accepted, accepted_cap, err, errlen);
+    }
+#endif
+    ds4_qwen35_not_reached("sampled speculative decode");
 #ifdef DS4_NO_GPU
     (void)eos_token; (void)top_k; (void)top_p; (void)min_p;
     if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;

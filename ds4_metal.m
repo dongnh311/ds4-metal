@@ -49528,6 +49528,7 @@ enum {
     QWEN4_K_QWEN35_MOE_MID,
     QWEN4_K_QWEN35_MOE_DOWN,
     QWEN4_K_QWEN35_GDN_OUT,
+    QWEN4_K_QWEN35_MTP_CONCAT,
     QWEN4_K_COUNT,
 };
 
@@ -49653,6 +49654,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen35_moe_mid",
     "kernel_qwen35_moe_down",
     "kernel_qwen35_gdn_out",
+    "kernel_qwen35_mtp_concat",
 };
 
 typedef struct {
@@ -50345,6 +50347,25 @@ int ds4_gpu_qwen35_gdn_out_tensor(
     }
     return qwen4_dispatch(QWEN4_K_QWEN35_GDN_OUT, &args, sizeof(args), b, 3,
                           MTLSizeMake(n_head, n_tokens, 1), MTLSizeMake(32, 1, 1), 0);
+}
+
+int ds4_gpu_qwen35_mtp_concat_tensor(
+        ds4_gpu_tensor *cat, const ds4_gpu_tensor *e, const ds4_gpu_tensor *h,
+        const void *model_map, uint64_t model_size, uint64_t enorm_offset, uint64_t hnorm_offset,
+        uint32_t n_embd, uint32_t n_tokens, float eps) {
+    struct { uint32_t n_embd, n_tokens; float eps; } args = { n_embd, n_tokens, eps };
+    qwen4_bind b[5];
+    const uint64_t row = (uint64_t)n_embd * sizeof(float);
+    if (n_tokens == 0 || n_embd == 0 ||
+        !qwen4_bind_tensor(&b[0], cat, 2u * row * n_tokens, "mtp concat") ||
+        !qwen4_bind_tensor(&b[1], e, row * n_tokens, "mtp embedding") ||
+        !qwen4_bind_tensor(&b[2], h, row * n_tokens, "mtp hidden") ||
+        !qwen4_bind_weight(&b[3], model_map, model_size, enorm_offset, row, "nextn enorm") ||
+        !qwen4_bind_weight(&b[4], model_map, model_size, hnorm_offset, row, "nextn hnorm")) {
+        return 0;
+    }
+    return qwen4_dispatch(QWEN4_K_QWEN35_MTP_CONCAT, &args, sizeof(args), b, 5,
+                          MTLSizeMake(2, n_tokens, 1), MTLSizeMake(256, 1, 1), 0);
 }
 
 int ds4_gpu_qwen4_ple_gate_tensor(

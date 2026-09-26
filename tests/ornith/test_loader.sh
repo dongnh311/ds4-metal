@@ -3,8 +3,9 @@
 # wrong metadata value, an unsupported expert type (trunk or MTP) or a type
 # mismatch between fused tensors fails with a message naming the key, the
 # tier or the tensors.  The Metal-only open gate also
-# refuses a non-Metal backend, --batched-session and a context above the
-# native 262144, and ds4-server / ds4-agent refuse Ornith until milestone M3.
+# refuses a non-Metal backend, --batched-session, a context above the
+# native 262144, --mtp-model and --mtp-exact-sampling, and ds4-server /
+# ds4-agent refuse Ornith until milestone M3.
 # Needs a built ./ds4, ./ds4-server and ./ds4-agent and DS4_ORNITH_MODEL.
 set -eu
 model=${DS4_ORNITH_MODEL:?set DS4_ORNITH_MODEL to the 23G ICE GGUF}
@@ -98,5 +99,16 @@ grep -q 'ds4-server: Ornith-1.5-35B-A3B serving arrives in milestone M3' "$tmp/s
 expect_refused "ds4-agent" "$tmp/agent.txt" ./ds4-agent -m "$model"
 grep -q 'ds4-agent: Ornith-1.5-35B-A3B agent mode arrives in milestone M3' "$tmp/agent.txt" ||
     { cat "$tmp/agent.txt"; exit 1; }
+
+# M2: --mtp runs the embedded blk.40 head; an external MTP model and exact
+# speculative sampling stay refused.
+if ./ds4 -m "$model" --raw --mtp --mtp-exact-sampling -p hi -n 1 > "$tmp/mtp_exact.txt" 2>&1; then
+    echo "--mtp-exact-sampling accepted for Ornith"; exit 1
+fi
+grep -q -- '--mtp-exact-sampling is not supported' "$tmp/mtp_exact.txt" || { cat "$tmp/mtp_exact.txt"; exit 1; }
+if ./ds4 -m "$model" --raw --mtp-model "$model" -p hi -n 1 > "$tmp/mtp_model.txt" 2>&1; then
+    echo "--mtp-model accepted for Ornith"; exit 1
+fi
+grep -q -- '--mtp-model is not supported' "$tmp/mtp_model.txt" || { cat "$tmp/mtp_model.txt"; exit 1; }
 
 echo "ornith loader: ok"

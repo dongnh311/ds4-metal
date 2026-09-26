@@ -13,8 +13,43 @@ Metal-versus-CPU spread instead of being picked by hand.
 """
 import json
 import os
+import subprocess
+import sys
 
 FLOOR = 0.05  # log-prob; the smallest tolerance and tie gap the gate uses
+
+# Grace period after SIGTERM before giving up and telling the operator to
+# check the process by hand.  Never SIGKILL: a killed-9 hung Metal process
+# wedges its GGUF's vnode until reboot on this machine.
+TERM_GRACE_S = 120
+
+
+def run_ds4(cmd, cwd=None, env=None, timeout=1800, text=False):
+    """Run a ds4 subprocess without ever SIGKILLing it.
+
+    subprocess.run's own timeout/Ctrl-C handling SIGKILLs the child, which
+    wedges the GGUF file until reboot if ds4 is mid-Metal-call.  Here a
+    timeout or KeyboardInterrupt sends SIGTERM and gives the child up to
+    TERM_GRACE_S to exit on its own; if it is still alive after that, the
+    whole script exits with the pid so the operator can check it by hand
+    (the pattern mtp_accept.py already uses when a llama-server child hangs).
+
+    Returns a subprocess.CompletedProcess like subprocess.run would, on the
+    normal (non-hung) exit path.
+    """
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=text)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except (subprocess.TimeoutExpired, KeyboardInterrupt):
+        proc.terminate()
+        try:
+            proc.communicate(timeout=TERM_GRACE_S)
+        except subprocess.TimeoutExpired:
+            sys.exit(f"ds4 pid {proc.pid} did not stop after SIGTERM; "
+                     f"do not kill -9, check it by hand")
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 # Tail ranks (roughly log-prob < -2, i.e. under ~13% probability) carry
 # activation-quantization noise from the CPU backend that says nothing about

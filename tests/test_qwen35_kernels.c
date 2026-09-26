@@ -432,6 +432,34 @@ static void test_reduce_nohc(uint32_t T, uint32_t K, uint32_t E, bool shared_slo
     ds4_gpu_tensor_free(gsh); ds4_gpu_tensor_free(gout);
 }
 
+/* Ornith MTP input: cat[t] = [RMSNorm(e_t) * enorm | RMSNorm(h_t) * hnorm],
+ * embedding half first (llama.cpp qwen35moe graph_mtp). */
+static void test_mtp_concat(arena_t *a, uint32_t E, uint32_t T) {
+    double *we, *wh;
+    const uint64_t e_off = arena_f32(a, E, &we, 0.5f, 1.5f);
+    const uint64_t h_off = arena_f32(a, E, &wh, 0.5f, 1.5f);
+    const uint64_t n = (uint64_t)T * E;
+    float *e = rand_vec(n, 1.0f), *h = rand_vec(n, 3.0f);
+    double *ref = malloc(2u * n * sizeof(double));
+    for (uint32_t t = 0; t < T; t++) {
+        for (uint32_t half = 0; half < 2u; half++) {
+            const float *x = (half ? h : e) + (uint64_t)t * E;
+            const double *w = half ? wh : we;
+            double ss = 0.0;
+            for (uint32_t i = 0; i < E; i++) ss += (double)x[i] * x[i];
+            const double r = 1.0 / sqrt(ss / E + 1e-6);
+            for (uint32_t i = 0; i < E; i++) ref[(uint64_t)t * 2u * E + (uint64_t)half * E + i] = x[i] * r * w[i];
+        }
+    }
+    ds4_gpu_tensor *ge = upload(e, n), *gh = upload(h, n), *gc = upload(NULL, 2u * n);
+    require_ok(ds4_gpu_qwen35_mtp_concat_tensor(gc, ge, gh, a->base, a->size, e_off, h_off, E, T, 1e-6f),
+               "qwen35 mtp concat");
+    float *got = download(gc, 2u * n);
+    check_close("mtp concat", got, ref, 2u * n, 1e-5);
+    free(got); free(e); free(h); free(ref); free(we); free(wh);
+    ds4_gpu_tensor_free(ge); ds4_gpu_tensor_free(gh); ds4_gpu_tensor_free(gc);
+}
+
 int main(void) {
     arena_t arena;
     arena.size = (uint64_t)512 << 20;
@@ -452,6 +480,10 @@ int main(void) {
     printf("qwen4 moe reduce without residual (as Ornith calls it)\n");
     test_reduce_nohc(1, 8, 2048, true);
     test_reduce_nohc(12, 8, 2048, false);
+    printf("qwen35 mtp concat\n");
+    test_mtp_concat(&arena, 2048, 1);
+    test_mtp_concat(&arena, 2048, 7);
+    test_mtp_concat(&arena, 256, 3);
     printf("qwen35 kernels: ok\n");
     return 0;
 }
