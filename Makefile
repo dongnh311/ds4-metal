@@ -633,6 +633,18 @@ tests/test_qwen4_kernels.o: tests/test_qwen4_kernels.c ds4_gpu.h ds4.h
 $(QWEN4_KERNEL_TEST): tests/test_qwen4_kernels.o ds4_metal.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
+tests/test_qwen35_kernels.o: tests/test_qwen35_kernels.c ds4_gpu.h ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_qwen35_kernels.c
+
+tests/test_qwen35_kernels: tests/test_qwen35_kernels.o ds4_metal.o ds4_image.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+tests/test_qwen35_session.o: tests/test_qwen35_session.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_qwen35_session.c
+
+tests/test_qwen35_session: tests/test_qwen35_session.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
 endif
 
 tests/test_qwen4_vision.o: tests/test_qwen4_vision.c ds4.h
@@ -645,9 +657,12 @@ else
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 endif
 
-.PHONY: test-qwen4-kernels test-qwen4-q2 test-qwen4-vision
+.PHONY: test-qwen4-kernels test-qwen4-q2 test-qwen4-vision test-qwen35-kernels
 test-qwen4-kernels: $(QWEN4_KERNEL_TEST)
 	./$(QWEN4_KERNEL_TEST)
+
+test-qwen35-kernels: tests/test_qwen35_kernels
+	./tests/test_qwen35_kernels
 
 test-qwen4-q2: $(QWEN4_KERNEL_TEST) tests/test_qwen4_moe_mm_specialize
 	DS4_TEST_QWEN4_MV_EXACT=1 ./$(QWEN4_KERNEL_TEST)
@@ -773,6 +788,10 @@ ifeq ($(UNAME_S),Darwin)
 else
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 endif
+
+.PHONY: test-qwen35-session
+test-qwen35-session: tests/test_qwen35_session
+	./tests/test_qwen35_session "$(DS4_ORNITH_MODEL)"
 
 ds4.o ds4_cpu.o ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o ds4_metal.o ds4_cuda.o ds4_rocm.o tests/test_qwen4_cuda.o tests/test_qwen4_kernels.o tests/test_qwen4_ngram_state.o: ds4_qwen4_vision.h
 
@@ -1112,7 +1131,8 @@ clean:
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_qwen4_moe_mm_specialize tests/test_qwen4_conv_parallel tests/test_q8_prefill_variants tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 	rm -f tests/test_image_decode
 	rm -f tests/test_qwen4_kernels tests/test_qwen4_cuda tests/test_qwen4_vision tests/test_qwen4_prefill
+	rm -f tests/test_qwen35_kernels tests/test_qwen35_session
 	rm -f speed-bench/session_concurrency_bench
 
-# The active tokenizer includes generated Unicode classes.
-ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: ds4_qwen4_unicode.inc
+# ds4.c includes the generated Unicode classes and the Ornith graph.
+ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: ds4_qwen4_unicode.inc ds4_qwen35moe.inc

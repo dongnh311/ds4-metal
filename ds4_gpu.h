@@ -3494,6 +3494,11 @@ int ds4_gpu_qwen4_gdn_out_tensor(
         ds4_gpu_tensor *o, const ds4_gpu_tensor *z,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,
         uint32_t n_tokens, uint32_t n_head, uint32_t head_dim, float eps);
+/* Same parameters as ds4_gpu_qwen4_gdn_out_tensor; gate silu(z). */
+int ds4_gpu_qwen35_gdn_out_tensor(
+        ds4_gpu_tensor *o, const ds4_gpu_tensor *z,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n_tokens, uint32_t n_head, uint32_t head_dim, float eps);
 int ds4_gpu_qwen4_ple_gate_tensor(
         ds4_gpu_tensor *gated, ds4_gpu_tensor *normed, const ds4_gpu_tensor *R,
         const ds4_gpu_tensor *key, const ds4_gpu_tensor *value,
@@ -3534,6 +3539,14 @@ int ds4_gpu_qwen4_attn_prep_tensor(
         float rope_base, float eps,
         ds4_gpu_tensor *k_cache_fp8, ds4_gpu_tensor *v_cache_fp8,
         ds4_gpu_tensor *k_scale, ds4_gpu_tensor *v_scale, uint32_t fp8, uint32_t ik_ring);
+/* q/k RMSNorm, NEOX RoPE on n_rot dims, F16 KV append; no indexer. */
+int ds4_gpu_qwen35_attn_prep_tensor(
+        ds4_gpu_tensor *q_out, ds4_gpu_tensor *gate_out, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *qg, const ds4_gpu_tensor *kproj, const ds4_gpu_tensor *vproj,
+        const ds4_gpu_tensor *pos3, const void *model_map, uint64_t model_size,
+        uint64_t g_q_offset, uint64_t g_k_offset,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot,
+        uint32_t pos0, uint32_t cache_cap, float rope_base, float eps);
 /* ik_ring != 0: ik_cache keeps only the last ik_ring raw indexer keys, row pos % ik_ring. */
 int ds4_gpu_qwen4_idx_block_key_tensor(
         ds4_gpu_tensor *block_key, const ds4_gpu_tensor *ik_cache, const ds4_gpu_tensor *pos3,
@@ -3578,6 +3591,20 @@ int ds4_gpu_qwen4_moe_mid_tensor(
         uint32_t in_dim, uint32_t ff_dim,
         uint64_t shared_gate_offset, uint64_t shared_up_offset, uint32_t shared_type);
 int ds4_gpu_qwen4_moe_down_tensor(
+        ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
+        const void *model_map, uint64_t model_size, uint64_t down_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t ff_dim, uint32_t out_dim,
+        uint64_t shared_down_offset, uint32_t shared_type);
+/* Ornith (qwen35moe) routed experts; same semantics as the qwen4 pair above,
+ * with weight_type 13 (Q5_K) handled by qwen35_row_dot. */
+int ds4_gpu_qwen35_moe_mid_tensor(
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t in_dim, uint32_t ff_dim,
+        uint64_t shared_gate_offset, uint64_t shared_up_offset, uint32_t shared_type);
+int ds4_gpu_qwen35_moe_down_tensor(
         ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
         const void *model_map, uint64_t model_size, uint64_t down_offset,
         uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,

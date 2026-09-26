@@ -50,3 +50,8 @@ speed-bench/fp8-flat-gate/
 /speed-bench/qwen-regression/last-*/
 /speed-bench/qwen-regression/baseline/server.log
 /speed-bench/think-budget/runs/*.log
+
+# Ornith (qwen35moe) run artefacts: keep RESULTS.md and compare output only
+speed-bench/ornith/*/ds4/
+speed-bench/ornith/*/logs/
+speed-bench/ornith/oracle/ref-cpu/

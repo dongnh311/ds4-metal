@@ -13577,6 +13577,13 @@ int main(int argc, char **argv) {
     } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         return 1;
     }
+    /* The agent's tool syntax and session files are not wired for Ornith
+     * yet. */
+    if (ds4_engine_is_qwen35moe(engine)) {
+        fprintf(stderr, "ds4-agent: Ornith-1.5-35B-A3B agent mode arrives in milestone M3; use ./ds4 for now\n");
+        ds4_engine_close(engine);
+        return 1;
+    }
     if (ds4_think_mode_level(cfg.gen.think_mode) >= 0 && !ds4_engine_is_deepseek41(engine)) {
         fprintf(stderr, "ds4-agent: --think-level requires a DeepSeek V4.1 model\n");
         ds4_engine_close(engine);

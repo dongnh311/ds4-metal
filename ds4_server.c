@@ -16023,6 +16023,13 @@ int main(int argc, char **argv) {
     } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         return 1;
     }
+    /* The server's chat ids, tool syntax and disk KV are not wired for
+     * Ornith yet. */
+    if (ds4_engine_is_qwen35moe(engine)) {
+        fprintf(stderr, "ds4-server: Ornith-1.5-35B-A3B serving arrives in milestone M3; use ./ds4 for now\n");
+        ds4_engine_close(engine);
+        return 1;
+    }
 
     if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
         ds4_dist_generation_options gen = {

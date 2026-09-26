@@ -527,6 +527,7 @@ typedef enum {
     DS4_MODEL_FAMILY_GLM_DSA   = 1,
     DS4_MODEL_FAMILY_DEEPSEEK41 = 2,
     DS4_MODEL_FAMILY_QWEN4_EXP = 3,
+    DS4_MODEL_FAMILY_QWEN35_MOE = 4,
 } ds4_model_family;
 
 typedef enum {
@@ -537,6 +538,7 @@ typedef enum {
     DS4_VARIANT_FLASH41 = 4,
     DS4_VARIANT_QWEN4_EXP = 5,
     DS4_VARIANT_QWEN4_MINI = 6,
+    DS4_VARIANT_QWEN35_MOE = 7,
 } ds4_variant;
 
 typedef struct {
@@ -877,6 +879,38 @@ static const ds4_shape DS4_SHAPE_QWEN4_MINI = {
     .rope_orig_ctx = 262144,
 };
 
+/* Ornith-1.5-35B-A3B (llama.cpp qwen35moe): 40 trunk layers repeating
+ * 3 Gated DeltaNet + 1 gated full attention on a plain residual stream,
+ * plus one MTP block.  256 routed experts, 8 used, and one shared expert.
+ * No hyper-connections, PLE or QSA indexer: those shape fields stay 0 and
+ * only the qwen4exp path reads them. */
+static const ds4_shape DS4_SHAPE_QWEN35_MOE = {
+    .name = "Ornith-1.5-35B-A3B",
+    .family = DS4_MODEL_FAMILY_QWEN35_MOE,
+    .variant = DS4_VARIANT_QWEN35_MOE,
+    .n_layer = 41,
+    .n_embd = 2048,
+    .n_vocab = 248320,
+    .n_head = 16,
+    .n_head_kv = 2,
+    .n_head_dim = 256,
+    .n_value_dim = 256,
+    .n_rot = 64,
+    .n_expert = 256,
+    .n_expert_used = 8,
+    .n_expert_shared = 1,
+    .n_ff_exp = 512,
+    .n_nextn_predict = 1,
+    .n_lin_k_head = 16,
+    .n_lin_v_head = 32,
+    .n_lin_head_dim = 128,
+    .n_lin_conv = 4,
+    .n_full_attn_interval = 4,
+    .rms_eps = 1.0e-6f,
+    .rope_freq_base = 10000000.0f,
+    .rope_orig_ctx = 262144,
+};
+
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
     .family = DS4_MODEL_FAMILY_DEEPSEEK4,
@@ -1027,6 +1061,35 @@ static bool ds4_qwen4_layer_is_ple(uint32_t il) {
 static bool ds4_qwen4_layer_is_nextn(uint32_t il) {
     return ds4_model_is_qwen4() && DS4_N_NEXTN_PREDICT != 0 &&
            il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER;
+}
+
+static bool ds4_model_is_qwen35moe(void) {
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35_MOE;
+}
+
+/* Qwen3.5 tokenizer, ChatML turns and XML tool calls: Qwen3.8 and Ornith. */
+static bool ds4_model_uses_qwen35_text(void) {
+    return ds4_model_is_qwen4() || ds4_model_is_qwen35moe();
+}
+
+static bool ds4_qwen35_layer_is_nextn(uint32_t il) {
+    return ds4_model_is_qwen35moe() && DS4_N_NEXTN_PREDICT != 0 &&
+           il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER;
+}
+
+/* Full attention at (il + 1) % 4 == 0, as llama.cpp's qwen35moe loader; the
+ * MTP block is an attention layer too. */
+static bool ds4_qwen35_layer_is_attention(uint32_t il) {
+    return ds4_model_is_qwen35moe() &&
+           (ds4_qwen35_layer_is_nextn(il) || (il + 1u) % DS4_N_FULL_ATTN_INTERVAL == 0u);
+}
+
+/* The Ornith family has its own branch at every graph, session and memory
+ * dispatch point; reaching a DeepSeek default instead is a missed branch. */
+static void ds4_qwen35_not_reached(const char *where) {
+    if (!ds4_model_is_qwen35moe()) return;
+    fprintf(stderr, "ds4: internal error: Ornith reached the DeepSeek path in %s\n", where);
+    exit(1);
 }
 
 static int g_ds4_lock_fd = -1;
@@ -5346,7 +5409,8 @@ static void tensor_expect_routed_expert(
 
 static bool weights_have_output_head(const ds4_weights *w) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ||
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35_MOE) {
         return w && w->output_norm && w->output;
     }
     if (ds4_model_is_qwen4()) {
@@ -5362,7 +5426,8 @@ static bool weights_have_output_head(const ds4_weights *w) {
 
 static bool weights_have_partial_output_head(const ds4_weights *w) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ||
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35_MOE) {
         return w && (w->output_norm || w->output);
     }
     if (ds4_model_is_qwen4()) {
@@ -5476,6 +5541,24 @@ static bool weights_qwen4_layer_has_required(const ds4_layer_weights *l, uint32_
          !l->nextn_hc_head_norm || !l->nextn_hc_head_down || !l->nextn_hc_head_up)) {
         return false;
     }
+    return true;
+}
+
+static bool weights_qwen35moe_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
+    if (!l || !l->attn_norm || !l->ffn_norm) return false;
+    if (ds4_qwen35_layer_is_attention(il)) {
+        if (!l->attn_q || !l->attn_k || !l->attn_v || !l->attn_output || !l->attn_q_norm || !l->attn_k_norm)
+            return false;
+    } else if (!l->lin_qkv || !l->lin_gate || !l->lin_conv || !l->lin_dt_bias || !l->lin_a ||
+               !l->lin_beta || !l->lin_alpha || !l->lin_norm || !l->lin_out) {
+        return false;
+    }
+    if (!l->ffn_gate_inp || !l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps ||
+        !l->ffn_gate_inp_shexp || !l->ffn_gate_shexp || !l->ffn_up_shexp || !l->ffn_down_shexp)
+        return false;
+    if (ds4_qwen35_layer_is_nextn(il) &&
+        (!l->nextn_eh_proj || !l->nextn_enorm || !l->nextn_hnorm || !l->nextn_shared_head_norm))
+        return false;
     return true;
 }
 
@@ -5646,6 +5729,7 @@ static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) 
     if (ds4_model_is_qwen4()) {
         return weights_qwen4_layer_has_required(l, il);
     }
+    if (ds4_model_is_qwen35moe()) return weights_qwen35moe_layer_has_required(l, il);
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return weights_glm_dsa_layer_has_required(l, il);
     }
@@ -5887,6 +5971,110 @@ static void weights_validate_glm_dsa_layout(
     }
 }
 
+/* Ornith routed experts: the ICE 23G/25G tiers use Q4_K and Q5_K; the 19G
+ * and 21G tiers (IQ4_XS / IQ3_S) have no Metal kernels here. */
+static void tensor_expect_qwen35_expert_layout(const ds4_tensor *t, uint64_t d0, uint64_t d1, uint64_t d2) {
+    if (!t) ds4_die("internal error: missing tensor while validating layout");
+    if (t->type != DS4_TENSOR_Q4_K && t->type != DS4_TENSOR_Q5_K) {
+        fprintf(stderr, "ds4: %.*s: expert type %s not supported; use the 23G or 25G tier (Q4_K/Q5_K experts)\n",
+                (int)t->name.len, t->name.ptr, tensor_type_name(t->type));
+        exit(1);
+    }
+    tensor_expect_layout(t, t->type, 3, d0, d1, d2);
+}
+
+/* Two tensors that one Ornith kernel reads with a single type argument. */
+static void tensor_expect_qwen35_same_type(uint32_t il, const ds4_tensor *t, const ds4_tensor *ref,
+                                           const char *why) {
+    if (t->type == ref->type) return;
+    fprintf(stderr, "ds4: layer %u: %.*s is %s but %.*s is %s; %s\n", il,
+            (int)t->name.len, t->name.ptr, tensor_type_name(t->type),
+            (int)ref->name.len, ref->name.ptr, tensor_type_name(ref->type), why);
+    exit(1);
+}
+
+static void weights_validate_qwen35moe_layout(const ds4_weights *w, uint32_t layer_start, uint32_t layer_end,
+                                              bool require_token_embd, bool require_output) {
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t lin_k_dim = (uint64_t)DS4_N_LIN_K_HEAD * DS4_N_LIN_HEAD_DIM;
+    const uint64_t lin_v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
+    if (!w) ds4_die("internal error: missing weights while validating Ornith layout");
+    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
+    if (layer_start > layer_end || layer_end >= DS4_N_LAYER) ds4_die("invalid Ornith layer range");
+    if (require_token_embd && !w->token_embd) ds4_die("required token embedding tensor is missing");
+    if (w->token_embd) tensor_expect_qwen4_dense_layout(w->token_embd, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    const bool have_output = weights_have_output_head(w);
+    if (require_output && !have_output) ds4_die("required output head tensors are missing");
+    if (have_output) {
+        tensor_expect_layout(w->output_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_qwen4_dense_layout(w->output, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+    /* When the executable trunk (0..DS4_N_LAYER-1-DS4_N_NEXTN_PREDICT) is
+     * fully loaded and the MTP block is bound, extend the check onto it too:
+     * weights_bind() binds blk.40 alongside the trunk, but only the trunk
+     * range is passed in, so blk.40 would otherwise never see a presence,
+     * shape or expert-type check. */
+    uint32_t loop_end = layer_end;
+    if (layer_end + 1u == DS4_N_LAYER - DS4_N_NEXTN_PREDICT &&
+        w->layer[DS4_N_LAYER - 1u].ffn_gate_exps) {
+        loop_end = DS4_N_LAYER - 1u;
+    }
+    uint32_t n_q4k = 0, n_q5k = 0;
+    for (uint32_t il = layer_start; il <= loop_end; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (!weights_qwen35moe_layer_has_required(l, il)) {
+            fprintf(stderr, "ds4: required Ornith tensors for layer %u are missing\n", il);
+            exit(1);
+        }
+        tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(l->ffn_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        if (ds4_qwen35_layer_is_attention(il)) {
+            tensor_expect_qwen4_dense_layout(l->attn_q, 2, DS4_N_EMBD, 2u * q_dim, 0);
+            tensor_expect_qwen4_dense_layout(l->attn_k, 2, DS4_N_EMBD, kv_dim, 0);
+            tensor_expect_qwen4_dense_layout(l->attn_v, 2, DS4_N_EMBD, kv_dim, 0);
+            tensor_expect_qwen4_dense_layout(l->attn_output, 2, q_dim, DS4_N_EMBD, 0);
+            tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
+            tensor_expect_layout(l->attn_k_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
+        } else {
+            tensor_expect_qwen4_dense_layout(l->lin_qkv, 2, DS4_N_EMBD, 2u * lin_k_dim + lin_v_dim, 0);
+            tensor_expect_qwen4_dense_layout(l->lin_gate, 2, DS4_N_EMBD, lin_v_dim, 0);
+            tensor_expect_layout(l->lin_conv, DS4_TENSOR_F32, 2, DS4_N_LIN_CONV, 2u * lin_k_dim + lin_v_dim, 0);
+            tensor_expect_layout(l->lin_dt_bias, DS4_TENSOR_F32, 1, DS4_N_LIN_V_HEAD, 0, 0);
+            tensor_expect_layout(l->lin_a, DS4_TENSOR_F32, 1, DS4_N_LIN_V_HEAD, 0, 0);
+            tensor_expect_qwen4_dense_layout(l->lin_beta, 2, DS4_N_EMBD, DS4_N_LIN_V_HEAD, 0);
+            tensor_expect_qwen4_dense_layout(l->lin_alpha, 2, DS4_N_EMBD, DS4_N_LIN_V_HEAD, 0);
+            tensor_expect_qwen35_same_type(il, l->lin_beta, l->lin_alpha,
+                                           "the fused GDN front reads both with ssm_alpha's type");
+            tensor_expect_layout(l->lin_norm, DS4_TENSOR_F32, 1, DS4_N_LIN_HEAD_DIM, 0, 0);
+            tensor_expect_qwen4_dense_layout(l->lin_out, 2, lin_v_dim, DS4_N_EMBD, 0);
+        }
+        tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
+        tensor_expect_qwen35_expert_layout(l->ffn_gate_exps, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_qwen35_expert_layout(l->ffn_up_exps, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_qwen35_expert_layout(l->ffn_down_exps, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+        if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
+            fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
+            exit(1);
+        }
+        if (l->ffn_gate_exps->type == DS4_TENSOR_Q5_K) n_q5k++; else n_q4k++;
+        tensor_expect_layout(l->ffn_gate_inp_shexp, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_qwen4_dense_layout(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_qwen4_dense_layout(l->ffn_up_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_qwen35_same_type(il, l->ffn_up_shexp, l->ffn_gate_shexp,
+                                       "the shared-expert slot reads both with the gate's type");
+        tensor_expect_qwen4_dense_layout(l->ffn_down_shexp, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+        if (ds4_qwen35_layer_is_nextn(il)) {
+            tensor_expect_qwen4_dense_layout(l->nextn_eh_proj, 2, 2u * DS4_N_EMBD, DS4_N_EMBD, 0);
+            tensor_expect_layout(l->nextn_enorm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+            tensor_expect_layout(l->nextn_hnorm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+            tensor_expect_layout(l->nextn_shared_head_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        }
+    }
+    fprintf(stderr, "ds4: %s: %u layers + MTP, routed experts Q5_K x%u / Q4_K x%u\n",
+            DS4_MODEL_SHAPE_NAME, DS4_N_LAYER - DS4_N_NEXTN_PREDICT, n_q5k, n_q4k);
+}
+
 static void weights_validate_layout(
         const ds4_weights *w,
         uint32_t           layer_start,
@@ -5904,6 +6092,10 @@ static void weights_validate_layout(
     if (ds4_model_is_qwen4()) {
         weights_validate_qwen4_layout(w, layer_start, layer_end,
                                       require_token_embd, require_output);
+        return;
+    }
+    if (ds4_model_is_qwen35moe()) {
+        weights_validate_qwen35moe_layout(w, layer_start, layer_end, require_token_embd, require_output);
         return;
     }
 
@@ -7172,6 +7364,45 @@ static void config_validate_qwen4_model(const ds4_model *m) {
     }
 }
 
+/* Ornith-1.5-35B-A3B: every shape value is fixed; a mismatch names the key.
+ * RoPE is plain NEOX partial rotation at the native context (the qwen4 prep
+ * kernel computes base^(-2i/n_rot) when no YaRN table is set). */
+static void config_validate_qwen35moe_model(const ds4_model *m) {
+    g_ds4_shape = DS4_SHAPE_QWEN35_MOE;
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+    config_expect_u32("embedding_length", required_u32(m, "qwen35moe.embedding_length"), DS4_N_EMBD);
+    config_expect_u32("block_count", required_u32(m, "qwen35moe.block_count"), DS4_N_LAYER);
+    config_expect_u32("nextn_predict_layers", required_u32(m, "qwen35moe.nextn_predict_layers"),
+                      DS4_N_NEXTN_PREDICT);
+    config_expect_u32("context_length", required_u32(m, "qwen35moe.context_length"),
+                      (uint32_t)DS4_ROPE_ORIG_CTX);
+    config_expect_u32("attention.head_count", required_u32(m, "qwen35moe.attention.head_count"), DS4_N_HEAD);
+    config_expect_u32("attention.head_count_kv", required_u32(m, "qwen35moe.attention.head_count_kv"),
+                      DS4_N_HEAD_KV);
+    config_expect_u32("attention.key_length", required_u32(m, "qwen35moe.attention.key_length"),
+                      DS4_N_HEAD_DIM);
+    config_expect_u32("attention.value_length", required_u32(m, "qwen35moe.attention.value_length"),
+                      DS4_N_VALUE_DIM);
+    config_expect_u32("rope.dimension_count", required_u32(m, "qwen35moe.rope.dimension_count"), DS4_N_ROT);
+    config_expect_f32("rope.freq_base", required_f32(m, "qwen35moe.rope.freq_base"), DS4_ROPE_FREQ_BASE);
+    config_expect_epsilon("attention.layer_norm_rms_epsilon",
+                          required_f32(m, "qwen35moe.attention.layer_norm_rms_epsilon"), DS4_RMS_EPS);
+    config_expect_u32("expert_count", required_u32(m, "qwen35moe.expert_count"), DS4_N_EXPERT);
+    config_expect_u32("expert_used_count", required_u32(m, "qwen35moe.expert_used_count"), DS4_N_EXPERT_USED);
+    config_expect_u32("expert_feed_forward_length",
+                      required_u32(m, "qwen35moe.expert_feed_forward_length"), DS4_N_FF_EXP);
+    config_expect_u32("expert_shared_feed_forward_length",
+                      required_u32(m, "qwen35moe.expert_shared_feed_forward_length"), DS4_N_FF_EXP);
+    config_expect_u32("ssm.conv_kernel", required_u32(m, "qwen35moe.ssm.conv_kernel"), DS4_N_LIN_CONV);
+    config_expect_u32("ssm.state_size", required_u32(m, "qwen35moe.ssm.state_size"), DS4_N_LIN_HEAD_DIM);
+    config_expect_u32("ssm.group_count", required_u32(m, "qwen35moe.ssm.group_count"), DS4_N_LIN_K_HEAD);
+    config_expect_u32("ssm.time_step_rank", required_u32(m, "qwen35moe.ssm.time_step_rank"), DS4_N_LIN_V_HEAD);
+    config_expect_u32("ssm.inner_size", required_u32(m, "qwen35moe.ssm.inner_size"),
+                      DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM);
+    config_expect_u32("full_attention_interval",
+                      required_u32(m, "qwen35moe.full_attention_interval"), DS4_N_FULL_ATTN_INTERVAL);
+}
+
 static void config_validate_model(const ds4_model *m) {
     g_ds4_flash_vision_exp = false;
     ds4_str arch = {0};
@@ -7190,6 +7421,10 @@ static void config_validate_model(const ds4_model *m) {
         }
         if (ds4_streq(arch, "qwen4exp")) {
             config_validate_qwen4_model(m);
+            return;
+        }
+        if (ds4_streq(arch, "qwen35moe")) {
+            config_validate_qwen35moe_model(m);
             return;
         }
     }
@@ -7681,7 +7916,8 @@ static void weights_bind_output(
             w->output         = model_find_tensor(m, "output.weight");
         }
     } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ||
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35_MOE) {
 
         if (required) {
             w->output_norm = required_tensor(m, "output_norm.weight");
@@ -7844,9 +8080,53 @@ static void weights_bind_qwen4_layer(ds4_layer_weights *l, const ds4_model *m, u
     }
 }
 
+/* llama.cpp qwen35moe names.  attn_norm / post_attention_norm land in the
+ * attn_norm / ffn_norm fields the other families use for their pre-mixer and
+ * pre-FFN norms; their weights already carry llama.cpp's +1. */
+static void weights_bind_qwen35moe_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    l->attn_norm = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+    l->ffn_norm  = required_tensorf(m, "blk.%u.post_attention_norm.weight", il);
+    if (ds4_qwen35_layer_is_attention(il)) {
+        l->attn_q      = required_tensorf(m, "blk.%u.attn_q.weight", il);
+        l->attn_k      = required_tensorf(m, "blk.%u.attn_k.weight", il);
+        l->attn_v      = required_tensorf(m, "blk.%u.attn_v.weight", il);
+        l->attn_output = required_tensorf(m, "blk.%u.attn_output.weight", il);
+        l->attn_q_norm = required_tensorf(m, "blk.%u.attn_q_norm.weight", il);
+        l->attn_k_norm = required_tensorf(m, "blk.%u.attn_k_norm.weight", il);
+    } else {
+        l->lin_qkv     = required_tensorf(m, "blk.%u.attn_qkv.weight", il);
+        l->lin_gate    = required_tensorf(m, "blk.%u.attn_gate.weight", il);
+        l->lin_conv    = required_tensorf(m, "blk.%u.ssm_conv1d.weight", il);
+        l->lin_dt_bias = required_tensorf(m, "blk.%u.ssm_dt.bias", il);
+        l->lin_a       = required_tensorf(m, "blk.%u.ssm_a", il);
+        l->lin_beta    = required_tensorf(m, "blk.%u.ssm_beta.weight", il);
+        l->lin_alpha   = required_tensorf(m, "blk.%u.ssm_alpha.weight", il);
+        l->lin_norm    = required_tensorf(m, "blk.%u.ssm_norm.weight", il);
+        l->lin_out     = required_tensorf(m, "blk.%u.ssm_out.weight", il);
+    }
+    l->ffn_gate_inp       = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
+    l->ffn_gate_exps      = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
+    l->ffn_up_exps        = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+    l->ffn_down_exps      = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+    l->ffn_gate_inp_shexp = required_tensorf(m, "blk.%u.ffn_gate_inp_shexp.weight", il);
+    l->ffn_gate_shexp     = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
+    l->ffn_up_shexp       = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
+    l->ffn_down_shexp     = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
+    if (ds4_qwen35_layer_is_nextn(il)) {
+        l->nextn_eh_proj          = required_tensorf(m, "blk.%u.nextn.eh_proj.weight", il);
+        l->nextn_enorm            = required_tensorf(m, "blk.%u.nextn.enorm.weight", il);
+        l->nextn_hnorm            = required_tensorf(m, "blk.%u.nextn.hnorm.weight", il);
+        l->nextn_shared_head_norm = required_tensorf(m, "blk.%u.nextn.shared_head_norm.weight", il);
+    }
+}
+
 static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
     if (ds4_model_is_qwen4()) {
         weights_bind_qwen4_layer(l, m, il);
+        return;
+    }
+    if (ds4_model_is_qwen35moe()) {
+        weights_bind_qwen35moe_layer(l, m, il);
         return;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
@@ -7933,7 +8213,7 @@ static void weights_bind(
     memset(w, 0, sizeof(*w));
 
     uint32_t executable_layers = DS4_N_LAYER;
-    if ((DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA || ds4_model_is_qwen4()) &&
+    if ((DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA || ds4_model_is_qwen4() || ds4_model_is_qwen35moe()) &&
         DS4_N_LAYER > DS4_N_NEXTN_PREDICT) {
         executable_layers = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     }
@@ -7968,7 +8248,7 @@ static void weights_bind(
     /* GLM nextn/MTP block(s): excluded from the executable pass but bound
      * so the drafter can run them. Only when the full model is loaded. */
     if (!load_slice &&
-        (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA || ds4_model_is_qwen4()) &&
+        (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA || ds4_model_is_qwen4() || ds4_model_is_qwen35moe()) &&
         start == 0 && end == executable_layers - 1u) {
         for (uint32_t il = executable_layers; il < DS4_N_LAYER; il++) {
             weights_bind_layer(&w->layer[il], m, il);
@@ -39849,6 +40129,15 @@ static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
     return chunk > ctx ? ctx : chunk;
 }
 
+/* Ornith prefill chunk: DS4_QWEN35_PREFILL_CHUNK tokens (default 2048), at
+ * most the context.  One rule for the memory estimate and the graph. */
+static DS4_MAYBE_UNUSED uint32_t qwen35_prefill_chunk_tokens(uint32_t ctx) {
+    const char *env = getenv("DS4_QWEN35_PREFILL_CHUNK");
+    const unsigned long v = env && env[0] ? strtoul(env, NULL, 10) : 2048ul;
+    const uint32_t chunk = v == 0 || v > 65536ul ? 2048u : (uint32_t)v;
+    return chunk > ctx ? ctx : chunk;
+}
+
 ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         ds4_backend backend,
         int         ctx_size,
@@ -39883,6 +40172,26 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
         return m;
     }
+
+    if (ds4_backend_uses_graph(backend) && ds4_model_is_qwen35moe()) {
+        /* F16 K/V per full-attention trunk layer, rope positions, fixed GDN
+         * state and conv history; transients scale with the prefill chunk. */
+        const uint64_t T = prefill_chunk ? prefill_chunk : qwen35_prefill_chunk_tokens(ctx);
+        const uint64_t E = DS4_N_EMBD, kv_row = 2ull * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
+        uint32_t n_attn = 0;
+        for (uint32_t il = 0; il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER; il++) n_attn += ds4_qwen35_layer_is_attention(il);
+        const uint32_t n_lin = DS4_N_LAYER - DS4_N_NEXTN_PREDICT - n_attn;
+        m.prefill_cap = (uint32_t)T;
+        m.raw_cap = ctx;
+        m.raw_bytes = (uint64_t)n_attn * ctx * kv_row + (uint64_t)ctx * 16u;
+        m.scratch_bytes = T * (8u * E + 4u * DS4_N_LIN_CONV_DIM + 6u * (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM +
+                               DS4_N_EXPERT + (uint64_t)(DS4_N_EXPERT_USED + 1u) * (E + DS4_N_FF_EXP)) * 4u +
+                          (uint64_t)n_lin * ((uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM * DS4_N_LIN_HEAD_DIM +
+                                             (uint64_t)(DS4_N_LIN_CONV - 1u) * DS4_N_LIN_CONV_DIM) * sizeof(float);
+        m.total_bytes = m.raw_bytes + m.scratch_bytes;
+        return m;
+    }
+    ds4_qwen35_not_reached("context memory estimate");
 
     if (ds4_backend_uses_graph(backend)) {
 #ifdef DS4_HAS_DEEPSEEK41_GPU
@@ -44370,7 +44679,7 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
         bpe_tokenize_text_glm4(vocab, text, out);
         return;
     }
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_uses_qwen35_text()) {
         bpe_tokenize_text_qwen35(vocab, text, out);
         return;
     }
@@ -44497,7 +44806,7 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     vocab->im_end_id = -1;
     vocab->endoftext_id = -1;
 
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_uses_qwen35_text()) {
         /* ChatML without BOS; <|endoftext|> is the document separator and a
          * second generation stop. */
         vocab->im_start_id = vocab_lookup(vocab, "<|im_start|>");
@@ -59057,6 +59366,9 @@ typedef struct ds4_qwen4_gpu_graph {
     uint32_t stream_layers[DS4_MAX_LAYER];
     uint32_t n_stream_layers;
     bool stream_layers_ready;
+    /* Ornith (qwen35moe) gates the GDN output with silu(z); Qwen3.8 with
+     * sigmoid(z).  qwen4_graph_alloc's memset leaves it false. */
+    bool gdn_silu;
 } ds4_qwen4_gpu_graph;
 
 static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
@@ -60046,6 +60358,12 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
     }
     sub_seal(SUB_GDN_SCAN);
     if (ok) {
+#ifdef DS4_HAS_QWEN4_METAL
+        if (g->gdn_silu)
+            ok = ds4_gpu_qwen35_gdn_out_tensor(g->lin_o, g->z, m->map, m->size, l->lin_norm->abs_offset, T,
+                                               DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS) != 0;
+        else
+#endif
         ok = ds4_gpu_qwen4_gdn_out_tensor(g->lin_o, g->z, m->map, m->size, l->lin_norm->abs_offset, T,
                                           DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS) != 0;
     }
@@ -61400,6 +61718,10 @@ static int generate_qwen4_metal_argmax(
     return 0;
 }
 
+#ifdef DS4_HAS_QWEN4_METAL
+#include "ds4_qwen35moe.inc"
+#endif
+
 #endif
 
 #ifndef DS4_NO_GPU
@@ -61443,6 +61765,13 @@ static int generate_metal_graph_raw_swa(
                                            emit, done, emit_ud, progress, progress_ud);
     }
 #endif
+#ifdef DS4_HAS_QWEN4_METAL
+    if (ds4_model_is_qwen35moe()) {
+        return generate_qwen35_metal_argmax(model, vocab, weights, prompt, n_predict, ctx_size, prefill_chunk,
+                                            emit, done, emit_ud, progress, progress_ud);
+    }
+#endif
+    ds4_qwen35_not_reached("one-shot generation");
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (power_percent > 0 && power_percent < 100) {
             fprintf(stderr, "ds4: --power is not supported by the GLM Metal path yet\n");
@@ -62347,6 +62676,9 @@ struct ds4_session {
     ds4_qwen4_gpu_graph qwen4_graph;
     bool qwen4_graph_ready;
     int qwen4_slot;   /* -1 when the session holds private recurrent state */
+    /* Ornith (qwen35moe) sessions reuse qwen4_graph for their graph but never
+     * set qwen4_graph_ready, so qwen4-only paths that test it stay off. */
+    bool qwen35_graph_ready;
     bool qwen4_rewound;
     float *qwen4_verify_logits;
     uint64_t qwen4_spec_cycles;
@@ -63371,6 +63703,10 @@ static bool ds4_session_is_glm(const ds4_session *s) {
 
 static bool ds4_session_is_qwen4(const ds4_session *s) {
     return s && s->engine && ds4_model_is_qwen4();
+}
+
+static DS4_MAYBE_UNUSED bool ds4_session_is_qwen35(const ds4_session *s) {
+    return s && s->engine && ds4_model_is_qwen35moe();
 }
 
 #ifndef DS4_NO_GPU
@@ -72811,6 +73147,39 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
     }
+    if (ds4_model_is_qwen35moe() && !opt->inspect_only) {
+        const char *bad =
+            e->backend != DS4_BACKEND_METAL ? "a non-Metal backend" :
+            opt->ssd_streaming ? "--ssd-streaming" :
+            (opt->tp.role != DS4_TP_NONE || opt->cuda_tensor_parallel) ? "tensor parallelism" :
+            (gpu_cfg && gpu_cfg->n_gpus > 1) ? "--gpu placement" :
+            opt->distributed.role != DS4_DISTRIBUTED_NONE ? "distributed inference" :
+            opt->placement_session_count_hint > 1 ? "--batched-session" :
+            load_slice ? "a layer slice" :
+            opt->dspark ? "--dspark" :
+            opt->glm_mtp ? "--mtp" :
+            (opt->mtp_path && opt->mtp_path[0]) ? "--mtp-model" :
+            (opt->vision_path && opt->vision_path[0]) ? "--vision" :
+            (opt->ple_path && opt->ple_path[0]) ? "--ple" :
+            ((opt->directional_steering_file && opt->directional_steering_file[0]) ||
+             opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) ?
+                "directional steering" :
+            e->power_percent != 100 ? "--power" :
+            (opt->first_token_test || opt->metal_graph_test) ? "legacy diagnostics" : NULL;
+        if (bad) {
+            fprintf(stderr, "ds4: Ornith-1.5-35B-A3B runs on single-host Metal only; %s is not supported\n", bad);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (opt->context_size > 0 && (uint64_t)opt->context_size > DS4_ROPE_ORIG_CTX) {
+            fprintf(stderr, "ds4: Ornith supports up to %llu tokens of context (no YaRN)\n",
+                    (unsigned long long)DS4_ROPE_ORIG_CTX);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
         const bool supported = (e->backend == DS4_BACKEND_METAL ||
 #if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(__APPLE__)
@@ -73089,6 +73458,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (engine_warm_full_model(opt)) model_warm_weights(&e->model);
     }
 #endif
+    if (ds4_model_is_qwen35moe() && opt->inspect_only) {
+        *out = e;
+        return 0;
+    }
     if (ds4_model_is_qwen4()) {
         if (opt->inspect_only) {
             *out = e;
@@ -74123,6 +74496,10 @@ bool ds4_engine_is_qwen4(ds4_engine *e) {
     return ds4_model_is_qwen4();
 }
 
+bool ds4_engine_is_qwen35moe(ds4_engine *e) {
+    return e && ds4_model_is_qwen35moe();
+}
+
 /* The official template's default effort is xhigh; medium adds no text. */
 const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode) {
     switch (mode) {
@@ -75089,6 +75466,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             fprintf(stderr, "ds4: Qwen3.8 sessions require Metal or CUDA\n");
             return 1;
         }
+        if (ds4_model_is_qwen35moe()) {
+            fprintf(stderr, "ds4: Ornith sessions require Metal\n");
+            return 1;
+        }
         if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
             fprintf(stderr, "ds4: distributed coordinator sessions require the graph backend\n");
             return 1;
@@ -75158,6 +75539,30 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         return 0;
     }
 #endif
+#ifdef DS4_HAS_QWEN4_METAL
+    if (ds4_model_is_qwen35moe()) {
+        if (e->backend != DS4_BACKEND_METAL || e->distributed.role != DS4_DISTRIBUTED_NONE) {
+            fprintf(stderr, "ds4: Ornith sessions require single-host Metal\n");
+            free(s);
+            return 1;
+        }
+        const uint32_t cap_tokens = e->prefill_chunk && e->prefill_chunk < (uint32_t)ctx_size ?
+            e->prefill_chunk : qwen35_prefill_chunk_tokens((uint32_t)ctx_size);
+        s->qwen4_slot = -1;
+        if (!qwen35_graph_alloc(&s->qwen4_graph, (uint32_t)ctx_size, cap_tokens)) {
+            free(s);
+            return 1;
+        }
+        qwen35_graph_reset(&s->qwen4_graph);
+        s->qwen35_graph_ready = true;
+        s->prefill_cap = (uint32_t)ctx_size;
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
+        *out = s;
+        return 0;
+    }
+#endif
+    ds4_qwen35_not_reached("session create");
 #ifdef DS4_HAS_QWEN4_GPU
     if (ds4_model_is_qwen4()) {
         if ((e->backend != DS4_BACKEND_METAL && e->backend != DS4_BACKEND_CUDA) ||
@@ -75597,6 +76002,11 @@ void ds4_session_free(ds4_session *s) {
         if (s->ds41_graph_ready) {
             s->engine->ds41_session_bytes -= s->ds41_graph.allocation_bytes;
             ds41_graph_free(&s->ds41_graph);
+        } else
+#endif
+#ifdef DS4_HAS_QWEN4_METAL
+        if (s->qwen35_graph_ready) {
+            qwen4_graph_free(&s->qwen4_graph);
         } else
 #endif
 #ifdef DS4_HAS_QWEN4_GPU
@@ -77764,6 +78174,54 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                      err,
                                      errlen);
     }
+#ifdef DS4_HAS_QWEN4_METAL
+    if (ds4_session_is_qwen35(s)) {
+        ds4_engine *e = s->engine;
+        ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+        int start = 0;
+        if (s->checkpoint_valid && g->pos == (uint32_t)s->checkpoint.len &&
+            prompt->len >= s->checkpoint.len && ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+            start = s->checkpoint.len;
+        } else {
+            /* A different prompt, a rewind or a failed forward: the recurrent
+             * state cannot be trimmed, so replay from the start. */
+            qwen35_graph_reset(g);
+            s->checkpoint.len = 0;
+            s->checkpoint_valid = false;
+        }
+        if ((uint32_t)prompt->len > g->ctx_cap) {
+            snprintf(err, errlen, "prompt of %d tokens exceeds the %u-token context", prompt->len, g->ctx_cap);
+            return 1;
+        }
+        for (int i = start; i < prompt->len; i++) {
+            if (prompt->v[i] < 0 || prompt->v[i] >= (int)DS4_N_VOCAB) {
+                snprintf(err, errlen, "token id %d at position %d is outside the vocabulary", prompt->v[i], i);
+                return 1;
+            }
+        }
+        for (int i = start; i < prompt->len;) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                s->checkpoint_valid = s->checkpoint.len > 0;
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            uint32_t chunk = (uint32_t)(prompt->len - i);
+            if (chunk > g->cap_tokens) chunk = g->cap_tokens;
+            s->checkpoint_valid = false;
+            if (!qwen35_graph_forward_tokens(g, &e->model, &e->weights, prompt->v + i, chunk, s->logits)) {
+                snprintf(err, errlen, "Ornith prefill failed at token %d", i);
+                return 1;
+            }
+            for (uint32_t j = 0; j < chunk; j++) token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
+            i += (int)chunk;
+            s->checkpoint_valid = true;
+            s->mtp_draft_valid = false;
+            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
+        }
+        s->checkpoint_valid = true;
+        return 0;
+    }
+#endif
 #ifdef DS4_HAS_QWEN4_GPU
     if (ds4_session_is_qwen4(s)) {
         ds4_engine *e = s->engine;
@@ -77844,6 +78302,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         return 0;
     }
 #endif
+    ds4_qwen35_not_reached("session sync");
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
         if (s->checkpoint_valid &&
@@ -79842,6 +80301,28 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         return 0;
     }
 #endif
+#ifdef DS4_HAS_QWEN4_METAL
+    if (ds4_session_is_qwen35(s)) {
+        ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+        if (!s->qwen35_graph_ready || !s->checkpoint_valid || g->pos != (uint32_t)s->checkpoint.len) {
+            if (errlen) snprintf(err, errlen, "Ornith session is not synchronized");
+            return 1;
+        }
+        if (g->pos >= g->ctx_cap) {
+            if (errlen) snprintf(err, errlen, "context is full");
+            return 1;
+        }
+        if (!qwen35_graph_forward_tokens(g, &e->model, &e->weights, &token, 1, s->logits)) {
+            if (errlen) snprintf(err, errlen, "Ornith decode failed at position %u", g->pos);
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        return 0;
+    }
+#endif
 #ifdef DS4_HAS_QWEN4_GPU
     if (ds4_session_is_qwen4(s)) {
         if (!s->qwen4_graph_ready) {
@@ -79868,6 +80349,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         return 0;
     }
 #endif
+    ds4_qwen35_not_reached("session eval");
     if (ds4_session_is_glm(s)) {
         if (!s->glm_graph_ready) {
             if (errlen) snprintf(err, errlen, "%s GLM graph is not initialized",
