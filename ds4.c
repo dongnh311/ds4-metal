@@ -59369,6 +59369,13 @@ typedef struct ds4_qwen4_gpu_graph {
     /* Ornith (qwen35moe) gates the GDN output with silu(z); Qwen3.8 with
      * sigmoid(z).  qwen4_graph_alloc's memset leaves it false. */
     bool gdn_silu;
+    /* Ornith MTP seed: post-output_norm trunk hidden rows.  Row k holds
+     * h_{mtp_h_pos0 - 1 + k}; row 0 is the carry from the previous forward
+     * (zeros at position 0) and rows 1..mtp_h_rows the last forward's rows.
+     * NULL on Qwen3.8 and on Ornith graphs without MTP. */
+    ds4_gpu_tensor *mtp_h;
+    uint32_t mtp_h_pos0;
+    uint32_t mtp_h_rows;
 } ds4_qwen4_gpu_graph;
 
 static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
@@ -59460,7 +59467,7 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         &g->ple_hist, &g->logits,
         &g->mtp_e, &g->mtp_cat, &g->mtp_proj, &g->mtp_R, &g->mtp_argmax, &g->mtp_argmax_tmp,
         &g->snap_ple_hist, &g->snap2_ple_hist, &g->snap0_ple_hist, &g->pos3,
-        &g->draft_head, &g->steer_dirs,
+        &g->draft_head, &g->steer_dirs, &g->mtp_h,
     };
     if (g->owns_scratch) {
         ds4_gpu_tensor **scratch[] = {
@@ -75549,7 +75556,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         const uint32_t cap_tokens = e->prefill_chunk && e->prefill_chunk < (uint32_t)ctx_size ?
             e->prefill_chunk : qwen35_prefill_chunk_tokens((uint32_t)ctx_size);
         s->qwen4_slot = -1;
-        if (!qwen35_graph_alloc(&s->qwen4_graph, (uint32_t)ctx_size, cap_tokens)) {
+        if (!qwen35_graph_alloc(&s->qwen4_graph, (uint32_t)ctx_size, cap_tokens, false)) {
             free(s);
             return 1;
         }
@@ -78208,7 +78215,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             uint32_t chunk = (uint32_t)(prompt->len - i);
             if (chunk > g->cap_tokens) chunk = g->cap_tokens;
             s->checkpoint_valid = false;
-            if (!qwen35_graph_forward_tokens(g, &e->model, &e->weights, prompt->v + i, chunk, s->logits)) {
+            if (!qwen35_graph_forward_tokens(g, &e->model, &e->weights, prompt->v + i, chunk, s->logits, false)) {
                 snprintf(err, errlen, "Ornith prefill failed at token %d", i);
                 return 1;
             }
@@ -80312,7 +80319,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             if (errlen) snprintf(err, errlen, "context is full");
             return 1;
         }
-        if (!qwen35_graph_forward_tokens(g, &e->model, &e->weights, &token, 1, s->logits)) {
+        if (!qwen35_graph_forward_tokens(g, &e->model, &e->weights, &token, 1, s->logits, false)) {
             if (errlen) snprintf(err, errlen, "Ornith decode failed at position %u", g->pos);
             s->checkpoint_valid = false;
             return 1;

@@ -645,6 +645,12 @@ tests/test_qwen35_session.o: tests/test_qwen35_session.c ds4.h
 tests/test_qwen35_session: tests/test_qwen35_session.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
+tests/test_qwen35_graph.o: tests/test_qwen35_graph.c ds4.c ds4.h ds4_gpu.h ds4_qwen35moe.inc
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_qwen35_graph: tests/test_qwen35_graph.o $(filter-out ds4.o,$(CORE_OBJS))
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
+
 endif
 
 tests/test_qwen4_vision.o: tests/test_qwen4_vision.c ds4.h
@@ -792,6 +798,10 @@ endif
 .PHONY: test-qwen35-session
 test-qwen35-session: tests/test_qwen35_session
 	./tests/test_qwen35_session "$(DS4_ORNITH_MODEL)"
+
+.PHONY: test-qwen35-graph
+test-qwen35-graph: tests/test_qwen35_graph
+	./tests/test_qwen35_graph "$(DS4_ORNITH_MODEL)"
 
 ds4.o ds4_cpu.o ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o ds4_metal.o ds4_cuda.o ds4_rocm.o tests/test_qwen4_cuda.o tests/test_qwen4_kernels.o tests/test_qwen4_ngram_state.o: ds4_qwen4_vision.h
 
@@ -1131,7 +1141,7 @@ clean:
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_qwen4_moe_mm_specialize tests/test_qwen4_conv_parallel tests/test_q8_prefill_variants tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 	rm -f tests/test_image_decode
 	rm -f tests/test_qwen4_kernels tests/test_qwen4_cuda tests/test_qwen4_vision tests/test_qwen4_prefill
-	rm -f tests/test_qwen35_kernels tests/test_qwen35_session
+	rm -f tests/test_qwen35_kernels tests/test_qwen35_session tests/test_qwen35_graph
 	rm -f speed-bench/session_concurrency_bench
 
 # ds4.c includes the generated Unicode classes and the Ornith graph.
