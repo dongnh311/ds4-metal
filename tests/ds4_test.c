@@ -512,6 +512,134 @@ cleanup:
     test_restore_env("DS4_QWEN4_SPEC_FORCE_ACCEPT", saved_force);
 }
 
+/* Ornith disk-KV payloads (M3).  A payload staged from the prefill progress
+ * callback at a chunk boundary restores into another session with the logits
+ * and recurrent state of an independent prefill, also after a cancelled
+ * prefill; a Qwen3.8-tagged header and a payload whose MTP presence differs
+ * from the session's are refused before anything is written; a truncated
+ * payload leaves no sampleable checkpoint.  Run it with DS4_TEST_GLM_MTP=1
+ * too: the MTP rows and the hidden-state carry travel with the payload. */
+static void test_qwen35_payloads(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine || !ds4_engine_is_qwen35moe(engine)) {
+        puts("qwen35-payloads: Ornith model required, skipped");
+        return;
+    }
+    char *saved_chunk = test_save_env("DS4_QWEN35_PREFILL_CHUNK");
+    setenv("DS4_QWEN35_PREFILL_CHUNK", "128", 1);
+    ds4_session *live = NULL, *reference = NULL, *restored = NULL;
+    ds4_tokens prompt = {0};
+    ds4_session_snapshot snap = {0};
+    buf text = {0};
+    char err[192] = {0};
+    for (int i = 0; i < 200; i++) buf_puts(&text, "The harbor records the weather and shipping schedules. ");
+    ds4_encode_chat_prompt(engine, NULL, text.ptr, DS4_THINK_NONE, &prompt);
+    buf_free(&text);
+    TEST_ASSERT(prompt.len > 512);
+    TEST_ASSERT(ds4_session_create(&live, engine, 1024) == 0);
+    TEST_ASSERT(ds4_session_create(&reference, engine, 1024) == 0);
+    TEST_ASSERT(ds4_session_create(&restored, engine, 1024) == 0);
+    if (!live || !reference || !restored || prompt.len <= 512) goto cleanup;
+
+    /* 1. chunk-boundary payloads, as the server's continued checkpoints */
+    for (int round = 0; round < 3; round++) {
+        test_qwen_prefill_checkpoint capture = {.session = live, .cancel = round == 2};
+        if (round == 2) ds4_session_invalidate(live);
+        ds4_tokens target = prompt;
+        target.len = round == 1 ? 512 : 256;
+        ds4_session_set_progress(live, test_qwen_capture_prefill, &capture);
+        ds4_session_set_cancel(live, test_qwen_cancel_after_checkpoint, &capture);
+        const int rc = ds4_session_sync(live, &target, err, sizeof(err));
+        ds4_session_set_progress(live, NULL, NULL);
+        ds4_session_set_cancel(live, NULL, NULL);
+        TEST_ASSERT(rc == (capture.cancel ? DS4_SESSION_SYNC_INTERRUPTED : 0));
+        TEST_ASSERT(capture.captured && capture.payload.path);
+        TEST_ASSERT(capture.pos == (round == 1 ? 384 : 128));
+        if (!capture.payload.path) continue;
+        ds4_session_invalidate(reference);
+        ds4_tokens prefix = prompt;
+        prefix.len = capture.pos;
+        TEST_ASSERT(ds4_session_sync(reference, &prefix, err, sizeof(err)) == 0);
+        FILE *fp = fopen(capture.payload.path, "rb");
+        TEST_ASSERT(fp != NULL);
+        if (fp) {
+            /* header word 10 = MTP presence; with MTP, the chunk's MTP rows
+             * were written before the progress report (mtp_rows == pos) */
+            uint32_t h[13], mtp_rows = 0;
+            const bool mtp = ds4_engine_mtp_draft_tokens(engine) > 1;
+            TEST_ASSERT(fread(h, sizeof(uint32_t), 13, fp) == 13);
+            TEST_ASSERT(h[10] == (mtp ? 1u : 0u));
+            TEST_ASSERT(fseeko(fp, (off_t)(13 + capture.pos + ds4_engine_vocab_size(engine)) * 4, SEEK_SET) == 0);
+            TEST_ASSERT(fread(&mtp_rows, sizeof(mtp_rows), 1, fp) == 1);
+            TEST_ASSERT(mtp_rows == (mtp ? (uint32_t)capture.pos : 0u));
+            rewind(fp);
+            const int load = ds4_session_load_payload(restored, fp, capture.payload.bytes, err, sizeof(err));
+            if (load) fprintf(stderr, "ds4-test: Ornith payload load: %s\n", err);
+            TEST_ASSERT(load == 0);
+            fclose(fp);
+            TEST_ASSERT(ds4_session_pos(restored) == capture.pos);
+            test_qwen_prefill_scores_equal(restored, reference);
+            if (capture.cancel) test_qwen_prefill_scores_equal(live, reference);
+            TEST_ASSERT(ds4_session_sync(restored, &target, err, sizeof(err)) == 0);
+            if (capture.cancel) TEST_ASSERT(ds4_session_sync(live, &target, err, sizeof(err)) == 0);
+            test_qwen_prefill_scores_equal(restored, live);
+        }
+        ds4_session_payload_file_free(&capture.payload);
+    }
+
+    /* 2. refusals before any write leave the session as it was */
+    TEST_ASSERT(ds4_session_save_snapshot(reference, &snap, err, sizeof(err)) == 0);
+    if (!snap.ptr) goto cleanup;
+    TEST_ASSERT(snap.len == ds4_session_payload_bytes(reference));
+    const int before = ds4_session_argmax(restored);
+    TEST_ASSERT(before >= 0);
+    for (int variant = 0; variant < 2; variant++) {
+        uint8_t *copy = malloc(snap.len);
+        TEST_ASSERT(copy != NULL);
+        if (!copy) break;
+        memcpy(copy, snap.ptr, snap.len);
+        const size_t off = (variant == 0 ? 12u : 10u) * sizeof(uint32_t);
+        uint32_t word;
+        memcpy(&word, copy + off, sizeof(word));
+        word = variant == 0 ? 0x51573802u : (word ^ 1u);   /* a Qwen3.8 tag; the other MTP presence */
+        memcpy(copy + off, &word, sizeof(word));
+        FILE *fp = tmpfile();
+        TEST_ASSERT(fp != NULL);
+        if (fp) {
+            TEST_ASSERT(fwrite(copy, 1, snap.len, fp) == snap.len);
+            rewind(fp);
+            TEST_ASSERT(ds4_session_load_payload(restored, fp, snap.len, err, sizeof(err)) != 0);
+            fclose(fp);
+            fprintf(stderr, "ds4-test: refused variant %d: %s\n", variant, err);
+            TEST_ASSERT(strstr(err, variant == 0 ? "different model family" : "--mtp") != NULL);
+            TEST_ASSERT(ds4_session_argmax(restored) == before);
+        }
+        free(copy);
+    }
+
+    /* 3. a truncated payload leaves no sampleable checkpoint */
+    {
+        const size_t bytes = 13u * sizeof(uint32_t) + (size_t)ds4_session_pos(reference) * sizeof(uint32_t) + 17u;
+        TEST_ASSERT(bytes < snap.len);
+        FILE *fp = tmpfile();
+        TEST_ASSERT(fp != NULL);
+        if (fp) {
+            TEST_ASSERT(fwrite(snap.ptr, 1, bytes, fp) == bytes);
+            rewind(fp);
+            TEST_ASSERT(ds4_session_load_payload(restored, fp, snap.len, err, sizeof(err)) != 0);
+            fclose(fp);
+            TEST_ASSERT(ds4_session_argmax(restored) == -1);
+        }
+    }
+cleanup:
+    ds4_session_snapshot_free(&snap);
+    ds4_session_free(restored);
+    ds4_session_free(reference);
+    ds4_session_free(live);
+    ds4_tokens_free(&prompt);
+    test_restore_env("DS4_QWEN35_PREFILL_CHUNK", saved_chunk);
+}
+
 static void test_session_snapshot_roundtrip(void) {
     ds4_engine *engine = test_get_engine(false);
     if (!engine) return;
@@ -7563,6 +7691,7 @@ static const ds4_test_entry test_entries[] = {
     {"--qwen4-prefill-checkpoints", "qwen4-prefill-checkpoints", "Qwen chunk checkpoints restore matching logits and state", test_qwen_prefill_checkpoints},
     {"--qwen4-restore-reuse", "qwen4-restore-reuse", "Qwen restore discards old verifier state and rejects truncated payloads", test_qwen_restore_reused_session},
     {"--qwen-kv-grow", "qwen-kv-grow", "Qwen3.8 grow-on-demand KV decodes byte-identically to full capacity", test_qwen_kv_grow},
+    {"--qwen35-payloads", "qwen35-payloads", "Ornith disk-KV payloads restore; foreign, MTP-mismatched and truncated ones are refused", test_qwen35_payloads},
     {"--session-snapshot", "session-snapshot", "session snapshot and recurrent-state round trip", test_session_snapshot_roundtrip},
     {"--session-rewind", "session-rewind", "Qwen3.8 rewind by snapshot restore and by replay", test_session_rewind_replay},
     {"--session-rewind-resample", "session-rewind-resample", "exact-sampling tool-boundary resample rewind restores the block-start state", test_session_rewind_resample_boundary},

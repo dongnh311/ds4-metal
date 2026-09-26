@@ -142,9 +142,11 @@ Decisions that follow from that audit:
   not reused for Ornith.
 - **No silent fallthrough.** Where a qwen4 branch is followed by a DeepSeek/GLM
   default (context estimate, one-shot generate, session create/sync/eval,
-  speculative cycle, rewind), the default path dies with a clear message if it
-  ever sees the Ornith family, so a missed DISPATCH branch cannot silently run
-  DeepSeek code.
+  speculative cycle, disk KV payload size/save/load), the default path dies
+  with a clear message if it ever sees the Ornith family, so a missed DISPATCH
+  branch cannot silently run DeepSeek code. Rewind has no DeepSeek default to
+  fall into: an Ornith rewind restores a verify snapshot or invalidates the
+  checkpoint (section 6).
 
 ## 4. Components
 
@@ -266,11 +268,17 @@ A/B shows a gain.
 - **Live prefix reuse.** The server's session sync applies unchanged.
 - **Disk KV checkpoints.**
   - A new payload tag, `DS4_QWEN35_PAYLOAD_TAG`, covers the 30 GDN recurrent
-    states and conv histories plus the KV rows of the 10 attention layers and
-    the MTP block.
-  - The checkpoint header records `qwen35moe`, so Qwen3.8 and Ornith
-    checkpoints can never load into each other. Existing Qwen3.8 checkpoints
-    are unaffected.
+    states and conv histories, the KV rows of the 10 attention layers, the
+    rope positions and, with `--mtp`, the MTP block's KV rows and the trunk
+    hidden-state carry the next draft pairs with. The payload records whether
+    it carries MTP state; a payload whose MTP presence differs from the
+    session's is refused and the server prefills instead. F16 KV only.
+  - The KV-cache file header records the model id (`qwen35moe` = 7) and the
+    payload its own tag, so Qwen3.8 and Ornith checkpoints can never load
+    into each other. Existing Qwen3.8 checkpoints are unaffected. The routed
+    quant byte stays 2 for both Ornith tiers (Q5_K in layer 0), so a 25G
+    server accepts a 23G checkpoint of the same text, as the Qwen3.8 IQ2
+    tiers do.
 - **KV cache.** F16 by default. KV is 20 KiB per token, about 5.4 GB at 262K,
   on top of 21 GiB of weights. kv-grow is not used in v1. The qwen4 FP8/Q4 KV
   modes remain available as a speed lever (section 8, gate 3).
@@ -394,7 +402,9 @@ PPL of the tier: 2.194208 x 1.0018 = 2.1982 for 23G.
    decoding, including cycles with rejected drafts.
 4. **Sessions.** Save to disk KV, restore and continue: the output equals an
    uninterrupted run. A Qwen3.8 checkpoint is refused by Ornith and the other
-   way round.
+   way round. (M3 tests the Ornith side with a Qwen3.8-tagged payload; the
+   other direction rests on the Qwen3.8 loader's exact tag check and the
+   KV-cache model id, tested without a model.)
 5. **Chat.** ds4 renderings match jinja2 renderings of the embedded template
    for a fixed conversation set: system prompt, tools, multi-turn with tool
    results, thinking on and off (`tests/ornith/chat/`: 26 goldens rendered

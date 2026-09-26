@@ -24091,6 +24091,34 @@ static void test_ornith_tool_turn_visible_text_prefixes_next_render(void) {
     g_server_qwen_flavor = SERVER_QWEN_FLAVOR_QWEN38;
 }
 
+/* A KV-cache file carries the model id: Qwen3.8 (5) and Ornith (7)
+ * checkpoints of the same rendered text never match each other. */
+static void test_kv_cache_lookup_separates_qwen38_and_ornith(void) {
+    char tmpl[] = "/tmp/ds4-kv-qwen-ornith-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    const char *text = "<|im_start|>system\nshared rendered prefix";
+    const char *prompt = "<|im_start|>system\nshared rendered prefix and tail";
+    test_kv_text_stub_file_model(dir, text, 7, KV_REASON_COLD, 512, 0);
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, prompt, 5, 2, 32768) < 0);
+    const int idx = ds4_kvstore_find_text_prefix(&kc, prompt, 7, 2, 32768);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].model_id == 7);
+    kv_cache_close(&kc);
+    char sha[41];
+    sha1_bytes_hex(text, strlen(text), sha);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_deepseek41_server_stream();
     test_deepseek41_server_tools();
@@ -24274,6 +24302,7 @@ static void ds4_server_unit_tests_run(void) {
     test_ornith_live_tail_continues_full_render();
     test_ornith_anthropic_tool_results_match_openai();
     test_ornith_tool_turn_visible_text_prefixes_next_render();
+    test_kv_cache_lookup_separates_qwen38_and_ornith();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN
