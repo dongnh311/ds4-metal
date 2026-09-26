@@ -82479,6 +82479,10 @@ static bool ds4_sessions_eval_batch_metal_supported(
         getenv("DS4_METAL_DECODE_STAGE_PROFILE") != NULL) {
         return false;
     }
+    /* Ornith sessions decode one at a time: batching is refused at open and
+     * no native batch path knows the family, so never reach the DeepSeek
+     * checks below. */
+    if (ds4_model_is_qwen35moe()) return false;
 #if defined(__APPLE__)
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41)
         return ds41_sessions_batch_supported(items, count, e);
@@ -88734,6 +88738,21 @@ void ds4_session_rewind(ds4_session *s, int pos) {
         /* Qwen eval replays the kept transcript if reset left the graph behind. */
         state_ok = true;
         s->qwen4_rewound = logit_row < 0;
+    }
+#endif
+#ifdef DS4_HAS_QWEN4_METAL
+    if (s->checkpoint_valid && ds4_session_is_qwen35(s)) {
+        /* One token back after an accepted verify: the after-row-0 GDN
+         * snapshot is the state at pos and verify row 0 holds its logits.
+         * Recurrent state cannot be trimmed otherwise, so any other rewind
+         * leaves state_ok false and the caller re-syncs the kept prefix. */
+        ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+        if (s->qwen4_verify_logits && g->snap_valid && g->snap_pos == (uint32_t)pos &&
+            qwen35_graph_state_swap(g)) {
+            memcpy(s->logits, s->qwen4_verify_logits, (size_t)DS4_N_VOCAB * sizeof(float));
+            if (g->mtp_pos > (uint32_t)pos) g->mtp_pos = (uint32_t)pos;
+            state_ok = true;
+        }
     }
 #endif
     if (s->checkpoint_valid && ds4_session_is_glm(s)) {

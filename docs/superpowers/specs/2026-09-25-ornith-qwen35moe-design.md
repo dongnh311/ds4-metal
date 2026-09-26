@@ -341,10 +341,12 @@ A/B shows a gain.
   above 1, directional steering, `--ple` and `--vision` (v1) are refused at
   open with a message naming the option. The batched-session refusal sits in
   the open gate because the server does not refuse batching per family today.
-- **Rewind.** A rewind on an Ornith session restores the GDN snapshot when one
-  covers the target position. Otherwise it resets the recurrent state and
-  conv history together with the checkpoint, so a later sync can never reuse
-  a stale prefix.
+- **Rewind.** A rewind on an Ornith session restores the after-row-0 verify
+  snapshot when it covers the target position (one token back after an
+  accepted draft, which a stop token inside a verify block produces), with
+  that row's logits. Otherwise it invalidates the checkpoint; the next sync
+  resets the recurrent state and conv history and replays the kept prefix,
+  so a stale prefix is never reused.
 - **Runtime.** Graph functions return false up the chain like the qwen4 path.
   If a target or MTP forward fails midway, the session is invalidated and the
   next request prefills again, so GDN state is never half updated. Requests

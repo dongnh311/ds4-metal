@@ -640,6 +640,87 @@ cleanup:
     test_restore_env("DS4_QWEN35_PREFILL_CHUNK", saved_chunk);
 }
 
+/* Ornith rewind (M3).  One token back right after an accepted verify
+ * restores the after-row-0 snapshot: the checkpoint stays valid and the
+ * logits and the next eval equal a fresh session's.  Any other rewind
+ * invalidates, and a sync of the kept prefix replays it.  The snapshot half
+ * needs DS4_TEST_GLM_MTP=1; without MTP every rewind invalidates. */
+static void test_qwen35_rewind(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine || !ds4_engine_is_qwen35moe(engine)) {
+        puts("qwen35-rewind: Ornith model required, skipped");
+        return;
+    }
+    const bool mtp = ds4_engine_mtp_draft_tokens(engine) > 1;
+    char *saved_force = test_save_env("DS4_QWEN35_SPEC_FORCE_ACCEPT");
+    if (mtp) setenv("DS4_QWEN35_SPEC_FORCE_ACCEPT", "1", 1);
+    ds4_session *live = NULL, *fresh = NULL;
+    ds4_tokens prompt = {0}, replay = {0};
+    char err[192] = {0};
+    ds4_token_score got[8], want[8];
+    ds4_chat_begin(engine, &prompt);
+    ds4_chat_append_message(engine, &prompt, "user", "Count from one to ten.");
+    ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+    TEST_ASSERT(ds4_session_create(&live, engine, 1024) == 0);
+    TEST_ASSERT(ds4_session_create(&fresh, engine, 1024) == 0);
+    if (!live || !fresh) goto cleanup;
+    TEST_ASSERT(ds4_session_sync(live, &prompt, err, sizeof(err)) == 0);
+    for (int i = 0; i < prompt.len; i++) ds4_tokens_push(&replay, prompt.v[i]);
+    int last_n = 1;
+    for (int step = 0; step < 3; step++) {
+        const int first = ds4_session_argmax(live);
+        if (mtp) {
+            int acc[2] = {0, 0};
+            last_n = ds4_session_eval_speculative_argmax(live, first, 2, -1, acc, 2, err, sizeof(err));
+            TEST_ASSERT(last_n == 1 || last_n == 2);
+            if (last_n < 1) goto cleanup;
+            for (int i = 0; i < last_n; i++) ds4_tokens_push(&replay, acc[i]);
+        } else {
+            TEST_ASSERT(ds4_session_eval(live, first, err, sizeof(err)) == 0);
+            ds4_tokens_push(&replay, first);
+        }
+    }
+    if (mtp) TEST_ASSERT(last_n == 2);
+    TEST_ASSERT(ds4_session_pos(live) == replay.len);
+    const int last = replay.v[replay.len - 1];
+    ds4_tokens prefix = replay;
+
+    /* 1. one token back: the snapshot with MTP, a replay without */
+    ds4_session_rewind(live, replay.len - 1);
+    TEST_ASSERT(ds4_session_pos(live) == replay.len - 1);
+    TEST_ASSERT(ds4_session_checkpoint_valid(live) == mtp);
+    prefix.len = replay.len - 1;
+    if (!mtp) TEST_ASSERT(ds4_session_sync(live, &prefix, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_sync(fresh, &prefix, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_top_logprobs(live, got, 8) == 8);
+    TEST_ASSERT(ds4_session_top_logprobs(fresh, want, 8) == 8);
+    TEST_ASSERT(got[0].id == want[0].id);
+    for (int i = 0; i < 8; i++) TEST_ASSERT(fabsf(got[i].logprob - want[i].logprob) < 2e-3f);
+    TEST_ASSERT(ds4_session_eval(live, last, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_eval(fresh, last, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_top_logprobs(live, got, 8) == 8);
+    TEST_ASSERT(ds4_session_top_logprobs(fresh, want, 8) == 8);
+    TEST_ASSERT(got[0].id == want[0].id);
+    for (int i = 0; i < 8; i++) TEST_ASSERT(fabsf(got[i].logprob - want[i].logprob) < 2e-3f);
+
+    /* 2. two tokens back: invalidated; the kept prefix replays on sync */
+    ds4_session_rewind(live, replay.len - 2);
+    TEST_ASSERT(ds4_session_pos(live) == replay.len - 2);
+    TEST_ASSERT(!ds4_session_checkpoint_valid(live));
+    prefix.len = replay.len - 2;
+    TEST_ASSERT(ds4_session_sync(live, &prefix, err, sizeof(err)) == 0);
+    ds4_session_invalidate(fresh);
+    TEST_ASSERT(ds4_session_sync(fresh, &prefix, err, sizeof(err)) == 0);
+    test_qwen_prefill_scores_equal(live, fresh);
+    fprintf(stderr, "ds4-test: Ornith rewind checked (mtp=%d)\n", mtp);
+cleanup:
+    ds4_tokens_free(&replay);
+    ds4_tokens_free(&prompt);
+    ds4_session_free(fresh);
+    ds4_session_free(live);
+    test_restore_env("DS4_QWEN35_SPEC_FORCE_ACCEPT", saved_force);
+}
+
 static void test_session_snapshot_roundtrip(void) {
     ds4_engine *engine = test_get_engine(false);
     if (!engine) return;
@@ -7692,6 +7773,7 @@ static const ds4_test_entry test_entries[] = {
     {"--qwen4-restore-reuse", "qwen4-restore-reuse", "Qwen restore discards old verifier state and rejects truncated payloads", test_qwen_restore_reused_session},
     {"--qwen-kv-grow", "qwen-kv-grow", "Qwen3.8 grow-on-demand KV decodes byte-identically to full capacity", test_qwen_kv_grow},
     {"--qwen35-payloads", "qwen35-payloads", "Ornith disk-KV payloads restore; foreign, MTP-mismatched and truncated ones are refused", test_qwen35_payloads},
+    {"--qwen35-rewind", "qwen35-rewind", "Ornith rewind by verify snapshot, otherwise invalidate and replay", test_qwen35_rewind},
     {"--session-snapshot", "session-snapshot", "session snapshot and recurrent-state round trip", test_session_snapshot_roundtrip},
     {"--session-rewind", "session-rewind", "Qwen3.8 rewind by snapshot restore and by replay", test_session_rewind_replay},
     {"--session-rewind-resample", "session-rewind-resample", "exact-sampling tool-boundary resample rewind restores the block-start state", test_session_rewind_resample_boundary},
