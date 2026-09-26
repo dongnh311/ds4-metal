@@ -35,7 +35,7 @@ def run_ds4(model, prompt, n, out):
         f.write(r.prompt_text(prompt, ROOT))
     cmd = [os.path.join(ROOT, "ds4"), "-m", model, "--metal", "--raw", "--prompt-file", txt,
            "-c", "16384", "--temp", "0", "-n", str(n), "--mtp", "--mtp-timing"]
-    res = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=1800)
+    res = r.run_ds4(cmd, cwd=ROOT, timeout=1800, text=True)
     with open(os.path.join(out, prompt["name"] + ".ds4.stderr"), "w") as f:
         f.write(res.stderr)
     m = DS4_RE.search(res.stderr)

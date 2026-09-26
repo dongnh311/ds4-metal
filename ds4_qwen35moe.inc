@@ -22,8 +22,9 @@
  * Catch-up rows need only their K/V; the draft row continues through
  * attention, the MoE, shared_head_norm and the output head.  A speculative
  * verify snapshots the GDN state after its first row and runs its
- * attention one row per dispatch, so each row equals plain decoding bit for
- * bit.  The session cycle is ds4_session_qwen35_spec_cycle in ds4.c. */
+ * attention, dense projections and GDN layers one row per dispatch, so each
+ * row equals plain decoding bit for bit.  The session cycle is
+ * ds4_session_qwen35_spec_cycle in ds4.c. */
 
 static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_t cap_tokens, bool mtp) {
     memset(g, 0, sizeof(*g));
@@ -328,6 +329,15 @@ static bool qwen35_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const d
 static bool qwen35_graph_linear_rows(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                      uint32_t il, uint32_t T) {
     if (!g->verify_rows_exact || T <= 1u) return qwen4_graph_linear(g, m, l, il, T);
+    if (g->snap_after_second) {
+        /* Each per-row call below is T=1, so it can only take the
+         * after-first-row snapshot; a 3-row verify (a deeper draft) needs
+         * the after-second-row snapshot too, which this loop cannot place
+         * on the right row.  Fail loudly instead of silently snapshotting
+         * the wrong GDN state. */
+        fprintf(stderr, "ds4: Ornith per-row verify supports only the after-first-row snapshot\n");
+        return false;
+    }
     ds4_gpu_tensor *const mixed0 = g->mixed, *const blk0 = g->blk;
     const bool snap0 = g->snap_after_first;
     const uint64_t row = (uint64_t)DS4_N_EMBD * sizeof(float);
@@ -424,9 +434,34 @@ static bool qwen35_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model 
             g->mtp_h_rows = T;
         }
     }
-    if (snap) g->snap_valid = ok;
+    if (snap) {
+        g->snap_valid = ok;
+    } else if (ok) {
+        /* This forward moved state past any earlier snapshot without taking
+         * a new one: the M3 cycle only rewinds right after its own verify,
+         * so an older snapshot here is stale and a later rewind must not
+         * swap to it (its mtp_h seed row is no longer resident). */
+        g->snap_valid = false;
+    }
     g->snap_after_first = false;
     return ok;
+}
+
+/* True when qwen35_graph_mtp's context/residency/argument preconditions
+ * hold, so a call would attempt GPU work; no GPU call is made here.  Split
+ * out so a caller can tell "not possible" (this returns false, e.g. at the
+ * context end) from "the GPU call itself failed" (this returns true but
+ * qwen35_graph_mtp still returns false). */
+static bool qwen35_mtp_precheck(const ds4_qwen4_gpu_graph *g, const int *tokens, uint32_t T, uint32_t pos0,
+                                bool want_draft, const int *draft_out) {
+    if (!g->mtp_h || T == 0 || pos0 + T > g->ctx_cap || (want_draft && !draft_out) ||
+        pos0 < g->mtp_h_pos0 || pos0 - g->mtp_h_pos0 + T - 1u > g->mtp_h_rows) {
+        return false;
+    }
+    for (uint32_t t = 0; t < T; t++) {
+        if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) return false;
+    }
+    return true;
 }
 
 /* The MTP block (blk.40) over tokens at positions pos0..pos0+T-1.  Row t
@@ -442,13 +477,7 @@ static DS4_MAYBE_UNUSED bool qwen35_graph_mtp(ds4_qwen4_gpu_graph *g, const ds4_
     const ds4_layer_weights *l = &w->layer[il];
     const uint64_t row = (uint64_t)E * sizeof(float);
     const uint64_t qrow = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
-    if (!g->mtp_h || T == 0 || pos0 + T > g->ctx_cap || (want_draft && !draft_out) ||
-        pos0 < g->mtp_h_pos0 || pos0 - g->mtp_h_pos0 + T - 1u > g->mtp_h_rows) {
-        return false;
-    }
-    for (uint32_t t = 0; t < T; t++) {
-        if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) return false;
-    }
+    if (!qwen35_mtp_precheck(g, tokens, T, pos0, want_draft, draft_out)) return false;
     bool ok = true;
     uint32_t sub0 = pos0, last = 0;
     for (uint32_t done = 0; done < T && ok;) {

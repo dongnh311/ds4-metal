@@ -197,8 +197,14 @@ static void check_catch_up(ds4_engine *e, const int *tok) {
     const uint32_t rowdim = DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     const double cos_b = min_row_cosine(ka, kb, N, rowdim);
     const double cos_c = min_row_cosine(ka, kc, N, rowdim);
-    printf("  catch-up K rows: min row cosine chunk 64 %.6f, per token %.6f\n", cos_b, cos_c);
+    /* Negative control: row p of chunk-512 against row p+1 of chunk-64. A
+     * genuine boundary/alignment bug would look like this shift, so this
+     * must collapse well below the ordinary-drift floor above. */
+    const double cos_shift = min_row_cosine(ka, kb + rowdim, N - 1u, rowdim);
+    printf("  catch-up K rows: min row cosine chunk 64 %.6f, per token %.6f, shifted %.6f\n",
+           cos_b, cos_c, cos_shift);
     CHECK(cos_b >= 0.95 && cos_c >= 0.95);
+    CHECK(cos_shift < 0.95);
     const int da = tg_draft(&a, e, tok[N], N), db = tg_draft(&b, e, tok[N], N), dc = tg_draft(&c, e, tok[N], N);
     printf("  drafts after %u tokens: %d %d %d (chunks 512, 64, 1)\n", N, da, db, dc);
     /* a 1-token graph runs the 2-row draft pass as two sub-batches */

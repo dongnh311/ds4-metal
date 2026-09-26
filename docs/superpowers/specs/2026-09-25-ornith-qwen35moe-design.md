@@ -253,10 +253,11 @@ A/B shows a gain.
   `ds4_session_qwen35_spec_cycle` in `ds4.c`, shaped like the qwen4 cycle
   (whose snapshot helpers need hyper-connections and PLE); the GDN kernels'
   after-first-row snapshot is reused. The verify runs its attention, dense
-  projections and GDN layers one row per dispatch (T=1 and T=2 pick different
-  matvec kernels, and the GDN mixer fuses its input projections only for
-  T=1), so each row equals plain decoding bit for bit; the experts stay
-  batched. Drafts are accepted when they are the target argmax (greedy and
+  projections and GDN layers one row per dispatch, because the shared
+  `qwen4_gemv` picks a different matvec kernel for T=1 than for T=2
+  (including the GDN mixer's `lin_qkv`/`lin_gate`/`lin_out` projections), so
+  each row equals plain decoding bit for bit; the experts stay batched.
+  Drafts are accepted when they are the target argmax (greedy and
   opportunistic sampling); `--mtp-exact-sampling` is refused. Draft depth
   starts at 1 and follows measured acceptance. At temperature 0 the output
   equals plain decoding.

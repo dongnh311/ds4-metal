@@ -1984,7 +1984,7 @@ Run:
 export DS4_ORNITH_MODEL=$HOME/orca/workspaces/ds4-metal-data/gguf/ornith/Ornith-1.5-35B-A3B-Abliterated-CyberTiel_Calibrated-MTPv2-23G-ICE.gguf
 S=$(mktemp -d); caffeinate -i -s python3 tests/ornith/test_mtp_cli.py "$S/cli" | tee speed-bench/ornith/m2/cli-mtp.txt
 ```
-Expected: 22 `ok` lines, `mtp cli: N accepted, M rejected drafts` with N, M > 0, and `test_mtp_cli: PASS`. A difference means a verify row is not exact: rerun `make test-qwen35-graph` and debug with superpowers:systematic-debugging before continuing.
+Expected: 22 `ok` lines from the byte-identity matrix, plus one more `ok`/`FAIL` line from the temperature > 0 smoke check of `ds4_session_eval_speculative`'s sampled branch (final review M10; smoke only, not compared to plain since acceptance there is opportunistic), then `mtp cli: N accepted, M rejected drafts` with N, M > 0, and `test_mtp_cli: PASS`. A difference means a verify row is not exact: rerun `make test-qwen35-graph` and debug with superpowers:systematic-debugging before continuing.
 
 - [ ] **Step 3: Write the acceptance script**
 

@@ -8,7 +8,8 @@ Branch `feature/ornith-m2`. Model: 23G ICE GGUF. Oracle: llama.cpp 0.5.0 (build 
 - `make test-qwen35-mtp`: 150 greedy cycles (101 accepted) commit the plain argmax sequence with bit-identical logits; forced accepts, a divergent prompt and the context end behave.
 - `tests/ornith/test_mtp_cli.py` (`cli-mtp.txt`): plain one-shot, session and `--mtp` print identical text for 5 prompts x prefill chunks 1, 2, 64 and default, and for `long_copy` (9,371 tokens) at default and 64; 362 drafts accepted, 59 rejected.
 - gate 1 default compare after the graph change: identical to `speed-bench/ornith/m1/compare-default.txt`.
-- Each verify runs its attention, dense projections and GDN layers one row per dispatch (T=1 and T=2 pick different matvec kernels, and the GDN mixer fuses its input projections only for T=1); the experts stay batched.
+- Each verify runs its attention, dense projections and GDN layers one row per dispatch, because the shared `qwen4_gemv` picks a different matvec kernel for T=1 than for T=2 (including the GDN mixer's `lin_qkv`/`lin_gate`/`lin_out` projections); the experts stay batched.
+- Byte identity above was verified on the M5 Pro with decode fusions off (the default there). Where decode fusions are on (`DS4_QWEN4_DECODE_FUSIONS=1`, the M3 Ultra default) the non-MTP graph takes the fused Q8 pair for the GDN projections and the MTP graph does not, so plain-vs-`--mtp` byte identity is unverified on such hosts.
 
 ## Acceptance vs llama.cpp (`accept.md`, n = 128 per prompt)
 

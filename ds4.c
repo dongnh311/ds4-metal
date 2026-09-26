@@ -77243,21 +77243,34 @@ static bool qwen35_spec_force_accept(void) {
 }
 
 /* Run the MTP block over tokens at pos0.. and keep the draft that follows
- * the last of them; without a draft the next cycle takes the plain path. */
-static void qwen35_session_draft(ds4_session *s, const int *tokens, uint32_t T, uint32_t pos0) {
+ * the last of them; without a draft the next cycle takes the plain path.
+ * Returns false only when the precheck passed but the GPU call itself
+ * failed (spec section 6: an MTP forward that fails midway invalidates the
+ * session), setting err/checkpoint_valid the way a failed verify does.
+ * When the draft is simply not possible (context end, residency), this
+ * returns true with no draft, unchanged from before. */
+static bool qwen35_session_draft(ds4_session *s, const int *tokens, uint32_t T, uint32_t pos0,
+                                 char *err, size_t errlen) {
     int d = -1;
     s->glm_mtp_have = 0;
-    if (qwen35_graph_mtp(&s->qwen4_graph, &s->engine->model, &s->engine->weights, tokens, T, pos0, true, &d)) {
+    ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+    if (!qwen35_mtp_precheck(g, tokens, T, pos0, true, &d)) return true;
+    if (qwen35_graph_mtp(g, &s->engine->model, &s->engine->weights, tokens, T, pos0, true, &d)) {
         s->glm_mtp_draft = d;
         s->glm_mtp_parent = tokens[T - 1u];
         s->glm_mtp_have = 1;
+        return true;
     }
+    s->checkpoint_valid = false;
+    if (errlen) snprintf(err, errlen, "Ornith mtp: draft failed");
+    return false;
 }
 
 /* One Ornith MTP cycle at depth 1, shaped like ds4_session_qwen4_spec_cycle:
  * evaluate first_token, or verify [first_token, draft] in one 2-row pass
- * whose attention runs per row, so every row equals plain decoding bit for
- * bit.  A draft is accepted when it is the target argmax (greedy and
+ * whose attention, dense projections and GDN layers run one row per
+ * dispatch, so every row equals plain decoding bit for bit.  A draft is
+ * accepted when it is the target argmax (greedy and
  * opportunistic sampling: the caller samples first_token and the token
  * after the block from s->logits, so the sampling parameters are unused);
  * a rejected one restores the GDN snapshot the verify took after its first
@@ -77283,7 +77296,7 @@ static int ds4_session_qwen35_spec_cycle(ds4_session *s, int first_token, float 
         if (rc != 0) return -1;
         /* rewrite MTP row pos for first_token, then draft after the parent */
         const int toks[2] = { first_token, sample_argmax(s->logits, V) };
-        qwen35_session_draft(s, toks, 2u, pos);
+        if (!qwen35_session_draft(s, toks, 2u, pos, err, errlen)) return -1;
         if (qwen35_spec_trace()) fprintf(stderr, "ds4: Ornith spec pos %u token %d plain\n", pos, first_token);
         accepted[0] = first_token;
         return 1;
@@ -77317,7 +77330,7 @@ static int ds4_session_qwen35_spec_cycle(ds4_session *s, int first_token, float 
         memcpy(s->logits, rows + V, (size_t)V * sizeof(float));
         /* rows pos+1 (d with h_pos) and pos+2 (the parent with h_{pos+1}) */
         const int next[2] = { d, sample_argmax(s->logits, V) };
-        qwen35_session_draft(s, next, 2u, pos + 1u);
+        if (!qwen35_session_draft(s, next, 2u, pos + 1u, err, errlen)) return -1;
         s->qwen4_spec_accepted++;
         accepted[0] = first_token;
         accepted[1] = d;
@@ -77330,7 +77343,7 @@ static int ds4_session_qwen35_spec_cycle(ds4_session *s, int first_token, float 
     }
     memcpy(s->logits, rows, (size_t)V * sizeof(float));
     const int parent = sample_argmax(s->logits, V);
-    qwen35_session_draft(s, &parent, 1u, pos + 1u);
+    if (!qwen35_session_draft(s, &parent, 1u, pos + 1u, err, errlen)) return -1;
     accepted[0] = first_token;
     return 1;
 }
