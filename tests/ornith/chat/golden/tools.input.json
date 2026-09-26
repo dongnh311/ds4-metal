@@ -1,0 +1,127 @@
+{
+ "api": "chat",
+ "body": {
+  "model": "ornith-1.5-35b-a3b",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a helpful assistant."
+   },
+   {
+    "role": "user",
+    "content": "What is the capital of France?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from disk.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "max_lines": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "template": {
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a helpful assistant."
+   },
+   {
+    "role": "user",
+    "content": "What is the capital of France?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from disk.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "max_lines": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   }
+  ],
+  "kwargs": {}
+ }
+}

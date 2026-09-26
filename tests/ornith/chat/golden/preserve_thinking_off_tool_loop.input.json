@@ -1,0 +1,114 @@
+{
+ "api": "chat",
+ "body": {
+  "model": "ornith-1.5-35b-a3b",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Run the build."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "reasoning_content": "Run make.",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "run",
+       "arguments": "{\"command\": \"make\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "ok"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "run",
+     "description": "Run a shell command.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   }
+  ],
+  "chat_template_kwargs": {
+   "preserve_thinking": false
+  }
+ },
+ "template": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Run the build."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "reasoning_content": "Run make.",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "run",
+       "arguments": {
+        "command": "make"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "ok"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "run",
+     "description": "Run a shell command.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   }
+  ],
+  "kwargs": {
+   "preserve_thinking": false
+  }
+ }
+}

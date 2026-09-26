@@ -1,0 +1,4 @@
+template_version: qwen3.8-froggeric-v22.4.1
+sha256: ae8fc6f688656083095fa39855f90a761a10ade61d7b21d6b761f5651f100473
+source: Ornith-1.5-35B-A3B-Abliterated-CyberTiel_Calibrated-MTPv2-23G-ICE.gguf
+jinja2: 3.1.6
