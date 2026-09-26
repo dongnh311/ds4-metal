@@ -310,6 +310,17 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_is_glm53(ds4_engine *e);
 bool ds4_engine_is_qwen4(ds4_engine *e);
 bool ds4_engine_is_qwen35moe(ds4_engine *e);
+/* Qwen3.5 tokenizer, ChatML turns and XML tool calls: Qwen3.8 and Ornith. */
+bool ds4_engine_uses_qwen35_text(ds4_engine *e);
+/* Reasoning-effort system line the engine-side renderers (CLI, agent) put in
+ * the system turn, or NULL.  Qwen3.8: ds4_qwen4_reasoning_effort_text().
+ * Ornith: the template defaults to medium (no line), and the frontends'
+ * default DS4_THINK_HIGH stands for "no effort given"; DS4_THINK_MAX gives
+ * the xhigh line and DS4_THINK_LOW the low line. */
+const char *ds4_engine_reasoning_effort_text(ds4_engine *e, ds4_think_mode mode);
+/* Ornith's "terse" system block (template kwarg terse, default true); the
+ * lead line depends on whether thinking is on. */
+const char *ds4_qwen35_terse_text(bool think);
 /* Qwen3.8 reasoning-effort system instruction for a think mode (NULL when none) */
 const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode);
 const char *ds4_backend_name(ds4_backend backend);

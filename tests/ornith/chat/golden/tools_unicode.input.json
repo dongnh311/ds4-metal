@@ -1,0 +1,71 @@
+{
+ "api": "chat",
+ "body": {
+  "model": "ornith-1.5-35b-a3b",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a helpful assistant."
+   },
+   {
+    "role": "user",
+    "content": "What is the capital of France?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "translate",
+     "description": "Dịch \"văn bản\" sang tiếng Việt — nhanh.\tTab.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "text"
+      ]
+     },
+     "strict": true
+    }
+   }
+  ]
+ },
+ "template": {
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a helpful assistant."
+   },
+   {
+    "role": "user",
+    "content": "What is the capital of France?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "translate",
+     "description": "Dịch \"văn bản\" sang tiếng Việt — nhanh.\tTab.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "text"
+      ]
+     },
+     "strict": true
+    }
+   }
+  ],
+  "kwargs": {}
+ }
+}

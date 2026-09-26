@@ -559,6 +559,29 @@ static DS4_MAYBE_UNUSED bool qwen35_graph_state_swap(ds4_qwen4_gpu_graph *g) {
     return true;
 }
 
+/* h_{g->pos - 1}: the post-output_norm trunk row the next MTP row pairs
+ * with, held in mtp_h row (g->pos - g->mtp_h_pos0).  The disk payload saves
+ * it so a restored session drafts exactly like the uninterrupted one. */
+static bool qwen35_graph_h_last(ds4_qwen4_gpu_graph *g, float *out) {
+    if (!g->mtp_h || g->pos < g->mtp_h_pos0) return false;
+    const uint32_t row = g->pos - g->mtp_h_pos0;
+    if (row > g->mtp_h_rows) return false;
+    if (ds4_gpu_synchronize() == 0) return false;
+    return ds4_gpu_tensor_read(g->mtp_h, (uint64_t)row * DS4_N_EMBD * sizeof(float), out,
+                               (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+}
+
+/* Install a restored carry: row 0 := h with mtp_h_pos0 = g->pos (the caller
+ * sets g->pos first) and no forward rows yet, so the next forward pairs its
+ * first MTP row with h. */
+static bool qwen35_graph_set_h_last(ds4_qwen4_gpu_graph *g, const float *h) {
+    if (!g->mtp_h) return false;
+    if (ds4_gpu_tensor_write(g->mtp_h, 0, h, (uint64_t)DS4_N_EMBD * sizeof(float)) == 0) return false;
+    g->mtp_h_pos0 = g->pos;
+    g->mtp_h_rows = 0;
+    return true;
+}
+
 static int generate_qwen35_metal_argmax(
         const ds4_model *model, const ds4_vocab *vocab, const ds4_weights *weights,
         const token_vec *prompt, int n_predict, int ctx_size, uint32_t prefill_chunk,

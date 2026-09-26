@@ -1,0 +1,122 @@
+{
+ "api": "anthropic",
+ "body": {
+  "model": "ornith-1.5-35b-a3b",
+  "max_tokens": 256,
+  "system": "You are a helpful assistant.",
+  "tools": [
+   {
+    "name": "get_weather",
+    "description": "Get the current weather for a city.",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "thinking",
+      "thinking": "The user wants weather. Call the tool.",
+      "signature": "sig"
+     },
+     {
+      "type": "tool_use",
+      "id": "toolu_1",
+      "name": "get_weather",
+      "input": {
+       "city": "Paris"
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "tool_result",
+      "tool_use_id": "toolu_1",
+      "content": "Error: city not found\n"
+     },
+     {
+      "type": "text",
+      "text": "Try Lyon instead."
+     }
+    ]
+   }
+  ]
+ },
+ "template": {
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a helpful assistant."
+   },
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "reasoning_content": "The user wants weather. Call the tool.",
+    "tool_calls": [
+     {
+      "id": "toolu_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Paris"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "toolu_1",
+    "content": "Error: city not found\n"
+   },
+   {
+    "role": "user",
+    "content": "Try Lyon instead."
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the current weather for a city.",
+     "input_schema": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "kwargs": {}
+ }
+}

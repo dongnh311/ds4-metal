@@ -10,7 +10,9 @@
  *       logit difference (chunking changes rounding) is printed only;
  *  2. a divergent prompt resets the state: logits bit-identical to a fresh session;
  *  3. a full context stops eval with the error "context is full";
- *  4. a session above the native 262144-token context is refused (no YaRN). */
+ *  4. a session above the native 262144-token context is refused (no YaRN);
+ *  5. a decode batch of two Ornith sessions takes the serialized path and
+ *     equals two single evals bit for bit. */
 #define _POSIX_C_SOURCE 200809L
 #include "../ds4.h"
 #include <assert.h>
@@ -130,6 +132,31 @@ int main(int argc, char **argv) {
     ds4_session *big = NULL;
     assert(ds4_session_create(&big, engine, 262145) != 0 && big == NULL);
     printf("  context 262145: session refused\n");
+
+    /* 5. a decode batch of Ornith sessions is serialized: no native batch
+     * path knows the family, and the result equals two single evals */
+    {
+        ds4_session *x = NULL, *y = NULL, *xr = NULL, *yr = NULL;
+        assert(ds4_session_create(&x, engine, ctx) == 0 && ds4_session_create(&y, engine, ctx) == 0);
+        assert(ds4_session_create(&xr, engine, ctx) == 0 && ds4_session_create(&yr, engine, ctx) == 0);
+        sync_len(x, &tokens, 200);
+        sync_len(xr, &tokens, 200);
+        sync_len(y, &other, other.len);
+        sync_len(yr, &other, other.len);
+        ds4_decode_item items[2] = {{x, ds4_session_argmax(x)}, {y, ds4_session_argmax(y)}};
+        assert(ds4_sessions_eval_batch(items, 2, err, sizeof(err)) == 0);
+        assert(ds4_session_eval(xr, items[0].token, err, sizeof(err)) == 0);
+        assert(ds4_session_eval(yr, items[1].token, err, sizeof(err)) == 0);
+        assert(ds4_session_copy_logits(x, a, vocab) == vocab && ds4_session_copy_logits(xr, b, vocab) == vocab);
+        assert(memcmp(a, b, (size_t)vocab * 4) == 0);
+        assert(ds4_session_copy_logits(y, a, vocab) == vocab && ds4_session_copy_logits(yr, b, vocab) == vocab);
+        assert(memcmp(a, b, (size_t)vocab * 4) == 0);
+        printf("  decode batch of two: serialized, equal to single evals\n");
+        ds4_session_free(yr);
+        ds4_session_free(xr);
+        ds4_session_free(y);
+        ds4_session_free(x);
+    }
 
     ds4_session_free(fresh);
     ds4_session_free(control);

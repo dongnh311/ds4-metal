@@ -805,6 +805,10 @@ endif
 test-qwen35-session: tests/test_qwen35_session
 	./tests/test_qwen35_session "$(DS4_ORNITH_MODEL)"
 
+.PHONY: test-ornith-render
+test-ornith-render: ds4_test
+	python3 tests/ornith/chat/check_render.py
+
 .PHONY: test-qwen35-graph
 test-qwen35-graph: tests/test_qwen35_graph
 	./tests/test_qwen35_graph "$(DS4_ORNITH_MODEL)"

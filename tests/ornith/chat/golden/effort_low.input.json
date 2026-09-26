@@ -1,0 +1,33 @@
+{
+ "api": "chat",
+ "body": {
+  "model": "ornith-1.5-35b-a3b",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a helpful assistant."
+   },
+   {
+    "role": "user",
+    "content": "What is the capital of France?"
+   }
+  ],
+  "reasoning_effort": "low"
+ },
+ "template": {
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a helpful assistant."
+   },
+   {
+    "role": "user",
+    "content": "What is the capital of France?"
+   }
+  ],
+  "tools": null,
+  "kwargs": {
+   "reasoning_effort": "low"
+  }
+ }
+}

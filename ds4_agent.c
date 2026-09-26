@@ -410,7 +410,7 @@ static int agent_read_default_lines(agent_worker *w);
 static int agent_compact_reserve_tokens(agent_worker *w);
 
 static agent_tool_syntax agent_tool_syntax_for_engine(ds4_engine *engine) {
-    if (ds4_engine_is_qwen4(engine)) return AGENT_TOOL_SYNTAX_QWEN;
+    if (ds4_engine_uses_qwen35_text(engine)) return AGENT_TOOL_SYNTAX_QWEN;
     return ds4_engine_is_glm_dsa(engine) ? AGENT_TOOL_SYNTAX_GLM
          : ds4_engine_is_deepseek41(engine) ? AGENT_TOOL_SYNTAX_DSML41
                                            : AGENT_TOOL_SYNTAX_DSML;
@@ -5134,8 +5134,10 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
 static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
     ds4_chat_begin(w->engine, out);
     ds4_think_mode think_mode = effective_think_mode(w->cfg);
-    if (ds4_engine_is_qwen4(w->engine)) {
-        const char *effort = ds4_qwen4_reasoning_effort_text(think_mode);
+    if (ds4_engine_uses_qwen35_text(w->engine)) {
+        /* Qwen3.8: its xhigh/low lines; Ornith: its template default medium
+         * for the agent's default think mode (ds4_engine_reasoning_effort_text) */
+        const char *effort = ds4_engine_reasoning_effort_text(w->engine, think_mode);
         if (effort) ds4_chat_append_message(w->engine, out, "system", effort);
     } else {
         ds4_chat_append_think_prefix(w->engine, out, think_mode);
@@ -13575,13 +13577,6 @@ int main(int argc, char **argv) {
                     &engine, &cfg.engine, &gpu_cfg) != 0) return 1;
         }
     } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
-        return 1;
-    }
-    /* The agent's tool syntax and session files are not wired for Ornith
-     * yet. */
-    if (ds4_engine_is_qwen35moe(engine)) {
-        fprintf(stderr, "ds4-agent: Ornith-1.5-35B-A3B agent mode arrives in milestone M3; use ./ds4 for now\n");
-        ds4_engine_close(engine);
         return 1;
     }
     if (ds4_think_mode_level(cfg.gen.think_mode) >= 0 && !ds4_engine_is_deepseek41(engine)) {

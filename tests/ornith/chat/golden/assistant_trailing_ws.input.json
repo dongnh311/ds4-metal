@@ -1,0 +1,40 @@
+{
+ "api": "chat",
+ "body": {
+  "model": "ornith-1.5-35b-a3b",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the capital of France?"
+   },
+   {
+    "role": "assistant",
+    "content": "Paris.\n\n",
+    "reasoning_content": "easy"
+   },
+   {
+    "role": "user",
+    "content": "And of Italy?"
+   }
+  ]
+ },
+ "template": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the capital of France?"
+   },
+   {
+    "role": "assistant",
+    "content": "Paris.\n\n",
+    "reasoning_content": "easy"
+   },
+   {
+    "role": "user",
+    "content": "And of Italy?"
+   }
+  ],
+  "tools": null,
+  "kwargs": {}
+ }
+}

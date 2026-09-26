@@ -44938,6 +44938,9 @@ static void chat_push_think_prefix(const ds4_vocab *vocab,
             token_vec_push(out, vocab->system_id);
             bpe_tokenize_text(vocab, effort, out);
         }
+    } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35_MOE) {
+        /* Ornith renders its effort inside the ChatML system turn; the
+         * DeepSeek max prefix is not part of its template. */
     } else if (think_mode == DS4_THINK_MAX) {
         bpe_tokenize_text(vocab, DS4_REASONING_EFFORT_MAX_PREFIX, out);
     }
@@ -44954,6 +44957,35 @@ static const char *DS4_QWEN4_REASONING_XHIGH =
 static const char *DS4_QWEN4_REASONING_LOW =
     "Reasoning effort is set to low. Keep your thinking brief and focused, "
     "moving directly to the conclusion without unnecessary elaboration.";
+
+/* Ornith's embedded template (froggeric v22.4.1) appends this block to the
+ * system turn unless the caller passes terse=false. */
+#define DS4_QWEN35_TERSE_CORE \
+    "Never: open with preamble or pleasantries; restate the question; add filler transitions; " \
+    "hedge with niceties; or repeat a point you've already made.\n" \
+    "Always: keep essential steps, caveats, uncertainties, and specifics \xe2\x80\x94 never drop " \
+    "correctness or a needed warning for brevity. Keep the final answer lean. Use the least structure " \
+    "that conveys it (plain prose when short; lists or code only when they earn their place). If " \
+    "genuinely uncertain, say so and explain why \xe2\x80\x94 never omit uncertainty for the sake of " \
+    "brevity.\n" \
+    "If a user request is genuinely ambiguous, ask a sharp question, don't guess."
+
+const char *ds4_qwen35_terse_text(bool think) {
+    return think ?
+        "Answer directly, after thinking. Lead with the answer, then only what it needs to be correct "
+        "and usable.\n" DS4_QWEN35_TERSE_CORE :
+        "Answer directly and concisely. Give the answer with only what it needs to be correct and "
+        "usable.\n" DS4_QWEN35_TERSE_CORE;
+}
+
+/* The CLI and the agent have no "effort was given" signal and default to
+ * DS4_THINK_HIGH, which therefore renders Ornith's default medium effort
+ * (no line); --think-max gives the xhigh line, a low level the low line. */
+static const char *qwen35_engine_effort_text(ds4_think_mode mode) {
+    if (mode == DS4_THINK_MAX) return DS4_QWEN4_REASONING_XHIGH;
+    if (mode == DS4_THINK_LOW) return DS4_QWEN4_REASONING_LOW;
+    return NULL;
+}
 
 static void qwen4_chat_open(const ds4_vocab *vocab, const char *role, token_vec *out) {
     token_vec_push(out, vocab->im_start_id);
@@ -44991,18 +45023,41 @@ static void qwen4_chat_system(const ds4_vocab *vocab, const char *system, ds4_th
     qwen4_chat_close(vocab, out);
 }
 
+/* Ornith's system turn: [effort "\n\n"] [trimmed system "\n\n"] terse block.
+ * The template emits it even without a system prompt.  The content is one
+ * BPE call so it tokenizes like the server's rendered text. */
+static void qwen35_chat_system(const ds4_vocab *vocab, const char *system, ds4_think_mode think_mode,
+                               token_vec *out) {
+    const bool think = ds4_think_mode_enabled(think_mode);
+    const char *effort = think ? qwen35_engine_effort_text(think_mode) : NULL;
+    const char *terse = ds4_qwen35_terse_text(think);
+    const char *s = system ? system : "";
+    while (*s && isspace((unsigned char)*s)) s++;
+    size_t n = strlen(s);
+    while (n > 0 && isspace((unsigned char)s[n - 1])) n--;
+    const size_t cap = (effort ? strlen(effort) + 2u : 0u) + n + 2u + strlen(terse) + 1u;
+    char *text = xmalloc(cap);
+    snprintf(text, cap, "%s%s%.*s%s%s", effort ? effort : "", effort ? "\n\n" : "",
+             (int)n, s, n ? "\n\n" : "", terse);
+    qwen4_chat_open(vocab, "system", out);
+    bpe_tokenize_text(vocab, text, out);
+    qwen4_chat_close(vocab, out);
+    free(text);
+}
+
 static void encode_chat_prompt(
         const ds4_vocab *vocab,
         const char      *system,
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_uses_qwen35_text()) {
         if (vocab->im_start_id < 0 || vocab->im_end_id < 0 ||
             vocab->think_start_id < 0 || vocab->think_end_id < 0) {
             ds4_die("this tokenizer does not provide the Qwen chat markers; use raw prompt tokenization");
         }
-        qwen4_chat_system(vocab, system, think_mode, out);
+        if (ds4_model_is_qwen35moe()) qwen35_chat_system(vocab, system, think_mode, out);
+        else qwen4_chat_system(vocab, system, think_mode, out);
         qwen4_chat_open(vocab, "user", out);
         bpe_tokenize_text(vocab, prompt, out);
         qwen4_chat_close(vocab, out);
@@ -45194,7 +45249,7 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     if (!role) role = "user";
     if (!content) content = "";
 
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_uses_qwen35_text()) {
         if (!strcmp(role, "tool") || !strcmp(role, "function")) {
             qwen4_chat_open(vocab, "user", tokens);
             bpe_tokenize_text(vocab, "<tool_response>\n", tokens);
@@ -45260,7 +45315,7 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 }
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_uses_qwen35_text()) {
         qwen4_chat_assistant_prefix(&e->vocab, think_mode, tokens);
         return;
     }
@@ -62548,7 +62603,10 @@ uint32_t ds4_think_max_min_context(void) {
 }
 
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size) {
+    /* The clamp protects DeepSeek's max-effort prefix; Ornith's max is its
+     * template's xhigh line, valid at any context. */
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 &&
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_QWEN35_MOE &&
         mode == DS4_THINK_MAX && (uint32_t)(ctx_size > 0 ? ctx_size : 0) < DS4_THINK_MAX_MIN_CONTEXT) {
         return DS4_THINK_HIGH;
     }
@@ -64932,8 +64990,23 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
 #ifdef DS4_HAS_QWEN4_GPU
 static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows, bool fp8, bool q4);
 #endif
+#ifdef DS4_HAS_QWEN4_METAL
+static uint64_t qwen35_payload_body_bytes(uint32_t rows, uint32_t mtp_rows, bool mtp);
+#endif
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
+#ifdef DS4_HAS_QWEN4_METAL
+    if (s && !s->distributed && ds4_session_is_qwen35(s)) {
+        const ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+        if (!s->qwen35_graph_ready || !s->checkpoint_valid || g->pos != (uint32_t)s->checkpoint.len ||
+            g->kv_fp8 || g->kv_q4) return 0;
+        const uint32_t rows = (uint32_t)s->checkpoint.len;
+        const bool mtp = g->mtp_h != NULL;
+        const uint32_t mtp_rows = mtp ? (g->mtp_pos < rows ? g->mtp_pos : rows) : 0u;
+        return (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t) +
+               qwen35_payload_body_bytes(rows, mtp_rows, mtp);
+    }
+#endif
     if (s && !s->distributed && ds4_session_is_qwen4(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
         return 0;
@@ -64990,6 +65063,7 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
 #ifdef DS4_NO_GPU
     return 0;
 #else
+    ds4_qwen35_not_reached("session payload bytes");
     const ds4_gpu_graph *g = &s->graph;
     uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
     bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
@@ -65414,6 +65488,214 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
     s->qwen4_rewound = false;
     return 0;
 }
+
+#ifdef DS4_HAS_QWEN4_METAL
+/* Ornith session payload.  The header mirrors Qwen3.8's with its own tag;
+ * h[6] is the embedding width and h[10] whether the session carries the MTP
+ * block (1) or not (0).  Body: tokens, logits, u32 mtp_rows, then with MTP
+ * the trunk hidden-state carry h_{rows-1} (E floats); per layer the GDN state
+ * and conv history, the trunk attention K/V rows [0, rows), with MTP the MTP
+ * block's K/V rows [0, mtp_rows); last the rope positions of the rows
+ * (16 bytes each), which a later MTP pass below g->pos may read.  F16 KV
+ * only: an FP8/Q4 KV mode needs its own layout before it saves. */
+#define DS4_QWEN35_PAYLOAD_TAG 0x51573501u
+
+static uint64_t qwen35_payload_body_bytes(uint32_t rows, uint32_t mtp_rows, bool mtp) {
+    uint64_t bytes = (uint64_t)rows * sizeof(uint32_t) + (uint64_t)DS4_N_VOCAB * sizeof(float);
+    bytes += sizeof(uint32_t);
+    if (mtp) bytes += (uint64_t)DS4_N_EMBD * sizeof(float);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_qwen35_layer_is_nextn(il) && !mtp) continue;
+        if (ds4_qwen35_layer_is_attention(il)) {
+            bytes += 2u * qwen4_payload_kv_bytes(ds4_qwen35_layer_is_nextn(il) ? mtp_rows : rows);
+        } else {
+            bytes += qwen4_payload_lin_state_bytes() + qwen4_payload_lin_hist_bytes();
+        }
+    }
+    return bytes + (uint64_t)rows * 16u;
+}
+
+static int qwen35_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+    ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+    const uint32_t rows = (uint32_t)s->checkpoint.len;
+    if (!s->qwen35_graph_ready || g->pos != rows) {
+        payload_set_err(err, errlen, "Ornith snapshot requires a synchronized session");
+        return 1;
+    }
+    if (g->kv_fp8 || g->kv_q4) {
+        payload_set_err(err, errlen, "Ornith checkpoints support the F16 KV cache only");
+        return 1;
+    }
+    if (ds4_gpu_synchronize() == 0) {
+        payload_set_err(err, errlen, "failed to synchronize accelerator before Ornith snapshot");
+        return 1;
+    }
+    const bool mtp = g->mtp_h != NULL;
+    const uint32_t mtp_rows = mtp ? (g->mtp_pos < rows ? g->mtp_pos : rows) : 0u;
+    float *h_last = NULL;
+    if (mtp) {
+        h_last = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+        if (!qwen35_graph_h_last(g, h_last)) {
+            free(h_last);
+            payload_set_err(err, errlen, "failed to read the Ornith MTP hidden-state carry");
+            return 1;
+        }
+    }
+    const uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
+        DS4_SESSION_PAYLOAD_MAGIC,
+        DS4_SESSION_PAYLOAD_VERSION,
+        (uint32_t)s->ctx_size,
+        s->prefill_cap,
+        g->ctx_cap,
+        g->ctx_cap,
+        (uint32_t)DS4_N_EMBD,
+        rows,
+        DS4_N_LAYER,
+        DS4_N_HEAD_DIM,
+        mtp ? 1u : 0u,
+        DS4_N_VOCAB,
+        DS4_QWEN35_PAYLOAD_TAG,
+    };
+    int rc = 0;
+    for (uint32_t i = 0; rc == 0 && i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++)
+        rc = payload_write_u32(fp, header[i], err, errlen);
+    for (int i = 0; rc == 0 && i < s->checkpoint.len; i++)
+        rc = payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen);
+    if (rc == 0) rc = payload_write_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), err, errlen);
+    if (rc == 0) rc = payload_write_u32(fp, mtp_rows, err, errlen);
+    if (rc == 0 && mtp) rc = payload_write_bytes(fp, h_last, (uint64_t)DS4_N_EMBD * sizeof(float), err, errlen);
+    free(h_last);
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        if (ds4_qwen35_layer_is_nextn(il) && !mtp) continue;
+        if (ds4_qwen35_layer_is_attention(il)) {
+            const uint64_t kvb = qwen4_payload_kv_bytes(ds4_qwen35_layer_is_nextn(il) ? mtp_rows : rows);
+            rc = payload_write_tensor_span(fp, g->layer_k_cache[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            if (rc == 0)
+                rc = payload_write_tensor_span(fp, g->layer_v_cache[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK, err, errlen);
+        } else {
+            rc = payload_write_tensor_span(fp, g->layer_lin_state[il], 0, qwen4_payload_lin_state_bytes(),
+                                           buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            if (rc == 0)
+                rc = payload_write_tensor_span(fp, g->layer_lin_hist[il], 0, qwen4_payload_lin_hist_bytes(),
+                                               buf, DS4_SESSION_IO_CHUNK, err, errlen);
+        }
+    }
+    if (rc == 0)
+        rc = payload_write_tensor_span(fp, g->pos3, 0, (uint64_t)rows * 16u, buf, DS4_SESSION_IO_CHUNK, err, errlen);
+    free(buf);
+    return rc;
+}
+
+static int qwen35_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *h, uint64_t *remaining,
+                                       char *err, size_t errlen) {
+    ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+    if (!s->qwen35_graph_ready) {
+        payload_set_err(err, errlen, "Ornith graph is not ready for restore");
+        return 1;
+    }
+    const bool mtp = g->mtp_h != NULL;
+    const uint32_t rows = h[7];
+    if (h[12] != DS4_QWEN35_PAYLOAD_TAG || h[6] != DS4_N_EMBD || h[8] != DS4_N_LAYER ||
+        h[9] != DS4_N_HEAD_DIM || h[10] > 1u || h[11] != DS4_N_VOCAB) {
+        payload_set_err(err, errlen, "KV checkpoint was written by a different model family or shape");
+        return 1;
+    }
+    if (h[10] != (mtp ? 1u : 0u)) {
+        payload_set_err(err, errlen, mtp ?
+            "KV checkpoint was saved without --mtp; this Ornith session keeps MTP state" :
+            "KV checkpoint was saved with --mtp; this Ornith session has no MTP state");
+        return 1;
+    }
+    if (g->kv_fp8 || g->kv_q4) {
+        payload_set_err(err, errlen, "Ornith checkpoints support the F16 KV cache only");
+        return 1;
+    }
+    if (rows > g->ctx_cap || rows > (uint32_t)s->ctx_size) {
+        payload_set_err(err, errlen, "KV checkpoint is longer than this session's context");
+        return 1;
+    }
+    token_vec new_checkpoint = {0};
+    for (uint32_t i = 0; i < rows; i++) {
+        uint32_t tok;
+        if (payload_read_u32(fp, &tok, remaining, err, errlen) != 0) {
+            token_vec_free(&new_checkpoint);
+            return 1;
+        }
+        if (tok >= DS4_N_VOCAB) {
+            token_vec_free(&new_checkpoint);
+            payload_set_err(err, errlen, "KV checkpoint token id is outside the vocabulary");
+            return 1;
+        }
+        token_vec_push(&new_checkpoint, (int)tok);
+    }
+    /* From the first write on, a failure leaves no reusable checkpoint, and
+     * verifier state belongs to the old transcript even at the same row. */
+    s->checkpoint_valid = false;
+    s->mtp_draft_valid = false;
+    s->glm_mtp_have = 0;
+    s->glm_mtp_have2 = false;
+    g->snap_valid = false;
+    int rc = payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), remaining, err, errlen);
+    if (rc == 0 && ds4_gpu_synchronize() == 0) {
+        payload_set_err(err, errlen, "failed to synchronize accelerator before Ornith restore");
+        rc = 1;
+    }
+    uint32_t mtp_rows = 0;
+    if (rc == 0) rc = payload_read_u32(fp, &mtp_rows, remaining, err, errlen);
+    if (rc == 0 && (mtp_rows > rows || (!mtp && mtp_rows != 0))) {
+        payload_set_err(err, errlen, "KV checkpoint MTP rows are invalid");
+        rc = 1;
+    }
+    float *h_last = mtp ? xmalloc((size_t)DS4_N_EMBD * sizeof(float)) : NULL;
+    if (rc == 0 && mtp)
+        rc = payload_read_bytes(fp, h_last, (uint64_t)DS4_N_EMBD * sizeof(float), remaining, err, errlen);
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        if (ds4_qwen35_layer_is_nextn(il) && !mtp) continue;
+        if (ds4_qwen35_layer_is_attention(il)) {
+            const uint64_t kvb = qwen4_payload_kv_bytes(ds4_qwen35_layer_is_nextn(il) ? mtp_rows : rows);
+            rc = payload_read_tensor_span(fp, g->layer_k_cache[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK,
+                                          remaining, err, errlen);
+            if (rc == 0)
+                rc = payload_read_tensor_span(fp, g->layer_v_cache[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK,
+                                              remaining, err, errlen);
+        } else {
+            rc = payload_read_tensor_span(fp, g->layer_lin_state[il], 0, qwen4_payload_lin_state_bytes(),
+                                          buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+            if (rc == 0)
+                rc = payload_read_tensor_span(fp, g->layer_lin_hist[il], 0, qwen4_payload_lin_hist_bytes(),
+                                              buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+        }
+    }
+    if (rc == 0)
+        rc = payload_read_tensor_span(fp, g->pos3, 0, (uint64_t)rows * 16u, buf, DS4_SESSION_IO_CHUNK,
+                                      remaining, err, errlen);
+    free(buf);
+    if (rc == 0) {
+        g->pos = rows;
+        if (mtp) {
+            if (!qwen35_graph_set_h_last(g, h_last)) {
+                payload_set_err(err, errlen, "failed to restore the Ornith MTP hidden-state carry");
+                rc = 1;
+            } else {
+                g->mtp_pos = mtp_rows;
+            }
+        }
+    }
+    free(h_last);
+    if (rc != 0) {
+        token_vec_free(&new_checkpoint);
+        qwen35_graph_reset(g);
+        s->checkpoint.len = 0;
+        return 1;
+    }
+    token_vec_free(&s->checkpoint);
+    s->checkpoint = new_checkpoint;
+    s->checkpoint_valid = true;
+    return 0;
+}
+#endif
 #endif
 
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
@@ -65426,6 +65708,9 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     }
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) return ds41_save_payload(s, fp, err, errlen);
+#endif
+#ifdef DS4_HAS_QWEN4_METAL
+    if (ds4_session_is_qwen35(s)) return qwen35_session_save_payload(s, fp, err, errlen);
 #endif
     if (ds4_session_is_qwen4(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
@@ -65635,6 +65920,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     payload_set_err(err, errlen, "graph backend support is not compiled in");
     return 1;
 #else
+    ds4_qwen35_not_reached("session payload save");
     if (ds4_gpu_synchronize() == 0) {
         payload_set_err(err, errlen, "failed to synchronize accelerator before snapshot");
         return 1;
@@ -65813,6 +66099,9 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     }
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) return ds41_load_payload(s, fp, h, remaining, err, errlen);
+#endif
+#ifdef DS4_HAS_QWEN4_METAL
+    if (ds4_session_is_qwen35(s)) return qwen35_session_load_payload(s, fp, h, &remaining, err, errlen);
 #endif
     if (ds4_session_is_qwen4(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
@@ -66183,6 +66472,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     payload_set_err(err, errlen, "graph backend support is not compiled in");
     return 1;
 #else
+    ds4_qwen35_not_reached("session payload load");
     ds4_gpu_graph *g = &s->graph;
     const uint32_t saved_ctx = h[2];
     const uint32_t saved_prefill_cap = h[3];
@@ -74516,6 +74806,16 @@ bool ds4_engine_is_qwen35moe(ds4_engine *e) {
     return e && ds4_model_is_qwen35moe();
 }
 
+bool ds4_engine_uses_qwen35_text(ds4_engine *e) {
+    (void)e;
+    return ds4_model_uses_qwen35_text();
+}
+
+const char *ds4_engine_reasoning_effort_text(ds4_engine *e, ds4_think_mode mode) {
+    (void)e;
+    return ds4_model_is_qwen35moe() ? qwen35_engine_effort_text(mode) : ds4_qwen4_reasoning_effort_text(mode);
+}
+
 /* The official template's default effort is xhigh; medium adds no text. */
 const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode) {
     switch (mode) {
@@ -82179,6 +82479,10 @@ static bool ds4_sessions_eval_batch_metal_supported(
         getenv("DS4_METAL_DECODE_STAGE_PROFILE") != NULL) {
         return false;
     }
+    /* Ornith sessions decode one at a time: batching is refused at open and
+     * no native batch path knows the family, so never reach the DeepSeek
+     * checks below. */
+    if (ds4_model_is_qwen35moe()) return false;
 #if defined(__APPLE__)
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41)
         return ds41_sessions_batch_supported(items, count, e);
@@ -88434,6 +88738,21 @@ void ds4_session_rewind(ds4_session *s, int pos) {
         /* Qwen eval replays the kept transcript if reset left the graph behind. */
         state_ok = true;
         s->qwen4_rewound = logit_row < 0;
+    }
+#endif
+#ifdef DS4_HAS_QWEN4_METAL
+    if (s->checkpoint_valid && ds4_session_is_qwen35(s)) {
+        /* One token back after an accepted verify: the after-row-0 GDN
+         * snapshot is the state at pos and verify row 0 holds its logits.
+         * Recurrent state cannot be trimmed otherwise, so any other rewind
+         * leaves state_ok false and the caller re-syncs the kept prefix. */
+        ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+        if (s->qwen4_verify_logits && g->snap_valid && g->snap_pos == (uint32_t)pos &&
+            qwen35_graph_state_swap(g)) {
+            memcpy(s->logits, s->qwen4_verify_logits, (size_t)DS4_N_VOCAB * sizeof(float));
+            if (g->mtp_pos > (uint32_t)pos) g->mtp_pos = (uint32_t)pos;
+            state_ok = true;
+        }
     }
 #endif
     if (s->checkpoint_valid && ds4_session_is_glm(s)) {

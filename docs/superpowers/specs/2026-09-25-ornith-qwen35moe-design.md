@@ -142,9 +142,11 @@ Decisions that follow from that audit:
   not reused for Ornith.
 - **No silent fallthrough.** Where a qwen4 branch is followed by a DeepSeek/GLM
   default (context estimate, one-shot generate, session create/sync/eval,
-  speculative cycle, rewind), the default path dies with a clear message if it
-  ever sees the Ornith family, so a missed DISPATCH branch cannot silently run
-  DeepSeek code.
+  speculative cycle, disk KV payload size/save/load), the default path dies
+  with a clear message if it ever sees the Ornith family, so a missed DISPATCH
+  branch cannot silently run DeepSeek code. Rewind has no DeepSeek default to
+  fall into: an Ornith rewind restores a verify snapshot or invalidates the
+  checkpoint (section 6).
 
 ## 4. Components
 
@@ -266,32 +268,75 @@ A/B shows a gain.
 - **Live prefix reuse.** The server's session sync applies unchanged.
 - **Disk KV checkpoints.**
   - A new payload tag, `DS4_QWEN35_PAYLOAD_TAG`, covers the 30 GDN recurrent
-    states and conv histories plus the KV rows of the 10 attention layers and
-    the MTP block.
-  - The checkpoint header records `qwen35moe`, so Qwen3.8 and Ornith
-    checkpoints can never load into each other. Existing Qwen3.8 checkpoints
-    are unaffected.
+    states and conv histories, the KV rows of the 10 attention layers, the
+    rope positions and, with `--mtp`, the MTP block's KV rows and the trunk
+    hidden-state carry the next draft pairs with. The payload records whether
+    it carries MTP state; a payload whose MTP presence differs from the
+    session's is refused and the server prefills instead. F16 KV only.
+  - The KV-cache file header records the model id (`qwen35moe` = 7) and the
+    payload its own tag, so Qwen3.8 and Ornith checkpoints can never load
+    into each other. Existing Qwen3.8 checkpoints are unaffected. The routed
+    quant byte stays 2 for both Ornith tiers (Q5_K in layer 0), so a 25G
+    server accepts a 23G checkpoint of the same text, as the Qwen3.8 IQ2
+    tiers do.
 - **KV cache.** F16 by default. KV is 20 KiB per token, about 5.4 GB at 262K,
   on top of 21 GiB of weights. kv-grow is not used in v1. The qwen4 FP8/Q4 KV
   modes remain available as a speed lever (section 8, gate 3).
 - **Chat rendering.**
-  - Reuse the Qwen3.8 ChatML and XML tool-call renderer.
-  - Ornith differences, gated by family: thinking on by default with the
-    generation prompt opened by `<think>\n`, thinking off rendered as
-    `<think>\n\n</think>\n\n`, and the tool schema placement of the embedded
-    template.
-  - The Qwen3.8 "Reasoning effort is set to xhigh" system line is not added.
-    It is added in three places (`encode_chat_prompt` through
-    `qwen4_chat_system`, the agent's system tokens, and the server's
-    `render_qwen_chat_prompt_text`). All three get the text from
-    `ds4_qwen4_reasoning_effort_text()`, which gains a family check and returns
-    NULL for Ornith. For Qwen3.8 the output does not change.
+  - Reuse the Qwen3.8 ChatML turns, XML tool-call syntax, parser and live
+    continuation tails (`SERVER_MODEL_SYNTAX_QWEN`). The generation prompt
+    (`<think>\n`, or `<think>\n\n</think>\n\n` with thinking off) already
+    equals the embedded template's.
+  - The embedded template (froggeric v22.4.1) differs in the system turn,
+    tool results and assistant history. ds4-server renders an Ornith flavor,
+    chosen once at startup from the engine, that equals the template on the
+    golden set in `tests/ornith/chat/golden/` (`make test-ornith-render`):
+    - a "terse" block appended to the system turn (kwarg `terse`, default
+      true; its lead line depends on thinking);
+    - the template's tool instructions (thinking-dependent) and `tool | tojson`
+      spacing for tool schemas and non-string arguments, in the order given;
+      Anthropic tools keep ds4's mapping `{"type": "function", "function":
+      <tool as given>}` (`input_schema` is not renamed);
+    - reasoning effort: an absent or null effort is the template's medium (no
+      line); high/xhigh/max give the existing xhigh line and low/minimal the
+      low line, the same strings Qwen3.8 uses; none/off turn thinking off.
+      `ds4_qwen4_reasoning_effort_text()` is unchanged; the Ornith default
+      comes from the request parsers;
+    - only leading system/developer messages merge into the system turn;
+      later ones render in place; Anthropic's `system` comes first;
+    - tool results trimmed, with the template's tool-error warning (the
+      count runs across assistant turns and into live tails);
+    - assistant history trimmed; `preserve_thinking` (or
+      `preserve_reasoning`) false drops reasoning before the last user query.
+  - Not rendered like the template, by decision: `<|think_*|>` tags inside
+    messages (plain text), unknown roles (dropped), the truncation and
+    tool-suppression kwargs (ignored), `tool_call_format` json (HTTP 400),
+    think tags inside assistant content (copied), the `thinking`/`reasoning`
+    history fields (only `reasoning_content`), closing-sentinel escaping and
+    sampled tool-text replay (kept from Qwen3.8), a generation prompt only
+    when an assistant turn is pending, ASCII-only trimming, and numbers
+    printed as written by tojson; `terse`/`preserve_thinking` given as JSON
+    null or a number are ignored (the defaults apply), where the template
+    would treat `null` (`terse`) or `0` (either) as false; tools marked
+    `defer_loading` are left out of the prompt, a ds4 convention the template
+    has no equivalent for; role `function` messages render as tool messages
+    (`<tool_response>`), where the template would print `[function]: ...`
+    like any other unknown role; `tool_choice: "none"` drops the tools block,
+    a ds4 request-level control the template has no concept of.
+  - CLI and agent: `encode_chat_prompt` renders the Ornith system turn with
+    the terse block; the frontends' default think mode stands for "no effort
+    given" (medium), `--think-max` gives the xhigh line
+    (`ds4_engine_reasoning_effort_text()`), and `ds4_think_mode_for_context`
+    does not clamp max for Ornith. The agent keeps the Qwen3.8 tools prompt
+    and adds no terse block.
   - Server model-name aliases for Qwen3.8 (`qwen3.8-flash-next-*`) are not
     predicate sites; Ornith gets its own alias list.
-- **Server.** Model id `ornith-1.5-35b-a3b` with the `-chat`, `-reasoner` and
-  `-nothink` aliases, following the Qwen3.8 pattern.
-  `SERVER_MODEL_SYNTAX_QWEN` for tool calls. Gateway registry changes belong to
-  the deploy step after v2.
+- **Server.** Model id `ornith-1.5-35b-a3b` with the `-chat`, `-reasoner`,
+  `-nothink` and `-no-think` aliases, following the Qwen3.8 pattern: -chat,
+  -nothink and -no-think turn thinking off and -reasoner on when the request
+  sets no thinking field; `/v1/models` lists the base id, `-chat` and
+  `-reasoner`. `SERVER_MODEL_SYNTAX_QWEN` for tool calls with the Ornith
+  render flavor. Gateway registry changes belong to the deploy step after v2.
 
 ## 6. Error handling
 
@@ -305,10 +350,12 @@ A/B shows a gain.
   above 1, directional steering, `--ple` and `--vision` (v1) are refused at
   open with a message naming the option. The batched-session refusal sits in
   the open gate because the server does not refuse batching per family today.
-- **Rewind.** A rewind on an Ornith session restores the GDN snapshot when one
-  covers the target position. Otherwise it resets the recurrent state and
-  conv history together with the checkpoint, so a later sync can never reuse
-  a stale prefix.
+- **Rewind.** A rewind on an Ornith session restores the after-row-0 verify
+  snapshot when it covers the target position (one token back after an
+  accepted draft, which a stop token inside a verify block produces), with
+  that row's logits. Otherwise it invalidates the checkpoint; the next sync
+  resets the recurrent state and conv history and replays the kept prefix,
+  so a stale prefix is never reused.
 - **Runtime.** Graph functions return false up the chain like the qwen4 path.
   If a target or MTP forward fails midway, the session is invalidated and the
   next request prefills again, so GDN state is never half updated. Requests
@@ -366,10 +413,13 @@ PPL of the tier: 2.194208 x 1.0018 = 2.1982 for 23G.
    decoding, including cycles with rejected drafts.
 4. **Sessions.** Save to disk KV, restore and continue: the output equals an
    uninterrupted run. A Qwen3.8 checkpoint is refused by Ornith and the other
-   way round.
+   way round. (M3 tests the Ornith side with a Qwen3.8-tagged payload; the
+   other direction rests on the Qwen3.8 loader's exact tag check and the
+   KV-cache model id, tested without a model.)
 5. **Chat.** ds4 renderings match jinja2 renderings of the embedded template
    for a fixed conversation set: system prompt, tools, multi-turn with tool
-   results, thinking on and off.
+   results, thinking on and off (`tests/ornith/chat/`: 26 goldens rendered
+   from the GGUF's template, compared by `make test-ornith-render`).
 
 ### Gate 2: quality (B)
 
