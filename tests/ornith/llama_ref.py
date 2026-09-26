@@ -7,9 +7,12 @@
 `record` starts llama-server on port 18190 (never a gateway port), tokenizes
 every prompt with the server (no BOS, like ds4's --raw), and stores the
 prompt ids, the generated text and, per greedy step, the selected id and
-top-20 log-probabilities of the unsampled distribution.  --cpu runs the same
-model on llama.cpp's CPU backend for calibration and skips the long
-file-backed prompt, which would take hours there.
+top-20 log-probabilities of the unsampled distribution.  A prompt with
+"llama_ubatch" is recorded by its own server with that physical batch
+(-ub): long_copy uses 1, because llama.cpp's batched Metal prefill moves its
+contested step by more than the tolerance while its per-token path agrees
+with the CPU backend.  --cpu runs the same model on llama.cpp's CPU backend
+for calibration and skips the file-backed prompts.
 """
 import json
 import os
@@ -48,16 +51,22 @@ def wait_ready(proc):
 
 def record(model, out_dir, cpu):
     os.makedirs(out_dir, exist_ok=True)
+    prompts = r.load_prompts(os.path.join(ROOT, "tests/ornith/prompts.json"))
+    for ubatch, group in r.llama_server_groups(prompts, cpu):
+        record_group(model, out_dir, cpu, ubatch, group)
+
+
+def record_group(model, out_dir, cpu, ubatch, prompts):
     cmd = ["llama-server", "-m", model, "--host", "127.0.0.1", "--port", str(PORT),
            "-c", "16384", "-np", "1"]
     cmd += ["-ngl", "0", "--device", "none"] if cpu else ["-ngl", "99"]
-    log = open(os.path.join(out_dir, "llama-server.log"), "w")
+    cmd += ["-ub", str(ubatch)] if ubatch is not None else []
+    log_name = "llama-server.log" if ubatch is None else f"llama-server-ub{ubatch}.log"
+    log = open(os.path.join(out_dir, log_name), "w")
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
     try:
         wait_ready(proc)
-        for p in r.load_prompts(os.path.join(ROOT, "tests/ornith/prompts.json")):
-            if cpu and "file" in p:
-                continue
+        for p in prompts:
             text = r.prompt_text(p, ROOT)
             ids = post("/tokenize", {"content": text, "add_special": False})["tokens"]
             comp = post("/completion", {"prompt": ids, "n_predict": p["n_predict"], "temperature": 0.0,

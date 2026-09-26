@@ -3,13 +3,13 @@
 References come from llama.cpp's llama-server on the same GGUF; ds4 output
 comes from `ds4 --dump-logprobs`.  Both are reduced to the same step form,
 {"selected": id, "top": [[id, logprob], ...]}, and compared greedily: the
-selected tokens must match and every probable token (reference log-prob >=
-PROBABLE) in both top-k lists must agree within a tolerance, until the
-reference reaches a near-tie (top-1/top-2 gap below `tie`).  The tie step's
-probable tokens are still checked against the tolerance; from that step on a
-different but equally valid continuation is allowed.  The tolerances are
-calibrated from llama.cpp's own Metal-versus-CPU spread instead of being
-picked by hand.
+selected tokens must match, a probable token (log-prob >= PROBABLE) on
+either side must be in both top-k lists, and the reference's probable
+tokens must agree within a tolerance, until the reference reaches a near-tie
+(top-1/top-2 gap below `tie`).  The tie step's probable tokens are still
+checked; from that step on a different but equally valid continuation is
+allowed.  The tolerances are calibrated from llama.cpp's own
+Metal-versus-CPU spread instead of being picked by hand.
 """
 import json
 import os
@@ -29,10 +29,30 @@ def load_prompts(path):
 
 
 def prompt_text(prompt, root):
+    """The prompt's raw text.  A file-backed prompt takes the file's first
+    `chars` characters; with `repeat_chars` the file's opening follows again
+    after a blank line, so the continuation copies from far back."""
     if "text" in prompt:
         return prompt["text"]
     with open(os.path.join(root, prompt["file"]), encoding="utf-8") as f:
-        return f.read()[: prompt["chars"]]
+        text = f.read()
+    if "repeat_chars" in prompt:
+        return text[: prompt["chars"]] + "\n\n" + text[: prompt["repeat_chars"]]
+    return text[: prompt["chars"]]
+
+
+def llama_server_groups(prompts, cpu):
+    """Prompts grouped by llama-server launch: the default physical batch
+    first, then one server per pinned "llama_ubatch" value (a long prompt
+    whose batched Metal prefill is not precise enough to be the reference is
+    recorded one token per ubatch).  The CPU backend skips file-backed
+    prompts."""
+    groups = {}
+    for p in prompts:
+        if cpu and "file" in p:
+            continue
+        groups.setdefault(p.get("llama_ubatch"), []).append(p)
+    return sorted(groups.items(), key=lambda g: (g[0] is not None, g[0] or 0))
 
 
 def llama_steps(completion):
@@ -56,8 +76,32 @@ def _gap(step):
     return lps[0] - lps[1] if len(lps) >= 2 else float("inf")
 
 
+def _check_probable(ref, got, res):
+    """A token probable on either side must be in both top-k lists; the first
+    one that is not is returned as the failure reason.  The log-prob deltas
+    are taken over the reference's probable tokens, the set the tolerance is
+    calibrated on (adding ds4-only probable tokens would move a CPU-only
+    probable token into the Metal-vs-CPU calibration and widen it); each
+    pair found adds to res["checked"] and res["max_delta"]."""
+    theirs = dict((tid, lp) for tid, lp in ref["top"])
+    mine = dict((tid, lp) for tid, lp in got["top"])
+    missing = ""
+    for tid, lp in ref["top"]:
+        if lp < PROBABLE:
+            continue
+        if tid not in mine:
+            missing = missing or f"token {tid} (reference {lp:.4f}) missing from ds4's top list"
+        else:
+            res["checked"] += 1
+            res["max_delta"] = max(res["max_delta"], abs(mine[tid] - lp))
+    for tid, lp in got["top"]:
+        if lp >= PROBABLE and tid not in theirs:
+            missing = missing or f"token {tid} (ds4 {lp:.4f}) missing from the reference's top list"
+    return missing
+
+
 def compare(ref_steps, got_steps, tol, tie):
-    res = {"ok": True, "compared": 0, "stopped_at_tie": None, "max_delta": 0.0,
+    res = {"ok": True, "compared": 0, "checked": 0, "stopped_at_tie": None, "max_delta": 0.0,
            "first_mismatch": None, "reason": ""}
     for i, ref in enumerate(ref_steps):
         at_tie = _gap(ref) < tie
@@ -69,10 +113,10 @@ def compare(ref_steps, got_steps, tol, tie):
             res.update(ok=False, first_mismatch=i, reason=f"ds4 stopped after {len(got_steps)} steps")
             return res
         got = got_steps[i]
-        mine = dict((tid, lp) for tid, lp in got["top"])
-        for tid, lp in ref["top"]:
-            if lp >= PROBABLE and tid in mine:
-                res["max_delta"] = max(res["max_delta"], abs(mine[tid] - lp))
+        missing = _check_probable(ref, got, res)
+        if missing:
+            res.update(ok=False, first_mismatch=i, reason=f"step {i}{' (tie)' if at_tie else ''}: {missing}")
+            return res
         if at_tie:
             # The tie excuses a different selection from here on, not the
             # probable-token log-probs of the tie step itself.
@@ -90,6 +134,14 @@ def compare(ref_steps, got_steps, tol, tie):
             return res
         res["compared"] = i + 1
     return res
+
+
+def verdict(res):
+    """Gate status for one prompt: a passing comparison that checked no
+    probable-token pair proved nothing, so it fails as vacuous."""
+    if not res["ok"]:
+        return "FAIL"
+    return "ok" if res["checked"] > 0 else "FAIL vacuous"
 
 
 def calibrate(metal, cpu):

@@ -6,6 +6,7 @@
 For each prompt in tests/ornith/prompts.json: write the raw text, check that
 ds4's prompt tokens equal llama.cpp's, run `ds4 --dump-logprobs` greedily for
 the reference's step count, and compare with tests/ornith/tolerance.json.
+A prompt whose comparison checked no probable-token pair fails as vacuous.
 Extra ds4 arguments (for example --prefill-chunk 64) are passed through.
 """
 import json
@@ -30,7 +31,7 @@ def main(argv):
     model = os.environ["DS4_ORNITH_MODEL"]
     os.makedirs(os.path.join(out, "ds4"), exist_ok=True)
     tol = json.load(open(os.path.join(ROOT, "tests/ornith/tolerance.json")))
-    failed = 0
+    failed = compared = checked = 0
     for p in r.load_prompts(os.path.join(ROOT, "tests/ornith/prompts.json")):
         ref = json.load(open(os.path.join(ROOT, "tests/ornith/ref", p["name"] + ".json")))
         txt = os.path.join(out, "ds4", p["name"] + ".txt")
@@ -51,11 +52,15 @@ def main(argv):
             failed += 1
             continue
         res = r.compare(ref["steps"], r.ds4_steps(json.load(open(dump))), tol["tol"], tol["tie"])
-        status = "ok" if res["ok"] else "FAIL"
-        failed += 0 if res["ok"] else 1
-        print(f"{p['name']}: {status} compared={res['compared']} tie_at={res['stopped_at_tie']} "
-              f"max_delta={res['max_delta']:.4f} {res['reason']}")
-    print(f"gate1: {'PASS' if failed == 0 else f'FAIL ({failed})'} tol={tol['tol']:.4f} tie={tol['tie']:.4f}")
+        status = r.verdict(res)
+        failed += 0 if status == "ok" else 1
+        compared += res["compared"]
+        checked += res["checked"]
+        reason = f" {res['reason']}" if res["reason"] else ""
+        print(f"{p['name']}: {status} compared={res['compared']} checked={res['checked']} "
+              f"tie_at={res['stopped_at_tie']} max_delta={res['max_delta']:.4f}{reason}")
+    print(f"gate1: {'PASS' if failed == 0 else f'FAIL ({failed})'} compared={compared} checked={checked} "
+          f"tol={tol['tol']:.4f} tie={tol['tie']:.4f}")
     return 1 if failed else 0
 
 
