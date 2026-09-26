@@ -3195,7 +3195,16 @@ static char *pyjson_from_raw(const char *raw) {
 static void append_ornith_tool_calls_text(buf *b, const tool_calls *calls, bool has_content) {
     if (!calls || calls->len == 0) return;
     if (calls->raw_tool_text && calls->raw_tool_text[0]) {
-        buf_puts(b, calls->raw_tool_text);
+        const char *raw = calls->raw_tool_text;
+        if (!has_content) {
+            /* The template starts the turn with "<tool_call>" directly when
+             * no think block or content precedes it. Sampled raw text always
+             * carries the leading blank line that separated it from the
+             * think-block-then-content layout it was generated in; trim that
+             * off here so a replay matches the template's own render. */
+            while (*raw && isspace((unsigned char)*raw)) raw++;
+        }
+        buf_puts(b, raw);
         return;
     }
     for (int i = 0; i < calls->len; i++) {
@@ -24104,6 +24113,61 @@ static void test_ornith_tool_turn_visible_text_prefixes_next_render(void) {
     g_server_qwen_flavor = SERVER_QWEN_FLAVOR_QWEN38;
 }
 
+/* An earlier assistant tool-call turn with empty content, before the last
+ * user query and with preserve_thinking=false, emits no think block (spec
+ * §5). Its raw_tool_text replay must still start right after
+ * "<|im_start|>assistant\n" the way the template does, not with the extra
+ * "\n\n" the sampled text carries from the think-block-then-content layout
+ * it was generated in; the replay must also match the render from the same
+ * structured tool calls (no raw_tool_text). */
+static void test_ornith_replayed_tool_text_no_think_no_content(void) {
+    g_server_qwen_flavor = SERVER_QWEN_FLAVOR_ORNITH;
+    char *texts[2];
+    for (int use_raw = 0; use_raw < 2; use_raw++) {
+        chat_msgs msgs = {0};
+        chat_msg user1 = {0};
+        user1.role = xstrdup("user");
+        user1.content = xstrdup("run it");
+        chat_msgs_push(&msgs, user1);
+
+        chat_msg assistant = {0};
+        assistant.role = xstrdup("assistant");
+        assistant.content = xstrdup("");
+        assistant.reasoning = xstrdup("Use the tool.");
+        tool_call call = {0};
+        call.name = xstrdup("bash");
+        call.arguments = xstrdup("{\"command\":\"ls\"}");
+        tool_calls_push(&assistant.calls, call);
+        if (use_raw)
+            assistant.calls.raw_tool_text = xstrdup(
+                "\n\n<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>");
+        chat_msgs_push(&msgs, assistant);
+
+        chat_msg tool = {0};
+        tool.role = xstrdup("tool");
+        tool.content = xstrdup("ok\n");
+        chat_msgs_push(&msgs, tool);
+
+        chat_msg user2 = {0};
+        user2.role = xstrdup("user");
+        user2.content = xstrdup("again");
+        chat_msgs_push(&msgs, user2);
+
+        chat_template_opts opts = CHAT_TEMPLATE_DEFAULTS;
+        opts.preserve_thinking = false;
+        texts[use_raw] = render_chat_prompt_text_opts(SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, NULL,
+                                                       DS4_THINK_MEDIUM, &opts);
+        chat_msgs_free(&msgs);
+    }
+    g_server_qwen_flavor = SERVER_QWEN_FLAVOR_QWEN38;
+    TEST_ASSERT(texts[0] && strstr(texts[0], "<|im_start|>assistant\n<tool_call>") != NULL);
+    TEST_ASSERT(texts[1] && strstr(texts[1], "<|im_start|>assistant\n<tool_call>") != NULL);
+    TEST_ASSERT(texts[1] && strstr(texts[1], "assistant\n\n\n<tool_call>") == NULL);
+    TEST_ASSERT(texts[0] && texts[1] && !strcmp(texts[0], texts[1]));
+    free(texts[0]);
+    free(texts[1]);
+}
+
 /* A KV-cache file carries the model id: Qwen3.8 (5) and Ornith (7)
  * checkpoints of the same rendered text never match each other. */
 static void test_kv_cache_lookup_separates_qwen38_and_ornith(void) {
@@ -24340,6 +24404,7 @@ static void ds4_server_unit_tests_run(void) {
     test_ornith_live_tail_continues_full_render();
     test_ornith_anthropic_tool_results_match_openai();
     test_ornith_tool_turn_visible_text_prefixes_next_render();
+    test_ornith_replayed_tool_text_no_think_no_content();
     test_kv_cache_lookup_separates_qwen38_and_ornith();
     test_ornith_model_ids();
 }

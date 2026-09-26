@@ -315,7 +315,14 @@ A/B shows a gain.
     history fields (only `reasoning_content`), closing-sentinel escaping and
     sampled tool-text replay (kept from Qwen3.8), a generation prompt only
     when an assistant turn is pending, ASCII-only trimming, and numbers
-    printed as written by tojson.
+    printed as written by tojson; `terse`/`preserve_thinking` given as JSON
+    null or a number are ignored (the defaults apply), where the template
+    would treat `null` (`terse`) or `0` (either) as false; tools marked
+    `defer_loading` are left out of the prompt, a ds4 convention the template
+    has no equivalent for; role `function` messages render as tool messages
+    (`<tool_response>`), where the template would print `[function]: ...`
+    like any other unknown role; `tool_choice: "none"` drops the tools block,
+    a ds4 request-level control the template has no concept of.
   - CLI and agent: `encode_chat_prompt` renders the Ornith system turn with
     the terse block; the frontends' default think mode stands for "no effort
     given" (medium), `--think-max` gives the xhigh line

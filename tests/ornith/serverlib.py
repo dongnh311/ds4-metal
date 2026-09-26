@@ -45,19 +45,25 @@ class Server:
         self.mark = self.log.stat().st_size
         self.proc = subprocess.Popen(cmd, cwd=ROOT, env=dict(os.environ, **(env or {})),
                                      stdout=self.fh, stderr=subprocess.STDOUT)
-        deadline = time.monotonic() + 600
-        while True:
-            if self.proc.poll() is not None:
-                raise RuntimeError(f"ds4-server exited {self.proc.returncode}; see {self.log}")
-            try:
-                with urllib.request.urlopen(BASE + "/v1/models", timeout=2) as resp:
-                    self.models = json.load(resp)
-                return
-            except OSError:
-                if time.monotonic() > deadline:
-                    self.stop()
-                    raise RuntimeError(f"ds4-server did not answer within 600 s; see {self.log}")
-                time.sleep(1)
+        try:
+            deadline = time.monotonic() + 600
+            while True:
+                if self.proc.poll() is not None:
+                    raise RuntimeError(f"ds4-server exited {self.proc.returncode}; see {self.log}")
+                try:
+                    with urllib.request.urlopen(BASE + "/v1/models", timeout=2) as resp:
+                        self.models = json.load(resp)
+                    return
+                except OSError:
+                    if time.monotonic() > deadline:
+                        raise RuntimeError(f"ds4-server did not answer within 600 s; see {self.log}")
+                    time.sleep(1)
+        except BaseException:
+            # Any failure during startup (bad JSON, RuntimeError, Ctrl-C, ...) must
+            # not leave the 23 GB ds4-server running: stop it and close the log
+            # handle before the exception escapes the constructor.
+            self.stop()
+            raise
 
     def new_log(self):
         """Server output since the previous call (or since start)."""
@@ -68,14 +74,18 @@ class Server:
         return data.decode("utf-8", "replace")
 
     def stop(self):
-        if self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=180)
-            except subprocess.TimeoutExpired:
-                raise RuntimeError(f"ds4-server pid {self.proc.pid} ignored SIGTERM for 180 s; check "
-                                   f"`ps -o pid,stat -p {self.proc.pid}` and never kill -9 a Metal process")
-        self.fh.close()
+        """Idempotent: safe to call more than once, and safe after a startup failure."""
+        try:
+            if self.proc.poll() is None:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=180)
+                except subprocess.TimeoutExpired:
+                    raise RuntimeError(f"ds4-server pid {self.proc.pid} ignored SIGTERM for 180 s; check "
+                                       f"`ps -o pid,stat -p {self.proc.pid}` and never kill -9 a Metal process")
+        finally:
+            if not self.fh.closed:
+                self.fh.close()
 
 
 def post(path, body, timeout=1800, save=None):

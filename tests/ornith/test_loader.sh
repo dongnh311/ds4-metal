@@ -11,7 +11,33 @@
 set -eu
 model=${DS4_ORNITH_MODEL:?set DS4_ORNITH_MODEL to the 23G ICE GGUF}
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/ornith-loader.XXXXXX")
-trap 'rm -rf "$tmp"' EXIT
+srv=""
+
+# stop_server: SIGTERM the ds4-server started for the M3 checks and wait for
+# it, never kill -9 (a killed Metal process can wedge the GGUF until reboot).
+# Also called from the EXIT trap so a script interrupted or aborted between
+# starting the server and the normal stop_server call never leaves the 23 GB
+# ds4-server running.
+stop_server() {
+    [ -n "$srv" ] || return 0
+    kill -0 "$srv" 2>/dev/null || return 0
+    kill -TERM "$srv" 2>/dev/null || true
+    j=0
+    while kill -0 "$srv" 2>/dev/null; do
+        j=$((j + 1))
+        if [ "$j" -ge 180 ]; then
+            echo "ds4-server pid $srv ignored SIGTERM for 180s; not killing a Metal process" >&2
+            return 0
+        fi
+        sleep 1
+    done
+    wait "$srv" 2>/dev/null || true
+}
+on_exit() {
+    stop_server
+    rm -rf "$tmp"
+}
+trap on_exit EXIT
 
 # expect_refused NAME OUT CMD...: run CMD in the background with no input and
 # require a non-zero exit.  A regression that starts serving or waits for
@@ -130,19 +156,6 @@ grep -q 'not supported' "$tmp/srv.txt" || { cat "$tmp/srv.txt"; exit 1; }
 # port).  The server is stopped with SIGTERM and waited for, never killed.
 ./ds4-server -m "$model" -c 4096 --port 18191 > "$tmp/srv_plain.txt" 2>&1 &
 srv=$!
-stop_server() {
-    kill -TERM "$srv" 2>/dev/null || true
-    j=0
-    while kill -0 "$srv" 2>/dev/null; do
-        j=$((j + 1))
-        if [ "$j" -ge 180 ]; then
-            echo "ds4-server pid $srv ignored SIGTERM for 180s; not killing a Metal process"
-            exit 1
-        fi
-        sleep 1
-    done
-    wait "$srv" 2>/dev/null || true
-}
 i=0
 until curl -sf http://127.0.0.1:18191/v1/models > "$tmp/models.json" 2>/dev/null; do
     if ! kill -0 "$srv" 2>/dev/null; then
