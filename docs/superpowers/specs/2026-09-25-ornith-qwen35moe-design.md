@@ -108,8 +108,10 @@ Existing work, checked and not reused as a base:
   `weights_bind()` runs before the graph block. The repo already includes
   `.inc` files this way (`ds4_streaming_hotlist.inc`, `ds4_qwen4_unicode.inc`).
 - `ds4.c` gets one branch per dispatch point (engine open, session
-  create/free, forward, speculative cycle, payload save/load, context cap),
-  each calling into the `.inc`.
+  create/free, forward, speculative cycle, payload save/load, context cap).
+  Graph-level code lives in the `.inc`; session-level code (sync/eval
+  branches, the speculative cycle) stays in `ds4.c`, because the `.inc` is
+  included before `struct ds4_session`.
 - Metal changes are additive: new kernel entry points (or function constants)
   in `metal/qwen4.metal` and `metal/moe.metal`, and their wrappers in
   `ds4_metal.m` / `ds4_gpu.h`.
@@ -218,11 +220,14 @@ and `ds4_gpu_add_tensor`.
   prefill speed is measured.
 - **MTP block (`blk.40`).**
   1. `x = eh_proj . concat[RMSNorm(embed(tok)) * enorm, RMSNorm(h) * hnorm]`,
-     embedding half first.
+     embedding half first; `h` is the trunk hidden after `output_norm` (the
+     tensor the LM head reads, llama.cpp PR #24025).
   2. One full-attention layer with its own KV cache, then one MoE layer, using
      the layer-loop functions above with `il = 40`.
   3. `logits = output . (RMSNorm(x) * shared_head_norm)`.
-  4. Drafting chains `x` as the next step's `h`.
+  4. A deeper draft chains `RMSNorm(x) * shared_head_norm` (the step-3 head
+     input) as the next step's `h`. M2 drafts one token per cycle; deeper
+     drafts are an M4 lever.
 
 ### Fusions
 
@@ -236,14 +241,25 @@ A/B shows a gain.
   1. Embedding rows go into `R`.
   2. The 40 layers run over T rows.
   3. The last row's logits are computed.
-  4. The MTP block runs a catch-up pass over the chunk: `h` shifted right by one
-     fills the MTP KV cache for every prompt position, as llama.cpp does.
+  4. The MTP block runs a catch-up pass over the chunk: MTP KV row `p` comes
+     from `(token_p, h_{p-1})` at RoPE position `p`, with `h_{-1} = 0`, as
+     llama.cpp's draft-mtp does. Catch-up rows compute only their K/V; the
+     trunk keeps its post-norm rows and carries the last one to the next
+     forward. Qwen3.8 has no catch-up, so this is Ornith code.
 - **Decode with MTP.** Each cycle drafts one token with the MTP block, then
   verifies `[current, draft]` in one T=2 pass, snapshotting GDN state and conv
-  history after row 1. An accepted draft keeps both rows. A rejected draft
-  restores the snapshot and keeps one. This reuses the qwen4 speculative cycle
-  and its snapshot/swap machinery. Draft depth starts at 1 and follows measured
-  acceptance. At temperature 0 the output equals plain decoding.
+  history after the first row. An accepted draft keeps both rows. A rejected
+  draft restores the snapshot and keeps one. The cycle is
+  `ds4_session_qwen35_spec_cycle` in `ds4.c`, shaped like the qwen4 cycle
+  (whose snapshot helpers need hyper-connections and PLE); the GDN kernels'
+  after-first-row snapshot is reused. The verify runs its attention, dense
+  projections and GDN layers one row per dispatch (T=1 and T=2 pick different
+  matvec kernels, and the GDN mixer fuses its input projections only for
+  T=1), so each row equals plain decoding bit for bit; the experts stay
+  batched. Drafts are accepted when they are the target argmax (greedy and
+  opportunistic sampling); `--mtp-exact-sampling` is refused. Draft depth
+  starts at 1 and follows measured acceptance. At temperature 0 the output
+  equals plain decoding.
 - **Sessions.** `ds4_session` reuses the qwen4 graph member, dispatched by
   family (Appendix B).
 - **Live prefix reuse.** The server's session sync applies unchanged.
