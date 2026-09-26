@@ -7645,7 +7645,47 @@ static void test_run_entry(const ds4_test_entry *entry) {
     fputc('\n', stderr);
 }
 
+/* Model-free Ornith render harness for tests/ornith/chat/check_render.py:
+ * parse one request body with the server's own parser under the Ornith
+ * flavor and print the rendered prompt text. */
+static int test_qwen35_render_main(const char *path, const char *api) {
+    const bool anthropic = api && !strcmp(api, "--anthropic");
+    if (api && !anthropic) {
+        fprintf(stderr, "ds4_test: unknown --qwen35-render option %s\n", api);
+        return 2;
+    }
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        perror(path);
+        return 2;
+    }
+    buf body = {0};
+    char chunk[4096];
+    size_t n;
+    while ((n = fread(chunk, 1, sizeof(chunk), fp)) > 0) buf_append(&body, chunk, n);
+    fclose(fp);
+    g_server_qwen_flavor = SERVER_QWEN_FLAVOR_ORNITH;
+    request r;
+    char err[256] = {0};
+    const char *text = body.ptr ? body.ptr : "";
+    const bool ok = anthropic ?
+        parse_anthropic_request(NULL, NULL, text, 256, 262144, &r, err, sizeof(err)) :
+        parse_chat_request(NULL, NULL, text, 256, 262144, &r, err, sizeof(err));
+    g_server_qwen_flavor = SERVER_QWEN_FLAVOR_QWEN38;
+    buf_free(&body);
+    if (!ok) {
+        fprintf(stderr, "ds4_test: %s\n", err);
+        return 1;
+    }
+    fputs(r.prompt_text, stdout);
+    request_free(&r);
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if ((argc == 3 || argc == 4) && !strcmp(argv[1], "--qwen35-render")) {
+        return test_qwen35_render_main(argv[2], argc == 4 ? argv[3] : NULL);
+    }
     if (argc == 4 && (!strcmp(argv[1], "--ds41-render") ||
                       !strcmp(argv[1], "--ds41-render-anthropic"))) {
         ds4_think_mode mode;
