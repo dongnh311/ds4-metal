@@ -44938,6 +44938,9 @@ static void chat_push_think_prefix(const ds4_vocab *vocab,
             token_vec_push(out, vocab->system_id);
             bpe_tokenize_text(vocab, effort, out);
         }
+    } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35_MOE) {
+        /* Ornith renders its effort inside the ChatML system turn; the
+         * DeepSeek max prefix is not part of its template. */
     } else if (think_mode == DS4_THINK_MAX) {
         bpe_tokenize_text(vocab, DS4_REASONING_EFFORT_MAX_PREFIX, out);
     }
@@ -44954,6 +44957,35 @@ static const char *DS4_QWEN4_REASONING_XHIGH =
 static const char *DS4_QWEN4_REASONING_LOW =
     "Reasoning effort is set to low. Keep your thinking brief and focused, "
     "moving directly to the conclusion without unnecessary elaboration.";
+
+/* Ornith's embedded template (froggeric v22.4.1) appends this block to the
+ * system turn unless the caller passes terse=false. */
+#define DS4_QWEN35_TERSE_CORE \
+    "Never: open with preamble or pleasantries; restate the question; add filler transitions; " \
+    "hedge with niceties; or repeat a point you've already made.\n" \
+    "Always: keep essential steps, caveats, uncertainties, and specifics \xe2\x80\x94 never drop " \
+    "correctness or a needed warning for brevity. Keep the final answer lean. Use the least structure " \
+    "that conveys it (plain prose when short; lists or code only when they earn their place). If " \
+    "genuinely uncertain, say so and explain why \xe2\x80\x94 never omit uncertainty for the sake of " \
+    "brevity.\n" \
+    "If a user request is genuinely ambiguous, ask a sharp question, don't guess."
+
+const char *ds4_qwen35_terse_text(bool think) {
+    return think ?
+        "Answer directly, after thinking. Lead with the answer, then only what it needs to be correct "
+        "and usable.\n" DS4_QWEN35_TERSE_CORE :
+        "Answer directly and concisely. Give the answer with only what it needs to be correct and "
+        "usable.\n" DS4_QWEN35_TERSE_CORE;
+}
+
+/* The CLI and the agent have no "effort was given" signal and default to
+ * DS4_THINK_HIGH, which therefore renders Ornith's default medium effort
+ * (no line); --think-max gives the xhigh line, a low level the low line. */
+static const char *qwen35_engine_effort_text(ds4_think_mode mode) {
+    if (mode == DS4_THINK_MAX) return DS4_QWEN4_REASONING_XHIGH;
+    if (mode == DS4_THINK_LOW) return DS4_QWEN4_REASONING_LOW;
+    return NULL;
+}
 
 static void qwen4_chat_open(const ds4_vocab *vocab, const char *role, token_vec *out) {
     token_vec_push(out, vocab->im_start_id);
@@ -44991,18 +45023,41 @@ static void qwen4_chat_system(const ds4_vocab *vocab, const char *system, ds4_th
     qwen4_chat_close(vocab, out);
 }
 
+/* Ornith's system turn: [effort "\n\n"] [trimmed system "\n\n"] terse block.
+ * The template emits it even without a system prompt.  The content is one
+ * BPE call so it tokenizes like the server's rendered text. */
+static void qwen35_chat_system(const ds4_vocab *vocab, const char *system, ds4_think_mode think_mode,
+                               token_vec *out) {
+    const bool think = ds4_think_mode_enabled(think_mode);
+    const char *effort = think ? qwen35_engine_effort_text(think_mode) : NULL;
+    const char *terse = ds4_qwen35_terse_text(think);
+    const char *s = system ? system : "";
+    while (*s && isspace((unsigned char)*s)) s++;
+    size_t n = strlen(s);
+    while (n > 0 && isspace((unsigned char)s[n - 1])) n--;
+    const size_t cap = (effort ? strlen(effort) + 2u : 0u) + n + 2u + strlen(terse) + 1u;
+    char *text = xmalloc(cap);
+    snprintf(text, cap, "%s%s%.*s%s%s", effort ? effort : "", effort ? "\n\n" : "",
+             (int)n, s, n ? "\n\n" : "", terse);
+    qwen4_chat_open(vocab, "system", out);
+    bpe_tokenize_text(vocab, text, out);
+    qwen4_chat_close(vocab, out);
+    free(text);
+}
+
 static void encode_chat_prompt(
         const ds4_vocab *vocab,
         const char      *system,
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_uses_qwen35_text()) {
         if (vocab->im_start_id < 0 || vocab->im_end_id < 0 ||
             vocab->think_start_id < 0 || vocab->think_end_id < 0) {
             ds4_die("this tokenizer does not provide the Qwen chat markers; use raw prompt tokenization");
         }
-        qwen4_chat_system(vocab, system, think_mode, out);
+        if (ds4_model_is_qwen35moe()) qwen35_chat_system(vocab, system, think_mode, out);
+        else qwen4_chat_system(vocab, system, think_mode, out);
         qwen4_chat_open(vocab, "user", out);
         bpe_tokenize_text(vocab, prompt, out);
         qwen4_chat_close(vocab, out);
@@ -45194,7 +45249,7 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     if (!role) role = "user";
     if (!content) content = "";
 
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_uses_qwen35_text()) {
         if (!strcmp(role, "tool") || !strcmp(role, "function")) {
             qwen4_chat_open(vocab, "user", tokens);
             bpe_tokenize_text(vocab, "<tool_response>\n", tokens);
@@ -45260,7 +45315,7 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 }
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_uses_qwen35_text()) {
         qwen4_chat_assistant_prefix(&e->vocab, think_mode, tokens);
         return;
     }
@@ -62548,7 +62603,10 @@ uint32_t ds4_think_max_min_context(void) {
 }
 
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size) {
+    /* The clamp protects DeepSeek's max-effort prefix; Ornith's max is its
+     * template's xhigh line, valid at any context. */
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 &&
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_QWEN35_MOE &&
         mode == DS4_THINK_MAX && (uint32_t)(ctx_size > 0 ? ctx_size : 0) < DS4_THINK_MAX_MIN_CONTEXT) {
         return DS4_THINK_HIGH;
     }
@@ -74514,6 +74572,16 @@ bool ds4_engine_is_qwen4(ds4_engine *e) {
 
 bool ds4_engine_is_qwen35moe(ds4_engine *e) {
     return e && ds4_model_is_qwen35moe();
+}
+
+bool ds4_engine_uses_qwen35_text(ds4_engine *e) {
+    (void)e;
+    return ds4_model_uses_qwen35_text();
+}
+
+const char *ds4_engine_reasoning_effort_text(ds4_engine *e, ds4_think_mode mode) {
+    (void)e;
+    return ds4_model_is_qwen35moe() ? qwen35_engine_effort_text(mode) : ds4_qwen4_reasoning_effort_text(mode);
 }
 
 /* The official template's default effort is xhigh; medium adds no text. */
