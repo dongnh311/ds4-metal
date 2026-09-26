@@ -132,3 +132,44 @@ kernel void kernel_qwen35_gdn_out(
         o[base + i] = o[base + i] * r * weight[tiisg * npt + i] * qwen4_silu(z[base + i]);
     }
 }
+
+/* --- MTP input ------------------------------------------------------------ */
+
+struct ds4_metal_args_qwen35_mtp_concat {
+    uint32_t n_embd;
+    uint32_t n_tokens;
+    float    eps;
+};
+
+/* The MTP block's input row: [RMSNorm(e) * enorm | RMSNorm(h) * hnorm],
+ * embedding half first, as llama.cpp's qwen35moe graph_mtp concatenates
+ * them.  One threadgroup of 256 threads per (half, token). */
+kernel void kernel_qwen35_mtp_concat(
+        constant ds4_metal_args_qwen35_mtp_concat & args,
+        device float       *cat,     /* [T][2E] */
+        device const float *e,       /* [T][E] token embeddings */
+        device const float *h,       /* [T][E] trunk hidden, post output_norm */
+        device const float *enorm,   /* [E] */
+        device const float *hnorm,   /* [E] */
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint half_ = tgpig.x;
+    const uint tok = tgpig.y;
+    if (half_ > 1u || tok >= args.n_tokens) return;
+    const uint E = args.n_embd;
+    device const float *x = (half_ ? h : e) + (uint64_t)tok * E;
+    device const float *w = half_ ? hnorm : enorm;
+    device float *y = cat + (uint64_t)tok * 2u * E + half_ * E;
+    threadgroup float partial[8];
+    float ss = 0.0f;
+    for (uint i = tid; i < E; i += 256u) ss += x[i] * x[i];
+    ss = simd_sum(ss);
+    if (tiisg == 0) partial[sgitg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.0f;
+    for (uint s = 0; s < 8u; s++) total += partial[s];
+    const float r = rsqrt(total / (float)E + args.eps);
+    for (uint i = tid; i < E; i += 256u) y[i] = x[i] * r * w[i];
+}

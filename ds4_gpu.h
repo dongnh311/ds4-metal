@@ -3499,6 +3499,12 @@ int ds4_gpu_qwen35_gdn_out_tensor(
         ds4_gpu_tensor *o, const ds4_gpu_tensor *z,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,
         uint32_t n_tokens, uint32_t n_head, uint32_t head_dim, float eps);
+/* Ornith MTP input rows: cat[t] = [RMSNorm(e_t) * enorm | RMSNorm(h_t) * hnorm]
+ * (cat [T][2E], e and h [T][E]; enorm/hnorm F32 in the model map). */
+int ds4_gpu_qwen35_mtp_concat_tensor(
+        ds4_gpu_tensor *cat, const ds4_gpu_tensor *e, const ds4_gpu_tensor *h,
+        const void *model_map, uint64_t model_size, uint64_t enorm_offset, uint64_t hnorm_offset,
+        uint32_t n_embd, uint32_t n_tokens, float eps);
 int ds4_gpu_qwen4_ple_gate_tensor(
         ds4_gpu_tensor *gated, ds4_gpu_tensor *normed, const ds4_gpu_tensor *R,
         const ds4_gpu_tensor *key, const ds4_gpu_tensor *value,
