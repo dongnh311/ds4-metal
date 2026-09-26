@@ -1291,6 +1291,9 @@ static bool model_alias_disables_thinking(const char *model) {
             !strcmp(model, "qwen3.8-flash-next-no-think") ||
             !strcmp(model, "qwen3.8-flash-next-nothink") ||
             !strcmp(model, "qwen/qwen3.8-flash-next-chat") ||
+            !strcmp(model, "ornith-1.5-35b-a3b-chat") ||
+            !strcmp(model, "ornith-1.5-35b-a3b-no-think") ||
+            !strcmp(model, "ornith-1.5-35b-a3b-nothink") ||
             !strcmp(model, "glm-5.2-chat") ||
             !strcmp(model, "glm-5.2-no-think") ||
             !strcmp(model, "glm-5.2-nothink") ||
@@ -1306,6 +1309,7 @@ static bool model_alias_enables_thinking(const char *model) {
            (!strcmp(model, "deepseek-reasoner") ||
             !strcmp(model, "qwen3.8-flash-next-reasoner") ||
             !strcmp(model, "qwen/qwen3.8-flash-next-reasoner") ||
+            !strcmp(model, "ornith-1.5-35b-a3b-reasoner") ||
             !strcmp(model, "glm-5.2-reasoner") ||
             !strcmp(model, "zai/glm-5.2-reasoner") ||
             !strcmp(model, "glm-5.3-flash-reasoner") ||
@@ -1322,6 +1326,7 @@ static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
 
 static const char *server_model_id_from_engine(ds4_engine *engine) {
     if (ds4_engine_is_deepseek41(engine)) return "deepseek-v4.1-flash";
+    if (ds4_engine_is_qwen35moe(engine)) return "ornith-1.5-35b-a3b";
     if (ds4_engine_is_qwen4(engine)) return "qwen3.8-flash-next";
     if (ds4_engine_is_glm53(engine)) return "glm-5.3-flash";
     if (ds4_engine_is_glm_dsa(engine)) return "glm-5.2";
@@ -1341,6 +1346,11 @@ static bool server_model_alias_known(const char *id) {
             !strcmp(id, "qwen/qwen3.8-flash-next") ||
             !strcmp(id, "qwen/qwen3.8-flash-next-chat") ||
             !strcmp(id, "qwen/qwen3.8-flash-next-reasoner") ||
+            !strcmp(id, "ornith-1.5-35b-a3b") ||
+            !strcmp(id, "ornith-1.5-35b-a3b-chat") ||
+            !strcmp(id, "ornith-1.5-35b-a3b-no-think") ||
+            !strcmp(id, "ornith-1.5-35b-a3b-nothink") ||
+            !strcmp(id, "ornith-1.5-35b-a3b-reasoner") ||
             !strcmp(id, "deepseek-v4-pro") ||
             !strcmp(id, "glm-5.2") ||
             !strcmp(id, "glm-5.2-chat") ||
@@ -15850,6 +15860,12 @@ static bool send_models(server *s, int fd) {
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
     if (ds4_engine_is_deepseek41(s->engine)) {
         append_model_json(&b, s, server_model_id_from_engine(s->engine));
+    } else if (ds4_engine_is_qwen35moe(s->engine)) {
+        append_model_json(&b, s, "ornith-1.5-35b-a3b");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "ornith-1.5-35b-a3b-chat");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "ornith-1.5-35b-a3b-reasoner");
     } else if (ds4_engine_is_qwen4(s->engine)) {
         append_model_json(&b, s, "qwen3.8-flash-next");
         buf_putc(&b, ',');
@@ -16604,13 +16620,10 @@ int main(int argc, char **argv) {
     } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         return 1;
     }
-    /* The server's chat ids, tool syntax and disk KV are not wired for
-     * Ornith yet. */
-    if (ds4_engine_is_qwen35moe(engine)) {
-        fprintf(stderr, "ds4-server: Ornith-1.5-35B-A3B serving arrives in milestone M3; use ./ds4 for now\n");
-        ds4_engine_close(engine);
-        return 1;
-    }
+    /* Ornith renders its own ChatML dialect (spec §5); every other engine
+     * keeps the Qwen3.8 flavor. */
+    g_server_qwen_flavor = ds4_engine_is_qwen35moe(engine) ?
+        SERVER_QWEN_FLAVOR_ORNITH : SERVER_QWEN_FLAVOR_QWEN38;
 
     if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
         ds4_dist_generation_options gen = {
@@ -24119,6 +24132,31 @@ static void test_kv_cache_lookup_separates_qwen38_and_ornith(void) {
     rmdir(dir);
 }
 
+/* Ornith ids: the aliases are known, toggle thinking like Qwen3.8's, and an
+ * explicit thinking field wins over an alias. */
+static void test_ornith_model_ids(void) {
+    static const char *ids[] = {"ornith-1.5-35b-a3b", "ornith-1.5-35b-a3b-chat", "ornith-1.5-35b-a3b-reasoner",
+                                "ornith-1.5-35b-a3b-nothink", "ornith-1.5-35b-a3b-no-think"};
+    for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) TEST_ASSERT(server_model_alias_known(ids[i]));
+    TEST_ASSERT(!model_alias_disables_thinking("ornith-1.5-35b-a3b"));
+    TEST_ASSERT(model_alias_disables_thinking("ornith-1.5-35b-a3b-chat"));
+    TEST_ASSERT(model_alias_disables_thinking("ornith-1.5-35b-a3b-nothink"));
+    TEST_ASSERT(model_alias_disables_thinking("ornith-1.5-35b-a3b-no-think"));
+    TEST_ASSERT(model_alias_enables_thinking("ornith-1.5-35b-a3b-reasoner"));
+    TEST_ASSERT(!model_alias_enables_thinking("ornith-1.5-35b-a3b"));
+    g_server_qwen_flavor = SERVER_QWEN_FLAVOR_ORNITH;
+    ds4_think_mode mode = DS4_THINK_HIGH;
+    char *p = test_ornith_prompt("chat", "{\"model\":\"ornith-1.5-35b-a3b-chat\","
+                                         "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}", &mode);
+    TEST_ASSERT(p && mode == DS4_THINK_NONE && ornith_test_ends_with(p, "<think>\n\n</think>\n\n"));
+    free(p);
+    p = test_ornith_prompt("chat", "{\"model\":\"ornith-1.5-35b-a3b-chat\",\"think\":true,"
+                                   "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}", &mode);
+    TEST_ASSERT(p && mode == DS4_THINK_MEDIUM);
+    free(p);
+    g_server_qwen_flavor = SERVER_QWEN_FLAVOR_QWEN38;
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_deepseek41_server_stream();
     test_deepseek41_server_tools();
@@ -24303,6 +24341,7 @@ static void ds4_server_unit_tests_run(void) {
     test_ornith_anthropic_tool_results_match_openai();
     test_ornith_tool_turn_visible_text_prefixes_next_render();
     test_kv_cache_lookup_separates_qwen38_and_ornith();
+    test_ornith_model_ids();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

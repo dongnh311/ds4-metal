@@ -2,10 +2,11 @@
 # Loader checks for Ornith (qwen35moe): the 23G GGUF inspects cleanly, and a
 # wrong metadata value, an unsupported expert type (trunk or MTP) or a type
 # mismatch between fused tensors fails with a message naming the key, the
-# tier or the tensors.  The Metal-only open gate also
-# refuses a non-Metal backend, --batched-session, a context above the
-# native 262144, --mtp-model and --mtp-exact-sampling, and ds4-server /
-# ds4-agent refuse Ornith until milestone M3.
+# tier or the tensors.  The Metal-only open gate also refuses a non-Metal
+# backend, --batched-session, a context above the native 262144,
+# --mtp-model and --mtp-exact-sampling.  Since milestone M3, ds4-server
+# serves Ornith under its own ids and ds4-agent runs a short
+# non-interactive turn.
 # Needs a built ./ds4, ./ds4-server and ./ds4-agent and DS4_ORNITH_MODEL.
 set -eu
 model=${DS4_ORNITH_MODEL:?set DS4_ORNITH_MODEL to the 23G ICE GGUF}
@@ -43,6 +44,39 @@ expect_refused() {
     if [ "$rc" -eq 0 ]; then
         cat "$out"
         echo "$name accepted Ornith"
+        exit 1
+    fi
+}
+
+# expect_ok NAME OUT CMD...: run CMD in the background with no input and
+# require exit 0 within 600s; SIGTERM (never -9) on a hang, then fail.
+expect_ok() {
+    name=$1
+    out=$2
+    shift 2
+    "$@" < /dev/null > "$out" 2>&1 &
+    pid=$!
+    rc=""
+    i=0
+    while [ "$i" -lt 600 ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rc=0
+            wait "$pid" || rc=$?
+            break
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    if [ -z "$rc" ]; then
+        kill -TERM "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        cat "$out"
+        echo "$name did not exit within 600s"
+        exit 1
+    fi
+    if [ "$rc" -ne 0 ]; then
+        cat "$out"
+        echo "$name failed ($rc)"
         exit 1
     fi
 }
@@ -92,13 +126,74 @@ expect_refused "ds4-server --batched-session 2" "$tmp/srv.txt" \
     ./ds4-server -m "$model" --batched-session 2 --port 18191
 grep -q 'not supported' "$tmp/srv.txt" || { cat "$tmp/srv.txt"; exit 1; }
 
-# ds4-server and ds4-agent refuse Ornith until milestone M3.
-expect_refused "ds4-server" "$tmp/srv_plain.txt" ./ds4-server -m "$model" --port 18191
-grep -q 'ds4-server: Ornith-1.5-35B-A3B serving arrives in milestone M3' "$tmp/srv_plain.txt" ||
-    { cat "$tmp/srv_plain.txt"; exit 1; }
-expect_refused "ds4-agent" "$tmp/agent.txt" ./ds4-agent -m "$model"
-grep -q 'ds4-agent: Ornith-1.5-35B-A3B agent mode arrives in milestone M3' "$tmp/agent.txt" ||
-    { cat "$tmp/agent.txt"; exit 1; }
+# M3: ds4-server serves Ornith under its own ids (port 18191, never a gateway
+# port).  The server is stopped with SIGTERM and waited for, never killed.
+./ds4-server -m "$model" -c 4096 --port 18191 > "$tmp/srv_plain.txt" 2>&1 &
+srv=$!
+stop_server() {
+    kill -TERM "$srv" 2>/dev/null || true
+    j=0
+    while kill -0 "$srv" 2>/dev/null; do
+        j=$((j + 1))
+        if [ "$j" -ge 180 ]; then
+            echo "ds4-server pid $srv ignored SIGTERM for 180s; not killing a Metal process"
+            exit 1
+        fi
+        sleep 1
+    done
+    wait "$srv" 2>/dev/null || true
+}
+i=0
+until curl -sf http://127.0.0.1:18191/v1/models > "$tmp/models.json" 2>/dev/null; do
+    if ! kill -0 "$srv" 2>/dev/null; then
+        cat "$tmp/srv_plain.txt"
+        echo "ds4-server exited during startup"
+        exit 1
+    fi
+    i=$((i + 1))
+    if [ "$i" -ge 300 ]; then
+        stop_server
+        cat "$tmp/srv_plain.txt"
+        echo "ds4-server did not answer within 300s"
+        exit 1
+    fi
+    sleep 1
+done
+python3 - "$tmp/models.json" <<'EOF' || { stop_server; exit 1; }
+import json, sys
+ids = [m["id"] for m in json.load(open(sys.argv[1]))["data"]]
+want = ["ornith-1.5-35b-a3b", "ornith-1.5-35b-a3b-chat", "ornith-1.5-35b-a3b-reasoner"]
+if ids != want:
+    sys.exit(f"/v1/models lists {ids}, expected {want}")
+EOF
+curl -sf http://127.0.0.1:18191/v1/models/ornith-1.5-35b-a3b-nothink > /dev/null ||
+    { stop_server; echo "alias ornith-1.5-35b-a3b-nothink is unknown"; exit 1; }
+curl -sf http://127.0.0.1:18191/v1/chat/completions -H 'Content-Type: application/json' \
+    -d '{"messages":[{"role":"user","content":"Say ok."}],"max_tokens":8,"temperature":0,"think":false}' \
+    > "$tmp/chat.json" || { stop_server; cat "$tmp/srv_plain.txt"; echo "chat request failed"; exit 1; }
+python3 - "$tmp/chat.json" <<'EOF' || { stop_server; exit 1; }
+import json, sys
+r = json.load(open(sys.argv[1]))
+if r.get("model") != "ornith-1.5-35b-a3b":
+    sys.exit(f"default model id {r.get('model')!r}")
+if not (r["choices"][0]["message"].get("content") or "").strip():
+    sys.exit("empty reply")
+EOF
+stop_server
+
+# M3: ds4-agent runs one short non-interactive turn (scratch directory, so a
+# tool call cannot touch the repository).
+root=$(pwd)
+mkdir -p "$tmp/agent-cwd"
+( cd "$tmp/agent-cwd" && expect_ok "ds4-agent" "$tmp/agent.txt" "$root/ds4-agent" -m "$model" \
+    --non-interactive --nothink -n 64 -p 'Reply with the single word: ready. Do not call any tool.' ) || exit 1
+if grep -q 'arrives in milestone M3' "$tmp/agent.txt"; then
+    cat "$tmp/agent.txt"
+    echo "ds4-agent still refuses Ornith"
+    exit 1
+fi
+# the answer's wording is the model's business: a soft check, logged only
+grep -qi 'ready' "$tmp/agent.txt" || { cat "$tmp/agent.txt"; echo "WARN: ds4-agent did not answer 'ready'"; }
 
 # M2: --mtp runs the embedded blk.40 head; an external MTP model and exact
 # speculative sampling stay refused.

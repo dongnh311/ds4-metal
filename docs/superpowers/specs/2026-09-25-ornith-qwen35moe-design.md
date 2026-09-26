@@ -324,10 +324,12 @@ A/B shows a gain.
     and adds no terse block.
   - Server model-name aliases for Qwen3.8 (`qwen3.8-flash-next-*`) are not
     predicate sites; Ornith gets its own alias list.
-- **Server.** Model id `ornith-1.5-35b-a3b` with the `-chat`, `-reasoner` and
-  `-nothink` aliases, following the Qwen3.8 pattern.
-  `SERVER_MODEL_SYNTAX_QWEN` for tool calls. Gateway registry changes belong to
-  the deploy step after v2.
+- **Server.** Model id `ornith-1.5-35b-a3b` with the `-chat`, `-reasoner`,
+  `-nothink` and `-no-think` aliases, following the Qwen3.8 pattern: -chat,
+  -nothink and -no-think turn thinking off and -reasoner on when the request
+  sets no thinking field; `/v1/models` lists the base id, `-chat` and
+  `-reasoner`. `SERVER_MODEL_SYNTAX_QWEN` for tool calls with the Ornith
+  render flavor. Gateway registry changes belong to the deploy step after v2.
 
 ## 6. Error handling
 
