@@ -275,17 +275,45 @@ A/B shows a gain.
   on top of 21 GiB of weights. kv-grow is not used in v1. The qwen4 FP8/Q4 KV
   modes remain available as a speed lever (section 8, gate 3).
 - **Chat rendering.**
-  - Reuse the Qwen3.8 ChatML and XML tool-call renderer.
-  - Ornith differences, gated by family: thinking on by default with the
-    generation prompt opened by `<think>\n`, thinking off rendered as
-    `<think>\n\n</think>\n\n`, and the tool schema placement of the embedded
-    template.
-  - The Qwen3.8 "Reasoning effort is set to xhigh" system line is not added.
-    It is added in three places (`encode_chat_prompt` through
-    `qwen4_chat_system`, the agent's system tokens, and the server's
-    `render_qwen_chat_prompt_text`). All three get the text from
-    `ds4_qwen4_reasoning_effort_text()`, which gains a family check and returns
-    NULL for Ornith. For Qwen3.8 the output does not change.
+  - Reuse the Qwen3.8 ChatML turns, XML tool-call syntax, parser and live
+    continuation tails (`SERVER_MODEL_SYNTAX_QWEN`). The generation prompt
+    (`<think>\n`, or `<think>\n\n</think>\n\n` with thinking off) already
+    equals the embedded template's.
+  - The embedded template (froggeric v22.4.1) differs in the system turn,
+    tool results and assistant history. ds4-server renders an Ornith flavor,
+    chosen once at startup from the engine, that equals the template on the
+    golden set in `tests/ornith/chat/golden/` (`make test-ornith-render`):
+    - a "terse" block appended to the system turn (kwarg `terse`, default
+      true; its lead line depends on thinking);
+    - the template's tool instructions (thinking-dependent) and `tool | tojson`
+      spacing for tool schemas and non-string arguments, in the order given;
+      Anthropic tools keep ds4's mapping `{"type": "function", "function":
+      <tool as given>}` (`input_schema` is not renamed);
+    - reasoning effort: an absent or null effort is the template's medium (no
+      line); high/xhigh/max give the existing xhigh line and low/minimal the
+      low line, the same strings Qwen3.8 uses; none/off turn thinking off.
+      `ds4_qwen4_reasoning_effort_text()` is unchanged; the Ornith default
+      comes from the request parsers;
+    - only leading system/developer messages merge into the system turn;
+      later ones render in place; Anthropic's `system` comes first;
+    - tool results trimmed, with the template's tool-error warning (the
+      count runs across assistant turns and into live tails);
+    - assistant history trimmed; `preserve_thinking` (or
+      `preserve_reasoning`) false drops reasoning before the last user query.
+  - Not rendered like the template, by decision: `<|think_*|>` tags inside
+    messages (plain text), unknown roles (dropped), the truncation and
+    tool-suppression kwargs (ignored), `tool_call_format` json (HTTP 400),
+    think tags inside assistant content (copied), the `thinking`/`reasoning`
+    history fields (only `reasoning_content`), closing-sentinel escaping and
+    sampled tool-text replay (kept from Qwen3.8), a generation prompt only
+    when an assistant turn is pending, ASCII-only trimming, and numbers
+    printed as written by tojson.
+  - CLI and agent: `encode_chat_prompt` renders the Ornith system turn with
+    the terse block; the frontends' default think mode stands for "no effort
+    given" (medium), `--think-max` gives the xhigh line
+    (`ds4_engine_reasoning_effort_text()`), and `ds4_think_mode_for_context`
+    does not clamp max for Ornith. The agent keeps the Qwen3.8 tools prompt
+    and adds no terse block.
   - Server model-name aliases for Qwen3.8 (`qwen3.8-flash-next-*`) are not
     predicate sites; Ornith gets its own alias list.
 - **Server.** Model id `ornith-1.5-35b-a3b` with the `-chat`, `-reasoner` and
@@ -369,7 +397,8 @@ PPL of the tier: 2.194208 x 1.0018 = 2.1982 for 23G.
    way round.
 5. **Chat.** ds4 renderings match jinja2 renderings of the embedded template
    for a fixed conversation set: system prompt, tools, multi-turn with tool
-   results, thinking on and off.
+   results, thinking on and off (`tests/ornith/chat/`: 26 goldens rendered
+   from the GGUF's template, compared by `make test-ornith-render`).
 
 ### Gate 2: quality (B)
 

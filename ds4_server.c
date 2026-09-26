@@ -3178,10 +3178,51 @@ static char *pyjson_from_raw(const char *raw) {
     return buf_take(&b);
 }
 
+/* Tool calls as the Ornith template renders them: arguments in the order the
+ * call gives them (no schema reordering), non-string values through tojson.
+ * Sampled tool text replays verbatim, as for Qwen3.8, so an echoed turn
+ * matches the live KV. */
+static void append_ornith_tool_calls_text(buf *b, const tool_calls *calls, bool has_content) {
+    if (!calls || calls->len == 0) return;
+    if (calls->raw_tool_text && calls->raw_tool_text[0]) {
+        buf_puts(b, calls->raw_tool_text);
+        return;
+    }
+    for (int i = 0; i < calls->len; i++) {
+        const tool_call *tc = &calls->v[i];
+        if (i == 0) buf_puts(b, has_content ? "\n\n<tool_call>\n<function=" : "<tool_call>\n<function=");
+        else buf_puts(b, "\n<tool_call>\n<function=");
+        buf_puts(b, tc->name ? tc->name : "");
+        buf_puts(b, ">\n");
+        json_args args = {0};
+        if (json_args_parse(tc->arguments, &args)) {
+            for (int k = 0; k < args.len; k++) {
+                const json_arg *arg = &args.v[k];
+                buf_puts(b, "<parameter=");
+                append_glm_tag_body_text(b, arg->key, ">");
+                buf_puts(b, ">\n");
+                char *py = arg->is_string ? NULL : pyjson_from_raw(arg->value);
+                append_glm_tag_body_text(b, arg->is_string ? arg->value : (py ? py : arg->value), "</parameter>");
+                free(py);
+                buf_puts(b, "\n</parameter>\n");
+            }
+            json_args_free(&args);
+        } else if (tc->arguments && tc->arguments[0]) {
+            /* not a JSON object: the template prints the raw text */
+            append_glm_tag_body_text(b, tc->arguments, "</function>");
+        }
+        buf_puts(b, "</function>\n</tool_call>");
+    }
+}
+
 /* Parameter values render as the template does: strings verbatim, other
  * JSON values as their (minified) JSON text. */
 static void append_qwen_tool_calls_text(buf *b, const tool_calls *calls, bool has_content,
                                         const tool_schema_orders *tool_orders) {
+    if (server_qwen_is_ornith()) {
+        append_ornith_tool_calls_text(b, calls, has_content);
+        return;
+    }
     if (!calls || calls->len == 0) return;
     if (calls->raw_tool_text && calls->raw_tool_text[0]) {
         buf_puts(b, calls->raw_tool_text);
@@ -3853,6 +3894,239 @@ static void append_ornith_tools_text(buf *b, const char *tool_schemas, bool thin
         "</IMPORTANT>");
 }
 
+/* ---- Ornith conversation body (template lines 222-459) ----------------- */
+
+typedef enum {
+    ORNITH_ITEM_SYSTEM,
+    ORNITH_ITEM_USER,
+    ORNITH_ITEM_ASSISTANT,
+    ORNITH_ITEM_TOOL,
+} ornith_item_kind;
+
+typedef struct {
+    ornith_item_kind kind;
+    int msg;            /* source message index */
+    const char *text;   /* system/user/tool text before trimming */
+    char *owned;        /* text assembled here, freed with the list */
+} ornith_item;
+
+typedef struct {
+    ornith_item *v;
+    int len;
+    int cap;
+} ornith_items;
+
+static void ornith_items_push(ornith_items *items, ornith_item_kind kind, int msg, const char *text, char *owned) {
+    if (items->len == items->cap) {
+        items->cap = items->cap ? items->cap * 2 : 16;
+        items->v = xrealloc(items->v, (size_t)items->cap * sizeof(items->v[0]));
+    }
+    items->v[items->len++] = (ornith_item){.kind = kind, .msg = msg, .text = owned ? owned : text, .owned = owned};
+}
+
+static void ornith_items_free(ornith_items *items) {
+    for (int i = 0; i < items->len; i++) free(items->v[i].owned);
+    free(items->v);
+    memset(items, 0, sizeof(*items));
+}
+
+static bool ornith_text_is_blank(const char *s) {
+    for (; s && *s; s++) {
+        if (!isspace((unsigned char)*s)) return false;
+    }
+    return true;
+}
+
+/* The template's message list from msgs[first..].  OpenAI tool messages are
+ * tool items.  An Anthropic user message with tool_result blocks becomes one
+ * tool item per block, then a user item with the text outside the blocks:
+ * what the OpenAI conversion of that message renders.  Roles the template
+ * would show as "[role]: ..." are dropped, as the Qwen3.8 renderer drops them. */
+static void ornith_items_build(ornith_items *items, const chat_msgs *msgs, int first) {
+    for (int i = first; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        const char *content = m->content ? m->content : "";
+        if (role_is_system(m->role)) {
+            ornith_items_push(items, ORNITH_ITEM_SYSTEM, i, content, NULL);
+        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
+            ornith_items_push(items, ORNITH_ITEM_TOOL, i, content, NULL);
+        } else if (!strcmp(m->role, "user") && m->tool_results_len > 0) {
+            const size_t len = strlen(content);
+            buf rest = {0};
+            size_t at = 0;
+            for (int k = 0; k < m->tool_results_len; k++) {
+                const tool_result_span *sp = &m->tool_results[k];
+                ornith_items_push(items, ORNITH_ITEM_TOOL, i, sp->content ? sp->content : "", NULL);
+                if (sp->begin > at && sp->begin <= len) buf_append(&rest, content + at, sp->begin - at);
+                if (sp->end > at) at = sp->end <= len ? sp->end : len;
+            }
+            if (at < len) buf_append(&rest, content + at, len - at);
+            if (rest.len && !ornith_text_is_blank(rest.ptr))
+                ornith_items_push(items, ORNITH_ITEM_USER, i, NULL, buf_take(&rest));
+            else
+                buf_free(&rest);
+        } else if (!strcmp(m->role, "user")) {
+            ornith_items_push(items, ORNITH_ITEM_USER, i, content, NULL);
+        } else if (!strcmp(m->role, "assistant")) {
+            ornith_items_push(items, ORNITH_ITEM_ASSISTANT, i, NULL, NULL);
+        }
+    }
+}
+
+/* last_query_index: the last user item that is not a bare <tool_response>
+ * wrapper; without one, 0, or the last index once the list has more than 51
+ * items (template lines 222-240). */
+static int ornith_last_query(const ornith_items *items) {
+    static const char open[] = "<tool_response>";
+    static const char close[] = "</tool_response>";
+    for (int k = items->len - 1; k >= 0; k--) {
+        if (items->v[k].kind != ORNITH_ITEM_USER) continue;
+        buf t = {0};
+        append_trimmed_text(&t, items->v[k].text);
+        const bool wrapped = t.len >= strlen(open) + strlen(close) &&
+                             !strncmp(t.ptr, open, strlen(open)) &&
+                             !strcmp(t.ptr + t.len - strlen(close), close);
+        buf_free(&t);
+        if (!wrapped) return k;
+    }
+    const int last = items->len - 1;
+    return last > 50 ? last : 0;
+}
+
+static bool ornith_has(const char *hay, const char *needle) {
+    return strstr(hay, needle) != NULL;
+}
+
+/* The template's tool-error test (lines 413-425) on the trimmed result.  The
+ * head is the first 120 characters (code points, as Python counts them) of
+ * the lowercased text; only ASCII is lowercased, and every signal is ASCII. */
+static bool ornith_tool_result_failed(const char *text) {
+    const size_t n = strlen(text);
+    char *lower = xmalloc(n + 1);
+    size_t head_end = n, chars = 0;
+    for (size_t i = 0; i < n; i++) {
+        const unsigned char c = (unsigned char)text[i];
+        lower[i] = (char)(c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c);
+        if ((c & 0xC0u) != 0x80u) {
+            if (chars == 120 && head_end == n) head_end = i;
+            chars++;
+        }
+    }
+    lower[n] = '\0';
+    char *head = xstrndup(lower, head_end);
+    const bool code_or_grep =
+        ornith_has(lower, "throw new ") || ornith_has(lower, "throw error") ||
+        ornith_has(lower, "console.error") || ornith_has(lower, "logger.error") ||
+        ornith_has(lower, "logging.error") || ornith_has(head, "import ") ||
+        ornith_has(head, "def ") || ornith_has(head, "function ");
+    const bool exit_code_zero = ornith_has(head, "exit code: 0") || ornith_has(head, "process exited with code 0");
+    const bool error_field_ok =
+        ornith_has(head, "\"error\": null") || ornith_has(head, "\"error\":null") ||
+        ornith_has(head, "\"error\": false") || ornith_has(head, "\"error\":false") ||
+        ornith_has(head, "\"error\": \"\"") || ornith_has(head, "\"error\":\"\"");
+    const bool strong =
+        (ornith_has(head, "\"error\":") && !error_field_ok) ||
+        ornith_has(head, "\"status\": \"error\"") || ornith_has(head, "\"status\":\"error\"") ||
+        ornith_has(head, "traceback (most recent call last):") || ornith_has(head, "command not found") ||
+        ornith_has(head, "invalid syntax") || ornith_has(head, "fatal:") ||
+        ((ornith_has(head, "exit code: ") || ornith_has(head, "process exited with code")) && !exit_code_zero) ||
+        !strncmp(head, "exception:", 10) || !strncmp(head, "failed to ", 10);
+    const bool weak = ornith_has(head, "error:") || ornith_has(head, "err!");
+    const bool weak_suppressed = ornith_has(head, "$ ") || ornith_has(head, "took ") || chars >= 600;
+    free(head);
+    free(lower);
+    return !code_or_grep && (strong || (weak && !weak_suppressed));
+}
+
+/* One tool result inside the open user turn: trimmed body, then the
+ * template's warning after one failure or a run of failures. */
+static void append_ornith_tool_response(buf *out, const char *trimmed, int failures) {
+    buf_puts(out, "\n<tool_response>\n");
+    append_glm_tag_body_text(out, trimmed, "</tool_response>");
+    if (failures >= 2) {
+        buf_printf(out, "\n\n\xe2\x9a\xa0\xef\xb8\x8f SYSTEM WARNING: %d consecutive tool errors detected. "
+                        "Your previous approach is incorrect. You MUST use a fundamentally different "
+                        "approach or corrected arguments.", failures);
+    } else if (failures == 1) {
+        buf_puts(out, "\n\n\xe2\x9a\xa0\xef\xb8\x8f SYSTEM WARNING: The previous tool call returned an error. "
+                      "Diagnose the failure and retry with completely corrected arguments.");
+    }
+    buf_puts(out, "\n</tool_response>");
+}
+
+/* One assistant turn: content trimmed (no trailing-whitespace carve-out),
+ * the reasoning block unless preserve_thinking is false and the turn comes
+ * before the last user query.  Content that already starts with a think tag
+ * is copied as Qwen3.8 copies it (spec §5), and sampled tool text replays. */
+static void append_ornith_assistant_message(buf *out, const chat_msg *m, bool keep_think) {
+    const char *content = m->content ? m->content : "";
+    const char *reasoning = m->reasoning ? m->reasoning : "";
+    buf body = {0};
+    append_trimmed_text(&body, content);
+    buf_puts(out, "<|im_start|>assistant\n");
+    if (keep_think && !text_starts_with_think_tag(content)) {
+        buf_puts(out, "<think>\n");
+        append_trimmed_text(out, reasoning);
+        /* sampled tool text already carries what followed the model's </think> */
+        const bool sampled_after_think = body.len == 0 && reasoning[0] &&
+            m->calls.raw_tool_text && m->calls.raw_tool_text[0];
+        buf_puts(out, sampled_after_think ? "\n</think>" : "\n</think>\n\n");
+    }
+    buf_append(out, body.ptr ? body.ptr : "", body.len);
+    append_ornith_tool_calls_text(out, &m->calls, body.len > 0);
+    buf_puts(out, "<|im_end|>\n");
+    buf_free(&body);
+}
+
+/* The conversation from msgs[first..], emitting only messages at index
+ * >= start.  The failure count and the last user query are computed from
+ * `first`, so a live tail renders the same bytes as the full prompt's end. */
+static void append_ornith_conversation(buf *out, const chat_msgs *msgs, int first, int start,
+                                       bool think, bool preserve_thinking) {
+    ornith_items items = {0};
+    ornith_items_build(&items, msgs, first);
+    const int last_query = preserve_thinking ? -1 : ornith_last_query(&items);
+    int failures = 0;
+    bool tool_open = false;
+    bool pending_assistant = false;
+    for (int k = 0; k < items.len; k++) {
+        const ornith_item *it = &items.v[k];
+        const bool emit = it->msg >= start;
+        if (it->kind == ORNITH_ITEM_TOOL) {
+            buf body = {0};
+            append_trimmed_text(&body, it->text);
+            const char *trimmed = body.ptr ? body.ptr : "";
+            failures = ornith_tool_result_failed(trimmed) ? failures + 1 : 0;
+            if (emit) {
+                if (!tool_open) buf_puts(out, "<|im_start|>user");
+                append_ornith_tool_response(out, trimmed, failures);
+                tool_open = true;
+                pending_assistant = true;
+            }
+            buf_free(&body);
+            continue;
+        }
+        if (tool_open) {
+            buf_puts(out, "<|im_end|>\n");
+            tool_open = false;
+        }
+        if (it->kind == ORNITH_ITEM_USER) failures = 0;
+        if (!emit) continue;
+        if (it->kind == ORNITH_ITEM_ASSISTANT) {
+            append_ornith_assistant_message(out, &msgs->v[it->msg], preserve_thinking || k > last_query);
+            pending_assistant = false;
+        } else {
+            buf_puts(out, it->kind == ORNITH_ITEM_SYSTEM ? "<|im_start|>system\n" : "<|im_start|>user\n");
+            append_trimmed_text(out, it->text);
+            buf_puts(out, "<|im_end|>\n");
+            if (it->kind == ORNITH_ITEM_USER) pending_assistant = true;
+        }
+    }
+    if (tool_open) buf_puts(out, "<|im_end|>\n");
+    if (pending_assistant) append_qwen_generation_prompt(out, think);
+    ornith_items_free(&items);
+}
+
 /* Ornith's system turn (template lines 132-221): effort line, tools block,
  * then the leading system/developer messages (each trimmed, joined by a
  * blank line) and the terse block.  Later system messages stay in place. */
@@ -3892,8 +4166,8 @@ static char *render_ornith_chat_prompt_text(const chat_msgs *msgs, const char *t
         buf_puts(&out, "<|im_end|>\n");
     }
     buf_free(&sc);
-    /* Task 4 replaces this Qwen3.8 body with the Ornith conversation */
-    append_qwen_conversation(&out, msgs, head, tool_orders, think);
+    (void)tool_orders;   /* Ornith keeps the call's argument order */
+    append_ornith_conversation(&out, msgs, head, head, think, opts->preserve_thinking);
     return buf_take(&out);
 }
 
@@ -4135,6 +4409,16 @@ static char *render_qwen_live_tool_tail(const chat_msgs *msgs, int start,
                                         ds4_think_mode think_mode) {
     buf out = {0};
     buf_puts(&out, "<|im_end|>\n");
+    if (server_qwen_is_ornith()) {
+        /* the tool-error count and the last user query depend on the turns
+         * before the tail: walk from the first non-system message, emit from
+         * start (template defaults; live tails carry no kwargs) */
+        int head = 0;
+        while (msgs && head < msgs->len && role_is_system(msgs->v[head].role)) head++;
+        append_ornith_conversation(&out, msgs, head, start > head ? start : head,
+                                   ds4_think_mode_enabled(think_mode), true);
+        return buf_take(&out);
+    }
     append_qwen_conversation(&out, msgs, start, tool_orders, ds4_think_mode_enabled(think_mode));
     return buf_take(&out);
 }
@@ -23642,6 +23926,171 @@ static void test_ornith_pyjson(void) {
     TEST_ASSERT(pyjson_from_raw("{\"a\":") == NULL);
 }
 
+/* The template's tool-error heuristic (lines 413-425) on trimmed results. */
+static void test_ornith_tool_error_heuristic(void) {
+    static const struct { const char *text; bool failed; } cases[] = {
+        {"Error: city not found", true},
+        {"{\"error\": \"file not found\", \"path\": \"/tmp/x\"}", true},
+        {"{\"temp_c\": 18, \"error\": null}", false},
+        {"{\"status\": \"error\", \"detail\": \"quota\"}", true},
+        {"Traceback (most recent call last):\n  File \"x.py\", line 1", true},
+        {"bash: foo: command not found", true},
+        {"fatal: not a git repository", true},
+        {"Process exited with code 1", true},
+        {"Exit code: 0\nok", false},
+        {"exception: boom", true},
+        {"Failed to open /tmp/x", true},
+        {"$ make\nerror: missing target", false},
+        {"Build took 3s; error: none", false},
+        {"def f():\n    raise ValueError('error: x')", false},
+        {"src/a.c:12: logger.error(\"x\")", false},
+        {"line1\nline2", false},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const bool got = ornith_tool_result_failed(cases[i].text);
+        if (got != cases[i].failed) fprintf(stderr, "ornith tool error case %zu: '%s' -> %d\n", i, cases[i].text, got);
+        TEST_ASSERT(got == cases[i].failed);
+    }
+    /* a weak error in output of 600 characters or more does not count */
+    buf big = {0};
+    buf_puts(&big, "error: first line\n");
+    while (big.len < 700) buf_puts(&big, "more output ");
+    TEST_ASSERT(!ornith_tool_result_failed(big.ptr));
+    buf_free(&big);
+    /* the head is 120 characters, not bytes: 100 two-byte characters, then a
+     * strong signal inside the first 120 characters */
+    buf wide = {0};
+    for (int i = 0; i < 100; i++) buf_puts(&wide, "\xc3\xa9");
+    buf_puts(&wide, " fatal: x");
+    TEST_ASSERT(ornith_tool_result_failed(wide.ptr));
+    buf_free(&wide);
+}
+
+/* Review Focus 2: a live tool tail counts the failures before it and is the
+ * exact suffix of the full render, so live KV and a later replay agree. */
+static void test_ornith_live_tail_continues_full_render(void) {
+    static const char *roles[] = {"user", "assistant", "tool", "assistant", "tool"};
+    static const char *texts[] = {
+        "Run the build.", "", "make: *** No rule to make target 'all'.\nerror: build failed",
+        "Retrying.", "Traceback (most recent call last):\n  File \"build.py\", line 3"};
+    chat_msgs msgs = {0};
+    for (int i = 0; i < 5; i++) {
+        chat_msg m = {0};
+        m.role = xstrdup(roles[i]);
+        m.content = xstrdup(texts[i]);
+        if (!strcmp(roles[i], "assistant")) {
+            tool_call tc = {0};
+            tc.id = xstrdup(i == 1 ? "c1" : "c2");
+            tc.name = xstrdup("run");
+            tc.arguments = xstrdup(i == 1 ? "{\"command\":\"make\"}" : "{\"command\":\"make all\",\"timeout\":30}");
+            tool_calls_push(&m.calls, tc);
+            m.reasoning = xstrdup("Use the tool.");
+        }
+        chat_msgs_push(&msgs, m);
+    }
+    static const char tail_head[] = "<|im_end|>\n<|im_start|>user\n<tool_response>\nTraceback";
+    g_server_qwen_flavor = SERVER_QWEN_FLAVOR_ORNITH;
+    char *full = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, NULL, DS4_THINK_MEDIUM);
+    char *tail = render_live_tool_tail_for_syntax(SERVER_MODEL_SYNTAX_QWEN, &msgs, 4, NULL, DS4_THINK_MEDIUM);
+    g_server_qwen_flavor = SERVER_QWEN_FLAVOR_QWEN38;
+    TEST_ASSERT(full && strstr(full, "The previous tool call returned an error.") != NULL);
+    TEST_ASSERT(tail && strstr(tail, "2 consecutive tool errors detected") != NULL);
+    TEST_ASSERT(tail && !strncmp(tail, tail_head, strlen(tail_head)));
+    TEST_ASSERT(full && tail && ornith_test_ends_with(full, tail));
+    TEST_ASSERT(full && strstr(full, "<parameter=timeout>\n30\n</parameter>") != NULL);
+    free(full);
+    free(tail);
+    chat_msgs_free(&msgs);
+}
+
+/* Review Focus 3: an Anthropic tool_result turn (a result block and a text
+ * block in one user message, system at the top level) renders the bytes of
+ * the OpenAI-shaped conversation. */
+static void test_ornith_anthropic_tool_results_match_openai(void) {
+    static const char anthropic[] =
+        "{\"max_tokens\":64,\"system\":\"You are a helpful assistant.\","
+        "\"tools\":[{\"name\":\"get_weather\",\"description\":\"Get the weather.\","
+        "\"input_schema\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}}}],"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"Weather in Paris?\"},"
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"Call the tool.\"},"
+        "{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"get_weather\",\"input\":{\"city\":\"Paris\"}}]},"
+        "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_1\","
+        "\"content\":\"Error: city not found\\n\"},{\"type\":\"text\",\"text\":\"Try Lyon.\"}]}]}";
+    static const char openai[] =
+        "{\"max_tokens\":64,"
+        "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Get the weather.\","
+        "\"input_schema\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}}}}],"
+        "\"messages\":[{\"role\":\"system\",\"content\":\"You are a helpful assistant.\"},"
+        "{\"role\":\"user\",\"content\":\"Weather in Paris?\"},"
+        "{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"Call the tool.\","
+        "\"tool_calls\":[{\"id\":\"toolu_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\","
+        "\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}]},"
+        "{\"role\":\"tool\",\"tool_call_id\":\"toolu_1\",\"content\":\"Error: city not found\\n\"},"
+        "{\"role\":\"user\",\"content\":\"Try Lyon.\"}]}";
+    static const char warning[] =
+        "<tool_response>\nError: city not found\n\n\xe2\x9a\xa0\xef\xb8\x8f SYSTEM WARNING: "
+        "The previous tool call returned an error.";
+    static const char after[] =
+        "</tool_response><|im_end|>\n<|im_start|>user\nTry Lyon.<|im_end|>\n<|im_start|>assistant\n<think>\n";
+    static const char head[] = "<|im_start|>system\n# Tools\n";
+    g_server_qwen_flavor = SERVER_QWEN_FLAVOR_ORNITH;
+    char *a = test_ornith_prompt("anthropic", anthropic, NULL);
+    char *o = test_ornith_prompt("chat", openai, NULL);
+    g_server_qwen_flavor = SERVER_QWEN_FLAVOR_QWEN38;
+    if (a && o && strcmp(a, o)) fprintf(stderr, "anthropic:\n%s\nopenai:\n%s\n", a, o);
+    TEST_ASSERT(a && o && !strcmp(a, o));
+    TEST_ASSERT(a && strstr(a, warning) != NULL);
+    TEST_ASSERT(a && strstr(a, after) != NULL);
+    TEST_ASSERT(a && !strncmp(a, head, strlen(head)));
+    free(a);
+    free(o);
+}
+
+/* The OpenAI tool-turn visible key stays a prefix of the next Ornith render,
+ * so a tool loop continues from live KV. */
+static void test_ornith_tool_turn_visible_text_prefixes_next_render(void) {
+    g_server_qwen_flavor = SERVER_QWEN_FLAVOR_ORNITH;
+    for (int with_content = 0; with_content < 2; with_content++) {
+        chat_msgs msgs = {0};
+        chat_msg user = {0};
+        user.role = xstrdup("user");
+        user.content = xstrdup("run it");
+        chat_msgs_push(&msgs, user);
+        request r = {0};
+        r.kind = REQ_CHAT;
+        r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+        r.think_mode = DS4_THINK_MEDIUM;
+        r.prompt_text = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, NULL, r.think_mode);
+        chat_msg assistant = {0};
+        assistant.role = xstrdup("assistant");
+        assistant.content = xstrdup(with_content ? "Running." : "");
+        tool_call call = {0};
+        call.name = xstrdup("bash");
+        call.arguments = xstrdup("{}");
+        tool_calls_push(&assistant.calls, call);
+        assistant.calls.raw_tool_text = xstrdup("\n\n<tool_call>\n<function=bash>\n</function>\n</tool_call>");
+        char *visible = build_qwen_tool_turn_visible_text(&r, "tool_calls", false, assistant.content,
+                                                          &assistant.calls);
+        chat_msgs_push(&msgs, assistant);
+        chat_msg tool = {0};
+        tool.role = xstrdup("tool");
+        tool.content = xstrdup("ok\n");
+        chat_msgs_push(&msgs, tool);
+        char *next = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, NULL, r.think_mode);
+        TEST_ASSERT(visible && next && !strncmp(next, visible, strlen(visible)));
+        if (visible && next && !strncmp(next, visible, strlen(visible))) {
+            static const char boundary[] =
+                "<|im_end|>\n<|im_start|>user\n<tool_response>\nok\n</tool_response><|im_end|>\n";
+            TEST_ASSERT(!strncmp(next + strlen(visible), boundary, strlen(boundary)));
+        }
+        free(next);
+        free(visible);
+        free(r.prompt_text);
+        chat_msgs_free(&msgs);
+    }
+    g_server_qwen_flavor = SERVER_QWEN_FLAVOR_QWEN38;
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_deepseek41_server_stream();
     test_deepseek41_server_tools();
@@ -23821,6 +24270,10 @@ static void ds4_server_unit_tests_run(void) {
     test_ornith_effort_sent_vs_absent();
     test_ornith_template_kwargs();
     test_ornith_pyjson();
+    test_ornith_tool_error_heuristic();
+    test_ornith_live_tail_continues_full_render();
+    test_ornith_anthropic_tool_results_match_openai();
+    test_ornith_tool_turn_visible_text_prefixes_next_render();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN
