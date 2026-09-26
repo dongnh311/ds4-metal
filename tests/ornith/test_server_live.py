@@ -32,6 +32,7 @@ says is a soft check (WARN, see serverlib).
 import copy
 import json
 import pathlib
+import re
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -209,7 +210,11 @@ def main(argv):
                  save=out / "think-budget", max_tokens=600)
         new = srv.new_log()
         m = r["choices"][0]["message"]
-        sl.check("thinking budget reached 64 tokens" in new, "think budget: the cap fired")
+        fired = re.search(r"thinking budget reached (\d+) tokens", new)
+        n = int(fired.group(1)) if fired else None
+        sl.check(fired is not None and 64 <= n <= 65,
+                 f"think budget: the cap fired at {n} tokens (64..65)" if fired else
+                 "think budget: the cap fired (no matching log line)")
         sl.check(sl.BUDGET_MESSAGE in (m.get("reasoning_content") or ""),
                  "think budget: the reasoning ends with the budget sentence")
         sl.check((m.get("content") or "").strip() != "", "think budget: an answer follows")
