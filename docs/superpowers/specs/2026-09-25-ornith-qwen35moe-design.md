@@ -212,6 +212,10 @@ and `ds4_gpu_add_tensor`.
   and tile-GEMM dequant, ported from the GLM `block_q5_K` kernels in
   `metal/moe.metal`. The reduce runs with `n_hc = 0` into `blk`, then the
   residual add.
+  *M1 deviation:* M1 ships the Q5_K row kernels only. Q5_K layers use the
+  per-token row kernels at every prefill size (Q4_K layers switch to the
+  tile GEMM above 64 tokens). The tiled Q5_K GEMM is deferred to M4, where
+  prefill speed is measured.
 - **MTP block (`blk.40`).**
   1. `x = eh_proj . concat[RMSNorm(embed(tok)) * enorm, RMSNorm(h) * hnorm]`,
      embedding half first.

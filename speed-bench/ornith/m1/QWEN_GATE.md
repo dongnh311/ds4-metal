@@ -24,3 +24,9 @@ Notes: run 1 (branch commit 0acea18) crashed at kernel-test build with
 `git checkout develop -- speed-bench/lib` (byte-identical, commit 81b0f2a),
 then this run (run 2) passed cleanly. Full per-check numbers are in
 `speed-bench/qwen-regression/last-full/result.json` (untracked, not committed).
+
+## Final fix wave (ruling 15)
+
+- Engine code: 56d7628. The ds4-server and ds4-agent Ornith refusals touch shared entry files.
+- Command: `speed-bench/qwen-regression/run.sh fast`
+- Result: `qwen_gate: PASS`. The kernel tests pass, the vi/code replies are byte-identical to the PROD baseline, and the registry command is unchanged.
