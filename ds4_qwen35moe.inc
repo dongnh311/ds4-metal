@@ -167,13 +167,41 @@ static bool qwen35_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m
            ds4_gpu_tensor_write(g->pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u);
 }
 
+/* qwen4_gemv's batched dispatch (qwen4_gemv_rows, ds4.c) picks its Q8_0/F16
+ * matvec path by n_tok (dispatch geometry and internal tiling change with
+ * the token count), and a T=1 call is not guaranteed to produce the same
+ * row bit-identically as that row inside a T=2 call.  A speculative
+ * verify's row 0 must equal plain 1-row decoding bit for bit (that is what
+ * makes accepting it and continuing decoding correct), so every dense
+ * projection reachable from a verify's 2-row forward routes through this
+ * helper instead of calling qwen4_gemv directly: under g->verify_rows_exact
+ * it dispatches one row at a time, each row taking exactly the T=1 kernel a
+ * plain decode would use.  Plain decode, prefill and non-MTP graphs (T<=1 or
+ * verify_rows_exact false) fall straight through to qwen4_gemv unchanged. */
+static bool qwen35_gemv(ds4_qwen4_gpu_graph *g, ds4_gpu_tensor *out, const ds4_model *m,
+                        const ds4_tensor *w, const ds4_gpu_tensor *x, uint32_t T) {
+    if (!g->verify_rows_exact || T <= 1u) return qwen4_gemv(out, m, w, x, T);
+    const uint64_t in_dim = w->dim[0];
+    const uint64_t out_dim = w->ndim >= 2 ? w->dim[1] : 1u;
+    const uint64_t xrow = in_dim * sizeof(float), orow = out_dim * sizeof(float);
+    bool ok = true;
+    for (uint32_t t = 0; t < T && ok; t++) {
+        ds4_gpu_tensor *xr = ds4_gpu_tensor_view(x, (uint64_t)t * xrow, xrow);
+        ds4_gpu_tensor *or_ = ds4_gpu_tensor_view(out, (uint64_t)t * orow, orow);
+        ok = xr && or_ && qwen4_gemv(or_, m, w, xr, 1u);
+        ds4_gpu_tensor_free(xr);
+        ds4_gpu_tensor_free(or_);
+    }
+    return ok;
+}
+
 /* q/gate, k and v projections of the rows in mixed, then the indexer-free
  * prep: q/k norms, RoPE and the F16 K/V append at positions pos0.. */
 static bool qwen35_graph_attention_prep(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                         uint32_t il, uint32_t pos0, uint32_t T) {
-    return qwen4_gemv(g->qg, m, l->attn_q, g->mixed, T) &&
-           qwen4_gemv(g->kp, m, l->attn_k, g->mixed, T) &&
-           qwen4_gemv(g->vp, m, l->attn_v, g->mixed, T) &&
+    return qwen35_gemv(g, g->qg, m, l->attn_q, g->mixed, T) &&
+           qwen35_gemv(g, g->kp, m, l->attn_k, g->mixed, T) &&
+           qwen35_gemv(g, g->vp, m, l->attn_v, g->mixed, T) &&
            ds4_gpu_qwen35_attn_prep_tensor(g->q, g->gate, g->layer_k_cache[il], g->layer_v_cache[il],
                                            g->qg, g->kp, g->vp, g->pos3, m->map, m->size,
                                            l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
@@ -221,7 +249,7 @@ static bool qwen35_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, c
                                    uint32_t il, uint32_t pos0, uint32_t T) {
     return qwen35_graph_attention_prep(g, m, l, il, pos0, T) &&
            qwen35_graph_attend(g, il, pos0, 0u, T, g->verify_rows_exact && T > 1u) &&
-           qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T);
+           qwen35_gemv(g, g->blk, m, l->attn_output, g->attn_o, T);
 }
 
 /* Router (softmax over 256, top 8, renormalized, sigmoid shared gate), the
@@ -234,17 +262,17 @@ static bool qwen35_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const d
                              uint32_t T) {
     const uint32_t E = DS4_N_EMBD, F = DS4_N_FF_EXP, NE = DS4_N_EXPERT, K = DS4_N_EXPERT_USED;
     const uint32_t xt = l->ffn_gate_exps->type, dt = l->ffn_down_exps->type;
-    bool ok = qwen4_gemv(g->router, m, l->ffn_gate_inp, g->mixed, T) &&
+    bool ok = qwen35_gemv(g, g->router, m, l->ffn_gate_inp, g->mixed, T) &&
         ds4_gpu_qwen4_router_topk_tensor(g->selected, g->weights, g->router, g->mixed, m->map, m->size,
                                          l->ffn_gate_inp_shexp->abs_offset, l->ffn_gate_inp_shexp->type,
                                          E, g->sh_gate_logit, T, NE, K) != 0;
     const bool mm = T > 64u && xt == DS4_TENSOR_Q4_K && dt == DS4_TENSOR_Q4_K;
     const bool shared_dense = mm || T > 8u;
     if (ok && shared_dense) {
-        ok = qwen4_gemv(g->sh_gate, m, l->ffn_gate_shexp, g->mixed, T) &&
-             qwen4_gemv(g->sh_up, m, l->ffn_up_shexp, g->mixed, T) &&
+        ok = qwen35_gemv(g, g->sh_gate, m, l->ffn_gate_shexp, g->mixed, T) &&
+             qwen35_gemv(g, g->sh_up, m, l->ffn_up_shexp, g->mixed, T) &&
              ds4_gpu_swiglu_tensor(g->sh_mid, g->sh_gate, g->sh_up, T * F, 0.0f, 1.0f) &&
-             qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->sh_mid, T);
+             qwen35_gemv(g, g->sh_out, m, l->ffn_down_shexp, g->sh_mid, T);
     }
     if (ok && mm) {
         ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, K, NE,
@@ -285,6 +313,41 @@ static bool qwen35_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const d
     return ok;
 }
 
+/* qwen4_graph_linear (shared with Qwen3.8, ds4.c) has no x/out parameters
+ * of its own: it reads g->mixed and writes g->blk directly, using g->qkv,
+ * g->z, g->ga, g->gb and g->lin_o purely as scratch it fills and consumes
+ * within the same call (row 0 of that scratch is reused safely on every
+ * T=1 call).  g->layer_lin_state[il]/g->layer_lin_hist[il] are the GDN
+ * recurrent state: calling it T=1 once per row in order advances that
+ * state exactly as plain decoding would.  So under g->verify_rows_exact
+ * this points g->mixed/g->blk at per-row views for a T=1 call each, and
+ * sets g->snap_after_first only for the row-0 call (qwen4_graph_linear
+ * snapshots the GDN state after the call's row 0, so a 1-row call's
+ * snapshot is already the state after that row) -- restoring all three
+ * fields on every path, success or failure. */
+static bool qwen35_graph_linear_rows(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                     uint32_t il, uint32_t T) {
+    if (!g->verify_rows_exact || T <= 1u) return qwen4_graph_linear(g, m, l, il, T);
+    ds4_gpu_tensor *const mixed0 = g->mixed, *const blk0 = g->blk;
+    const bool snap0 = g->snap_after_first;
+    const uint64_t row = (uint64_t)DS4_N_EMBD * sizeof(float);
+    bool ok = true;
+    for (uint32_t t = 0; t < T && ok; t++) {
+        ds4_gpu_tensor *mv = ds4_gpu_tensor_view(mixed0, (uint64_t)t * row, row);
+        ds4_gpu_tensor *bv = ds4_gpu_tensor_view(blk0, (uint64_t)t * row, row);
+        g->mixed = mv;
+        g->blk = bv;
+        g->snap_after_first = snap0 && t == 0u;
+        ok = mv && bv && qwen4_graph_linear(g, m, l, il, 1u);
+        ds4_gpu_tensor_free(mv);
+        ds4_gpu_tensor_free(bv);
+    }
+    g->mixed = mixed0;
+    g->blk = blk0;
+    g->snap_after_first = snap0;
+    return ok;
+}
+
 /* One trunk layer: pre-norm mixer and pre-norm MoE, each added to R. */
 static bool qwen35_graph_layer(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                uint32_t il, uint32_t pos0, uint32_t T) {
@@ -293,7 +356,7 @@ static bool qwen35_graph_layer(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
     bool ok = ds4_gpu_rms_norm_weight_rows_tensor(g->mixed, g->R, m->map, m->size, l->attn_norm->abs_offset,
                                                   DS4_N_EMBD, T, DS4_RMS_EPS) != 0;
     if (ok) ok = ds4_qwen35_layer_is_attention(il) ? qwen35_graph_attention(g, m, l, il, pos0, T)
-                                                    : qwen4_graph_linear(g, m, l, il, T);
+                                                    : qwen35_graph_linear_rows(g, m, l, il, T);
     if (ok) ok = ds4_gpu_add_tensor(g->R, g->R, g->blk, n) != 0;
     if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->mixed, g->R, m->map, m->size, l->ffn_norm->abs_offset,
                                                      DS4_N_EMBD, T, DS4_RMS_EPS) != 0;
@@ -338,7 +401,7 @@ static bool qwen35_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model 
                                                       DS4_N_EMBD, T, DS4_RMS_EPS) != 0;
         if (ok && logits_out) {
             ds4_gpu_tensor *last = all_rows ? NULL : ds4_gpu_tensor_view(g->mtp_h, (uint64_t)T * row, row);
-            ok = (all_rows || last) && qwen4_gemv(g->logits, m, w->output, all_rows ? h : last, all_rows ? T : 1u);
+            ok = (all_rows || last) && qwen35_gemv(g, g->logits, m, w->output, all_rows ? h : last, all_rows ? T : 1u);
             ds4_gpu_tensor_free(last);
         }
         ds4_gpu_tensor_free(h);
