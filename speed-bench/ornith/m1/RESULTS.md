@@ -44,12 +44,15 @@ Log-prob of " di" at step 29 (" de" is top-1 everywhere):
 | ds4 `--prefill-chunk 65` | -2.667 | -0.075 |
 | ds4 `--prefill-chunk 64` | -3.030 | -0.052 |
 
-- At this step, llama.cpp's own batched Metal prefill disagrees with its CPU backend by 1.00. The largest Metal-vs-CPU gap on the calibration prompts is 0.49.
-- llama.cpp's `-ub 1` Metal run agrees with its CPU run within 0.041 over the whole comparison.
-- Compared with the CPU run, the three ds4 runs are within 0.027-0.043.
-- Compared with the `-ub 1` reference, they are within 0.024-0.035 on every step.
+- At this step, llama.cpp's own batched Metal prefill disagrees with its CPU backend by 1.00 on " di". The largest Metal-vs-CPU gap on the calibration prompts is 0.49.
+- The figures in the next three bullets use the gate's metric: the reference's probable tokens only (log-prob >= -2.0). At step 29 that is " de" alone; " di" is excluded.
+  - llama.cpp's `-ub 1` Metal run agrees with its CPU run within 0.041 over the whole comparison.
+  - Compared with the CPU run, the three ds4 runs are within 0.027-0.043.
+  - Compared with the `-ub 1` reference, they are within 0.024-0.035 on every step.
+- " di" is not settled by any backend. `-ub 1` and CPU differ by 0.60 on it, which is above the 0.49 calibration maximum but under tol 1.48. They sit on opposite sides of the default-batch run. ds4 is within tol of the CPU run and the `-ub 1` run on " di" in all three runs (0.07 / 0.21 / 0.58 from CPU). The default-batch reference also fails against llama.cpp's own `-ub 1` output (1.60 > 1.48).
+- With either the `-ub 1` or the CPU reference, " di" falls below the probable threshold, so the gate does not check that token at step 29. It still checks the " de" selection and log-prob.
 
-The batched llama.cpp prefill is the outlier, not ds4. The per-token reference is the llama.cpp output that agrees with the calibration backend. Tolerances are unchanged.
+On the gate's metric, the batched llama.cpp prefill is the outlier, not ds4. The per-token reference is the llama.cpp output that agrees with the calibration backend. Tolerances are unchanged.
 
 ## Coverage beyond the gate
 
