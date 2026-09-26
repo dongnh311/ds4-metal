@@ -17,6 +17,11 @@
 
 static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_t cap_tokens) {
     memset(g, 0, sizeof(*g));
+    if ((uint64_t)ctx_cap > DS4_ROPE_ORIG_CTX) {
+        fprintf(stderr, "ds4: Ornith supports up to %llu tokens of context (no YaRN)\n",
+                (unsigned long long)DS4_ROPE_ORIG_CTX);
+        return false;
+    }
     const uint64_t E = DS4_N_EMBD, T = cap_tokens;
     const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
     const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;

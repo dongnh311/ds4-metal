@@ -633,6 +633,12 @@ tests/test_qwen35_kernels.o: tests/test_qwen35_kernels.c ds4_gpu.h ds4.h
 tests/test_qwen35_kernels: tests/test_qwen35_kernels.o ds4_metal.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
+tests/test_qwen35_session.o: tests/test_qwen35_session.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_qwen35_session.c
+
+tests/test_qwen35_session: tests/test_qwen35_session.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
 endif
 
 tests/test_qwen4_vision.o: tests/test_qwen4_vision.c ds4.h
@@ -762,12 +768,6 @@ ifeq ($(UNAME_S),Darwin)
 else
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 endif
-
-tests/test_qwen35_session.o: tests/test_qwen35_session.c ds4.h
-	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_qwen35_session.c
-
-tests/test_qwen35_session: tests/test_qwen35_session.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 .PHONY: test-qwen35-session
 test-qwen35-session: tests/test_qwen35_session

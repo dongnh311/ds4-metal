@@ -6,6 +6,9 @@
 bad_embd.gguf: qwen35moe.embedding_length = 64.
 bad_tier.gguf: blk.20 gate/up experts typed IQ4_XS (ggml type 23).
 bad_mtp.gguf: blk.40 (MTP) gate/up experts typed IQ4_XS (ggml type 23).
+bad_gdn_pair.gguf: blk.0 ssm_alpha typed F16 (ggml type 1), ssm_beta F32.
+bad_shexp_pair.gguf: blk.0 ffn_up_shexp typed Q4_0 (ggml type 2), gate Q8_0.
+Both retypes shrink the tensor, so it still fits its data region.
 Only the header is copied; the tensor data is a hole of the original size,
 so each file costs a few MB on disk.
 """
@@ -86,6 +89,12 @@ def main(model, out_dir):
     for name in ("blk.40.ffn_gate_exps.weight", "blk.40.ffn_up_exps.weight"):
         struct.pack_into("<I", bad, type_pos[name], 23)
     write(os.path.join(out_dir, "bad_mtp.gguf"), bad, size)
+    bad = bytearray(header)
+    struct.pack_into("<I", bad, type_pos["blk.0.ssm_alpha.weight"], 1)
+    write(os.path.join(out_dir, "bad_gdn_pair.gguf"), bad, size)
+    bad = bytearray(header)
+    struct.pack_into("<I", bad, type_pos["blk.0.ffn_up_shexp.weight"], 2)
+    write(os.path.join(out_dir, "bad_shexp_pair.gguf"), bad, size)
 
 
 if __name__ == "__main__":

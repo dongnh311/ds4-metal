@@ -9,7 +9,8 @@
  *     - its argmax equals a one-pass prefill of the same prefix; the one-pass
  *       logit difference (chunking changes rounding) is printed only;
  *  2. a divergent prompt resets the state: logits bit-identical to a fresh session;
- *  3. a full context stops eval with the error "context is full". */
+ *  3. a full context stops eval with the error "context is full";
+ *  4. a session above the native 262144-token context is refused (no YaRN). */
 #define _POSIX_C_SOURCE 200809L
 #include "../ds4.h"
 #include <assert.h>
@@ -124,6 +125,11 @@ int main(int argc, char **argv) {
     assert(ds4_session_eval(control, 11, err, sizeof(err)) != 0);
     printf("  context full: '%s'\n", err);
     assert(strcmp(err, "context is full") == 0);
+
+    /* 4. above the native context: the graph allocation refuses it */
+    ds4_session *big = NULL;
+    assert(ds4_session_create(&big, engine, 262145) != 0 && big == NULL);
+    printf("  context 262145: session refused\n");
 
     ds4_session_free(fresh);
     ds4_session_free(control);

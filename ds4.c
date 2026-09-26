@@ -5983,6 +5983,16 @@ static void tensor_expect_qwen35_expert_layout(const ds4_tensor *t, uint64_t d0,
     tensor_expect_layout(t, t->type, 3, d0, d1, d2);
 }
 
+/* Two tensors that one Ornith kernel reads with a single type argument. */
+static void tensor_expect_qwen35_same_type(uint32_t il, const ds4_tensor *t, const ds4_tensor *ref,
+                                           const char *why) {
+    if (t->type == ref->type) return;
+    fprintf(stderr, "ds4: layer %u: %.*s is %s but %.*s is %s; %s\n", il,
+            (int)t->name.len, t->name.ptr, tensor_type_name(t->type),
+            (int)ref->name.len, ref->name.ptr, tensor_type_name(ref->type), why);
+    exit(1);
+}
+
 static void weights_validate_qwen35moe_layout(const ds4_weights *w, uint32_t layer_start, uint32_t layer_end,
                                               bool require_token_embd, bool require_output) {
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
@@ -6034,6 +6044,8 @@ static void weights_validate_qwen35moe_layout(const ds4_weights *w, uint32_t lay
             tensor_expect_layout(l->lin_a, DS4_TENSOR_F32, 1, DS4_N_LIN_V_HEAD, 0, 0);
             tensor_expect_qwen4_dense_layout(l->lin_beta, 2, DS4_N_EMBD, DS4_N_LIN_V_HEAD, 0);
             tensor_expect_qwen4_dense_layout(l->lin_alpha, 2, DS4_N_EMBD, DS4_N_LIN_V_HEAD, 0);
+            tensor_expect_qwen35_same_type(il, l->lin_beta, l->lin_alpha,
+                                           "the fused GDN front reads both with ssm_alpha's type");
             tensor_expect_layout(l->lin_norm, DS4_TENSOR_F32, 1, DS4_N_LIN_HEAD_DIM, 0, 0);
             tensor_expect_qwen4_dense_layout(l->lin_out, 2, lin_v_dim, DS4_N_EMBD, 0);
         }
@@ -6049,6 +6061,8 @@ static void weights_validate_qwen35moe_layout(const ds4_weights *w, uint32_t lay
         tensor_expect_layout(l->ffn_gate_inp_shexp, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
         tensor_expect_qwen4_dense_layout(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
         tensor_expect_qwen4_dense_layout(l->ffn_up_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_qwen35_same_type(il, l->ffn_up_shexp, l->ffn_gate_shexp,
+                                       "the shared-expert slot reads both with the gate's type");
         tensor_expect_qwen4_dense_layout(l->ffn_down_shexp, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
         if (ds4_qwen35_layer_is_nextn(il)) {
             tensor_expect_qwen4_dense_layout(l->nextn_eh_proj, 2, 2u * DS4_N_EMBD, DS4_N_EMBD, 0);
@@ -72024,6 +72038,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
             (opt->first_token_test || opt->metal_graph_test) ? "legacy diagnostics" : NULL;
         if (bad) {
             fprintf(stderr, "ds4: Ornith-1.5-35B-A3B runs on single-host Metal only; %s is not supported\n", bad);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (opt->context_size > 0 && (uint64_t)opt->context_size > DS4_ROPE_ORIG_CTX) {
+            fprintf(stderr, "ds4: Ornith supports up to %llu tokens of context (no YaRN)\n",
+                    (unsigned long long)DS4_ROPE_ORIG_CTX);
             ds4_engine_close(e);
             *out = NULL;
             return 1;
